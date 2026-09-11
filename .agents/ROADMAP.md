@@ -120,8 +120,10 @@ UI data-race fixes (`view.post`).
       per owner decision; nbio_map race + growth fixed. Proxy-connect bound = W7 hardening.)
 - [ ] Authenticate injectee↔injector sessions: per-injection token stored in the port
       mapping and verified by the control server.
-- [ ] Restrict the named mapping's DACL so same-user processes can't read the IPC
-      port or race the mapping name (`src/common/utils.hpp:156`).
+- [x] Restrict the named mapping's DACL so same-user processes can't read the IPC
+      port or race the mapping name (`src/common/utils.hpp:156`). (e1f4d00: SDDL
+      user+SYSTEM, fail-closed on any SD failure; cross-user targets now fail
+      cleanly via the W2 fail-safe — same-user injection proven by e2e.inject_connect.)
 - [ ] Define and implement injector-exit behavior mid-session: reconnect policy and
       clean DLL unload; document it.
 - [ ] Audit partial injection failure: mapping cleanup and no half-initialized hooks
