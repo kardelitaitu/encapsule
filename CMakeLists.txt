@@ -35,6 +35,7 @@ FetchContent_Declare(minhook
 )
 
 set(BUILD_TESTS OFF CACHE BOOL "")
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(protopuf
 	GIT_REPOSITORY https://github.com/PragmaTwice/protopuf
 	GIT_TAG v2.2.1
@@ -140,4 +141,10 @@ endif()
 
 if(PROXINJECTEE_ONLY)
 	add_executable(wow64-address-dumper src/wow64/address_dumper.cpp)
+endif()
+
+option(PROXINJECT_BUILD_TESTS "build host-side CTest targets" ON)
+enable_testing()
+if(PROXINJECT_BUILD_TESTS AND NOT PROXINJECTEE_ONLY)
+	add_subdirectory(tests)
 endif()
