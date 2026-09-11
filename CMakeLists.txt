@@ -135,7 +135,7 @@ if(NOT PROXINJECTEE_ONLY)
 
 	add_executable(proxinjector-cli ${INJECTOR_CLI_SRCS})
 	target_compile_features(proxinjector-cli PUBLIC cxx_std_20)
-	target_link_libraries(proxinjector-cli PUBLIC protopuf argparse spdlog proxinject_common)
+	target_link_libraries(proxinjector-cli PUBLIC protopuf argparse spdlog proxinject_common advapi32)
 	target_include_directories(proxinjector-cli PUBLIC ${asio_SOURCE_DIR}/asio/include)
 endif()
 

@@ -19,6 +19,7 @@
 #include "tlhelp32.h"
 #include "utils.hpp"
 #include <Windows.h>
+#include <sddl.h>
 #include <memory>
 #include <optional>
 
@@ -129,9 +130,69 @@ template <typename F> void match_process(F &&f) {
   }
 }
 
+// Owns memory handed out by the advapi32 SDDL helpers (ConvertSidToStringSidW,
+// ConvertStringSecurityDescriptorToSecurityDescriptorW), both LocalFree-based.
+struct local_memory
+    : std::unique_ptr<void, static_function<LocalFree>> {
+  using base_type = std::unique_ptr<void, static_function<LocalFree>>;
+
+  local_memory(void *p) : base_type(p) {}
+};
+
+// The mapping carries the control port from the injector to the injectee, so
+// it must not inherit the default (NULL) DACL that would let any other process
+// in the session read or rewrite it. The descriptor below grants generic all
+// to SYSTEM and to the current user only, and is SACL-protected (D:P).
+//
+// FAIL CLOSED: if any step of building the descriptor fails, the mapping is
+// NOT created with default security - create_mapping reports the same failure
+// a rejected CreateFileMappingW would, and the injection is refused.
 inline handle create_mapping(const std::wstring &name, DWORD buf_size) {
+  const HANDLE failed = nullptr; // what a failed CreateFileMappingW yields
+
+  HANDLE raw_token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw_token)) {
+    return failed;
+  }
+  handle token = raw_token;
+
+  DWORD needed = 0;
+  GetTokenInformation(token.get(), TokenUser, nullptr, 0, &needed);
+  if (needed < sizeof(TOKEN_USER)) {
+    return failed;
+  }
+
+  auto buffer = std::make_unique<char[]>(needed);
+  if (!GetTokenInformation(token.get(), TokenUser, buffer.get(), needed,
+                           &needed)) {
+    return failed;
+  }
+  auto *user = reinterpret_cast<TOKEN_USER *>(buffer.get());
+
+  LPWSTR sid_text = nullptr;
+  if (!ConvertSidToStringSidW(user->User.Sid, &sid_text)) {
+    return failed;
+  }
+  local_memory sid_owner = sid_text;
+
+  std::wstring sddl = L"D:P(A;;GA;;;SY)(A;;GA;;;";
+  sddl += sid_text;
+  sddl += L")";
+
+  PSECURITY_DESCRIPTOR sd = nullptr;
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+          sddl.c_str(), SDDL_REVISION_1, &sd, nullptr)) {
+    return failed;
+  }
+  local_memory sd_owner = sd; // must outlive the CreateFileMappingW call
+
+  SECURITY_ATTRIBUTES sa{};
+  sa.nLength = sizeof(sa);
+  sa.lpSecurityDescriptor = sd;
+  sa.bInheritHandle = FALSE;
+
   return CreateFileMappingW(INVALID_HANDLE_VALUE, // use paging file
-                            NULL,                 // default security
+                            &sa, // explicit DACL, never a NULL DACL
                             PAGE_READWRITE,       // read/write access
                             0,        // maximum object size (high-order DWORD)
                             buf_size, // maximum object size (low-order DWORD)

@@ -157,3 +157,5 @@ Also read before changing things (ROADMAP §2): the exact detour signatures
 (`src/common/minhook.hpp`; `hook_ConnectEx` bypasses the CRTP wrapper), the
 surprising IPv6 byte order in `src/injectee/winnet.hpp`, and the
 unauthenticated IPC mapping in `src/common/utils.hpp`.
+
+The IPC mapping that carries the control port is now created with an explicit user+SYSTEM DACL (`D:P(A;;GA;;;SY)(A;;GA;;;<current-user-SID>)`, `create_mapping` in `src/common/winraii.hpp`), and it fails closed: if that descriptor cannot be built the mapping is not created at all, never silently left world-accessible.
