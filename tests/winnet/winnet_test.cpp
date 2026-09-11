@@ -72,8 +72,12 @@ std::array<unsigned char, 16> v6_bytes(const sockaddr *sa) {
       ((const sockaddr_in6 *)sa)->sin6_addr);
 }
 
-const sockaddr *as_sockaddr(const sockaddr_in *sa) { return (const sockaddr *)sa; }
-const sockaddr *as_sockaddr(const sockaddr_in6 *sa) { return (const sockaddr *)sa; }
+const sockaddr *as_sockaddr(const sockaddr_in *sa) {
+  return (const sockaddr *)sa;
+}
+const sockaddr *as_sockaddr(const sockaddr_in6 *sa) {
+  return (const sockaddr *)sa;
+}
 
 // 2001:db8::1 on the wire.
 constexpr std::array<unsigned char, 16> k2001db8_1{
