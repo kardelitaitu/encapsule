@@ -74,7 +74,7 @@ UI data-race fixes (`view.post`).
 
 ### P2 — Testing & CI foundation (none exists today; `**/*test*` is empty)
 - [x] Create a CTest-enabled host-side test target (no injection needed).
-- [ ] Round-trip tests for `schema.hpp` protopuf messages (encode/decode).
+- [x] Round-trip tests for `schema.hpp` protopuf messages (encode/decode).
 - [x] Tests for `utils.hpp` wildcard/regex process matching.
 - [x] Tests for `to_sockaddr` / `to_ip_addr` IPv4/IPv6/domain conversions (locks down
       the byte-order question flagged in §2).
