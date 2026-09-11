@@ -32,8 +32,7 @@ jobs:
 
     - name: Test (e2e)
       if: matrix.arch == 'x64' && matrix.build_type == 'Release'
-      continue-on-error: true
-      run: ctest --test-dir build/${{ matrix.arch }} -C ${{ matrix.build_type }} --output-on-failure -R '^e2e\.'
+      run: ctest --test-dir build/${{ matrix.arch }} -C ${{ matrix.build_type }} --output-on-failure -R '^e2e\.' --repeat until-pass:3
 
     - name: Set variables
       run: |
