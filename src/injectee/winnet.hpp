@@ -95,7 +95,8 @@ bool sockequal(const sockaddr *l, const sockaddr *r) {
                         r6->sin6_addr.u.Byte);
     }
 
-    return false; // FIXME: add equal checking for more family
+    // only AF_INET/AF_INET6 reach here (is_inet gate at every call site)
+    return false;
   }
 
   return false;

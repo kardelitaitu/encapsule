@@ -351,8 +351,8 @@ void sockequal_different_family_is_false() {
 void sockequal_same_unsupported_family_is_false() {
   // Locks current behavior: two identical AF_UNSPEC addresses are NOT equal,
   // because the family-matched branch falls through to `return false`
-  // (winnet.hpp:98, "FIXME: add equal checking for more family"). Fixing it
-  // is P4 scope, so this pin stays as-is.
+  // (winnet.hpp:98 documents the no-op: only AF_INET/AF_INET6 reach sockequal
+  // in practice, every call site gates on is_inet first; see P4 #1).
   sockaddr a{};
   a.sa_family = AF_UNSPEC;
   sockaddr b{};
