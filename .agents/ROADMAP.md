@@ -73,7 +73,7 @@ UI data-race fixes (`view.post`).
       and the logo attribution, `docs/logo/attribute.md`).
 
 ### P2 — Testing & CI foundation (none exists today; `**/*test*` is empty)
-- [ ] Create a CTest-enabled host-side test target (no injection needed).
+- [x] Create a CTest-enabled host-side test target (no injection needed).
 - [ ] Round-trip tests for `schema.hpp` protopuf messages (encode/decode).
 - [ ] Tests for `utils.hpp` wildcard/regex process matching.
 - [ ] Tests for `to_sockaddr` / `to_ip_addr` IPv4/IPv6/domain conversions (locks down
