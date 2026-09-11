@@ -27,6 +27,9 @@ jobs:
     - name: Build
       run: .\build.ps1 -mode ${{ matrix.build_type }} -arch ${{ matrix.arch }}
 
+    - name: Test
+      run: ctest --test-dir build/${{ matrix.arch }} -C ${{ matrix.build_type }} --output-on-failure
+
     - name: Set variables
       run: |
         echo "PROXINJECT_VERSION=$(git describe --tags)" >> $Env:GITHUB_ENV
