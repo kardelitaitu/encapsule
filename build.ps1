@@ -23,9 +23,9 @@ if(!($skip_cmake)) {
 	}
 
 	if($arch -eq "x64") {
-		cmake -DCMAKE_BUILD_TYPE="$mode" -A x64 -S . -B $build_dir/x64	
+		cmake -DCMAKE_BUILD_TYPE="$mode" '-DCMAKE_POLICY_VERSION_MINIMUM=3.5' -A x64 -S . -B $build_dir/x64	
 	}
-	cmake -DCMAKE_BUILD_TYPE="$mode" $win32_injectee_only -A Win32 -S . -B $build_dir/Win32
+	cmake -DCMAKE_BUILD_TYPE="$mode" '-DCMAKE_POLICY_VERSION_MINIMUM=3.5' $win32_injectee_only -A Win32 -S . -B $build_dir/Win32
 }
 
 if($arch -eq "x64") {

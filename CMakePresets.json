@@ -9,8 +9,8 @@
     "encapsule/build-ps1": {
       "mirrors": "./build.ps1 -mode Release -arch x64",
       "notes": [
-        "build.ps1:26 -> configure preset 'x64': cmake -DCMAKE_BUILD_TYPE=Release -A x64 -S . -B build/x64",
-        "build.ps1:28 -> configure preset 'win32-injectee-only' (via build.ps1:20): -DPROXINJECTEE_ONLY=ON -A Win32 -S . -B build/Win32",
+        "build.ps1:26 -> configure preset 'x64': cmake -DCMAKE_BUILD_TYPE=Release '-DCMAKE_POLICY_VERSION_MINIMUM=3.5' -A x64 -S . -B build/x64",
+        "build.ps1:28 -> configure preset 'win32-injectee-only' (via build.ps1:20): -DPROXINJECTEE_ONLY=ON '-DCMAKE_POLICY_VERSION_MINIMUM=3.5' -A Win32 -S . -B build/Win32",
         "build.ps1:32 -> build preset 'x64': cmake --build build/x64 --config Release",
         "build.ps1:34 -> build preset 'win32-injectee-only': cmake --build build/Win32 --config Release",
         "build.ps1:36-45 copies artifacts into ./release (incl. proxinjectee.dll -> proxinjectee32.dll); the presets only configure/build, they do not copy."
@@ -21,11 +21,12 @@
     {
       "name": "vs-base",
       "displayName": "Visual Studio base (hidden)",
-      "description": "Settings shared by both build.ps1 passes: the Visual Studio generator build.ps1 gets by default (it passes -A but no -G), and Release, build.ps1's default -mode. CMAKE_BUILD_TYPE is inert for the multi-config VS generator but mirrors build.ps1's -DCMAKE_BUILD_TYPE.",
+      "description": "Settings shared by both build.ps1 passes: the Visual Studio generator build.ps1 gets by default (it passes -A but no -G), and Release, build.ps1's default -mode. CMAKE_BUILD_TYPE is inert for the multi-config VS generator but mirrors build.ps1's -DCMAKE_BUILD_TYPE. CMAKE_POLICY_VERSION_MINIMUM=3.5 lets CMake >= 4 configure the FetchContent deps (minhook, protopuf, argparse, spdlog) that still declare cmake_minimum_required(< 3.5); it mirrors build.ps1:26,28.",
       "hidden": true,
       "generator": "Visual Studio 17 2022",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_POLICY_VERSION_MINIMUM": "3.5"
       }
     },
     {
