@@ -60,15 +60,15 @@ UI data-race fixes (`view.post`).
 > increasing size (auth → DNS → UDP) → UX polish last.
 
 ### P1 — Build & packaging foundation (quick wins)
-- [ ] Replace `file(GLOB)` source collection with explicit source lists (or add
+- [x] Replace `file(GLOB)` source collection with explicit source lists (or add
       `CONFIGURE_DEPENDS`) at `CMakeLists.txt:98,106,122`.
-- [ ] Add a fallback version string when `git describe` fails outside a git checkout
+- [x] Add a fallback version string when `git describe` fails outside a git checkout
       (`CMakeLists.txt:82-89`) instead of hard-failing configuration.
-- [ ] Add `CMakePresets.json` mirroring `build.ps1` (x64 full build + Win32
+- [x] Add `CMakePresets.json` mirroring `build.ps1` (x64 full build + Win32
       `PROXINJECTEE_ONLY=ON` pass that yields `proxinjectee32.dll`).
 - [ ] Scheduled chore: bump pinned FetchContent deps (asio 1.22.2, spdlog 1.10.0,
       argparse v2.9, protopuf v2.2.1) and refresh the elements fork pin.
-- [ ] Add contributor docs: build prerequisites (MSVC, Windows SDK, CMake) and
+- [x] Add contributor docs: build prerequisites (MSVC, Windows SDK, CMake) and
       debugging tips for injected processes (`docs/` currently holds only image assets
       and the logo attribution, `docs/logo/attribute.md`).
 
