@@ -13,6 +13,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <WinSock2.h>
+#include <Windows.h>
+
 #include "test_support.hpp"
 
 #include <asio/ip/address.hpp>
@@ -21,6 +31,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <sstream>
 #include <span>
@@ -30,6 +41,7 @@
 namespace ip = asio::ip;
 
 #include <schema.hpp>
+#include <utils.hpp>
 
 namespace {
 
@@ -264,7 +276,7 @@ void truncated_buffer() {
   // unset instead of being fabricated
   const InjecteeMessage full =
       create_message<InjecteeMessage, "connect">(make_connect());
-  const InjecteeMessage head{std::string("connect"), {}, {}, {}};
+  const InjecteeMessage head{std::string("connect"), {}, {}, {}, {}};
   const auto head_bytes = encode(head);
   const auto full_bytes = encode(full);
   CHECK(head_bytes.size() < full_bytes.size());
@@ -302,6 +314,85 @@ void truncated_buffer() {
   CHECK(same_encoding(msg, full));
 }
 
+// (6) the per-injection token field (P4-3): it round-trips byte-exactly,
+// stays absent when unset, and a different token is a different message.
+void injectee_token_field() {
+  const std::vector<unsigned char> token{0x01u, 0x23u, 0x45u, 0x67u,
+                                         0x89u, 0xabu, 0xcdu, 0xefu};
+
+  InjecteeMessage msg = create_message<InjecteeMessage, "pid">(42u);
+  CHECK(!msg["token"_f].has_value()); // the token is opt-in per message
+  msg["token"_f] = token;
+
+  const auto bytes = encode(msg);
+  const auto back = decode<InjecteeMessage>(bytes);
+  CHECK(back.has_value());
+  if (!back) {
+    return;
+  }
+  CHECK(same_encoding(msg, *back));
+
+  const auto &got = (*back)["token"_f];
+  CHECK(got.has_value());
+  if (got) {
+    CHECK_EQ(got->size(), token.size());
+    CHECK(std::equal(token.begin(), token.end(), got->begin()));
+  }
+
+  // wire format is pinned too: field 5, length-delimited (wire type 2)
+  // -> tag 0x2a, then an 8-byte length prefix, then the token itself.
+  InjecteeMessage token_only;
+  token_only["token"_f] = token;
+  const auto only = encode(token_only);
+  CHECK_EQ(only.size(), token.size() + 2);
+  if (only.size() == token.size() + 2) {
+    CHECK(only[0] == std::byte{0x2a});
+    CHECK(only[1] == std::byte{0x08});
+    CHECK(std::equal(token.begin(), token.end(), only.begin() + 2,
+                     [](unsigned char a, std::byte b) {
+                       return a == static_cast<unsigned char>(b);
+                     }));
+  }
+
+  // one flipped byte is a different token, not an equal message
+  InjecteeMessage other = msg;
+  (*other["token"_f])[0] = 0x02u;
+  CHECK(!same_encoding(msg, other));
+  CHECK(encode(msg) != encode(other));
+}
+
+// (7) the mapping payload contract (P4-3): the layout both sides copy
+// byte-for-byte through the shared mapping, plus the token it carries.
+void mapping_payload_layout() {
+  CHECK_EQ(port_mapping_token_size, static_cast<std::size_t>(8));
+  CHECK_EQ(get_port_mapping_payload_size(), sizeof(port_mapping_payload));
+  CHECK_EQ(get_port_mapping_payload_size(),
+           sizeof(std::uint16_t) + port_mapping_token_size);
+  // no padding surprises: port first, token right after it
+  CHECK_EQ(offsetof(port_mapping_payload, port), static_cast<std::size_t>(0));
+  CHECK_EQ(offsetof(port_mapping_payload, token), sizeof(std::uint16_t));
+
+  const auto payload = get_port_mapping_payload(1080);
+  CHECK(payload.has_value());
+  if (!payload) {
+    return;
+  }
+  CHECK_EQ(static_cast<int>(payload->port), 1080);
+
+  const auto again = get_port_mapping_payload(1080);
+  CHECK(again.has_value());
+  if (again) {
+    // two injections never share a token (2^-64 collision aside)
+    CHECK(std::memcmp(payload->token, again->token,
+                      port_mapping_token_size) != 0);
+  }
+
+  // the mapping name contract is untouched by the payload change
+  const auto name = get_port_mapping_name(4242);
+  CHECK(name.find(port_mapping_name) == 0);
+  CHECK(name.ends_with(L"4242"));
+}
+
 } // namespace
 
 int main() {
@@ -311,5 +402,7 @@ int main() {
   RUN(create_and_compare);
   RUN(asio_symmetry);
   RUN(truncated_buffer);
+  RUN(injectee_token_field);
+  RUN(mapping_payload_layout);
   return test_failures;
 }

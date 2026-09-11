@@ -16,6 +16,11 @@
 #ifndef PROXINJECT_COMMON_UTILS
 #define PROXINJECT_COMMON_UTILS
 
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <optional>
+#include <random>
 #include <regex>
 #include <string>
 
@@ -157,6 +162,53 @@ inline const std::wstring port_mapping_name = L"PROXINJECT_PORT_IPC_";
 
 inline std::wstring get_port_mapping_name(DWORD pid) {
   return port_mapping_name + std::to_wstring(pid);
+}
+
+// The IPC mapping payload (P4-3): the control port plus a per-injection
+// random token. Guessing the mapping name (it only embeds a pid) no longer
+// lets another process read or forge control messages, because the injectee
+// echoes the token back inside every InjecteeMessage. Both sides must agree
+// on this exact layout, so the size is exposed as a helper rather than as a
+// sizeof() at the call sites: the injector maps
+// get_port_mapping_payload_size() bytes and writes one port_mapping_payload,
+// the injectee reads the same struct back.
+inline constexpr std::size_t port_mapping_token_size = 8;
+
+struct port_mapping_payload {
+  std::uint16_t port = 0;
+  unsigned char token[port_mapping_token_size] = {};
+};
+
+static_assert(sizeof(port_mapping_payload) ==
+                  port_mapping_token_size + sizeof(std::uint16_t),
+              "the payload is copied byte-for-byte between processes");
+static_assert(port_mapping_token_size % sizeof(unsigned) == 0,
+              "the token is filled in whole random_device draws");
+
+inline constexpr std::size_t get_port_mapping_payload_size() {
+  return sizeof(port_mapping_payload);
+}
+
+// Build the payload for one injection: the control port plus a fresh random
+// token. Returns nullopt when the RNG is unavailable, so a caller must refuse
+// the injection instead of falling back to a predictable token.
+inline std::optional<port_mapping_payload>
+get_port_mapping_payload(std::uint16_t port) {
+  port_mapping_payload payload;
+  payload.port = port;
+
+  std::random_device rd;
+  try {
+    for (std::size_t i = 0; i < port_mapping_token_size;
+         i += sizeof(unsigned)) {
+      const unsigned part = rd();
+      std::memcpy(&payload.token[i], &part, sizeof(part));
+    }
+  } catch (const std::exception &) {
+    return std::nullopt;
+  }
+
+  return payload;
 }
 
 inline std::string proxinject_copyright(const std::string &version) {

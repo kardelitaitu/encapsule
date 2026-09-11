@@ -55,10 +55,15 @@ using InjecteeConnect = pp::message<
     pp::uint32_field<"handle", 1>, pp::message_field<"addr", 2, IpAddr>,
     pp::message_field<"proxy", 3, IpAddr>, pp::string_field<"syscall", 4>>;
 
+// Field 5 carries the per-injection token from the IPC mapping payload
+// (P4-3): the injectee echoes it back with every message, so the injector can
+// tell a real client from a process that merely guessed the mapping name.
+// Field numbers 6 and up stay free for the P5 credential work.
 using InjecteeMessage =
     pp::message<pp::string_field<"opcode", 1>,
                 pp::message_field<"connect", 2, InjecteeConnect>,
-                pp::uint32_field<"pid", 3>, pp::uint32_field<"subpid", 4>>;
+                pp::uint32_field<"pid", 3>, pp::uint32_field<"subpid", 4>,
+                pp::bytes_field<"token", 5>>;
 
 using InjectorConfig =
     pp::message<pp::message_field<"addr", 1, IpAddr>, pp::bool_field<"log", 2>,
