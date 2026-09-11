@@ -15,6 +15,8 @@
 
 #include "hook.hpp"
 #include <utils.hpp>
+#include <chrono>
+#include <thread>
 #include <vector>
 
 void do_client(HINSTANCE dll_handle, const port_mapping_payload &ipc) {
@@ -46,10 +48,24 @@ void do_client(HINSTANCE dll_handle, const port_mapping_payload &ipc) {
     asio::co_spawn(io_context, c.start(), asio::detached);
 
     io_context.run();
+
+    // run() only comes back if the client could not keep any work pending,
+    // i.e. after its reconnect budget expired.  Stay resident anyway:
+    // unbinding the globals the hooks read would turn every later connect
+    // into a silent direct connect, and unmapping the DLL while other
+    // threads may be inside a detour is the use-after-free this path used to
+    // cause (P4 #5).  Park instead: the hooks and the pinned routing then
+    // live for as long as the victim does.
+    (void)dll_handle;
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::hours(1));
+    }
   }
-  FreeLibrary(dll_handle);
 }
 
+// Pre-session failures still unload (nothing is live in another thread yet);
+// losing the injector mid-session does not - see the note in do_client().
+//
 // The injector publishes the control port plus a per-injection token in a
 // per-process named mapping.  A missing mapping or a failed view means the
 // setup was broken: hand back the zero payload (port 0, empty token) and let

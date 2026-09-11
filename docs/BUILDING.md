@@ -80,7 +80,44 @@ with a `{Debug, Release} × {Win32, x64}` matrix.
 > `build.ps1` stays the source-of-truth reference for what the presets must
 > reproduce.
 
-## 3. Debugging injected processes
+## 3. Injector-exit behavior
+
+**Policy: the injectee stays resident — the injector is not the victim's
+lifeline.** When `proxinjector.exe` / `proxinjector-cli.exe` dies, is killed,
+or simply exits once its last client is gone, nothing already done to the
+injected process is undone. What the victim then experiences:
+
+1. **Hooks stay installed.** `proxinjectee.dll` is never unloaded on the
+   mid-session IPC-loss path. The client thread used to `FreeLibrary` itself
+   as soon as the IPC channel closed; that was removed (ROADMAP P4 #5),
+   because any other thread of the victim can be inside a detour at that
+   exact moment, and no amount of joining fixes it — the unloading thread
+   cannot join the threads it is unmapping code away from.
+2. **Routing is fail-closed.** The hooks keep redirecting outbound AF_INET
+   connects to the **last proxy config the injector sent**, held in
+   `injectee_config::pinned`, which `stop()` deliberately does not clear
+   (`injectee_config::drop()` only marks the session down). If that proxy is
+   gone too, connects simply fail — the honest outcome. Quietly reverting
+   to a direct route is precisely the leak the tool exists to prevent.
+3. **The client reconnects, briefly.** The lost IPC channel is retried with
+   bounded exponential backoff on the existing `asio::steady_timer`: 1s, 2s,
+   4s, 8s, capped at 10s, for a total budget of 60s per disconnect. Every
+   attempt sends a fresh `pid` hello that **re-presents the per-injection
+   token** from the mapping payload, so a reconnect is authenticated exactly
+   like a first session (P4 #3): a process that merely guessed the mapping
+   name cannot take the channel over.
+4. **After the budget expires, nothing changes.** The client stops trying
+   but undoes nothing — the thread parks on an unexpiring timer so the
+   globals the hooks read (`queue`, `config`, `nbio_map`) stay bound and
+   the module stays mapped. Restarting the injector and re-injecting the
+   process gives it a new session, a new token and a new config.
+
+Pre-session failures are unchanged and still release the DLL, because at
+that point no detour is live in another thread: a missing or zero IPC port
+(`get_ipc_payload()`) and a failed `hook_create_all()` both unload from a
+helper thread.
+
+## 4. Debugging injected processes
 
 `proxinjectee.dll` executes **inside the target process** and detours live
 winsock APIs — a crash in injected code kills the target, so debug against
@@ -137,12 +174,14 @@ full table lives in `.agents/ROADMAP.md` §2:
   thread indefinitely. When stepping here, check that the non-blocking state
   is restored correctly — a wrongly restored mode looks like an unrelated
   async-I/O bug in the target application.
-- **DLL self-unload — `src/injectee/injectee.cpp`.** `DllMain` spawns a
-  *detached* worker thread (`do_client`) that runs the asio `io_context`;
-  when the IPC client finishes, that thread calls `FreeLibrary` on the DLL
-  itself. Never join it or hold references into the DLL past exit. Under a
-  debugger this means breakpoints and module presence can vanish mid-session
-  once the client loop exits — don't mistake the unload for a crash.
+- **Injector exit — `src/injectee/injectee.cpp`, `client.hpp`.** `DllMain`
+  spawns a *detached* worker thread (`do_client`) that runs the asio
+  `io_context`. It no longer calls `FreeLibrary` on the DLL when the IPC
+  channel closes: the injector dying must not unmap code that other threads
+  of the victim may be executing inside a detour. The module therefore stays
+  mapped for the lifetime of the process — see §4 for the whole policy, and
+  stop expecting the unload that used to make breakpoints and module
+  presence vanish mid-session.
 - **WoW64 exit-code pivot — `src/injector/injector.hpp`,
   `src/wow64/address_dumper.cpp`.** For 32-bit targets, the 64-bit injector
   learns the 32-bit `LoadLibraryW` address by launching
