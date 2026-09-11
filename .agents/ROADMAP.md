@@ -75,11 +75,11 @@ UI data-race fixes (`view.post`).
 ### P2 — Testing & CI foundation (none exists today; `**/*test*` is empty)
 - [x] Create a CTest-enabled host-side test target (no injection needed).
 - [ ] Round-trip tests for `schema.hpp` protopuf messages (encode/decode).
-- [ ] Tests for `utils.hpp` wildcard/regex process matching.
+- [x] Tests for `utils.hpp` wildcard/regex process matching.
 - [ ] Tests for `to_sockaddr` / `to_ip_addr` IPv4/IPv6/domain conversions (locks down
       the byte-order question flagged in §2).
 - [ ] Tests for socks5 request byte builders and `queue.hpp` behavior.
-- [ ] Wire CTest into `.github/workflows/build.yml` (existing job: windows-2022 with a
+- [x] Wire CTest into `.github/workflows/build.yml` (existing job: windows-2022 with a
       {Debug, Release} × {Win32, x64} matrix; snapshot/installer artifacts; gh-release
       on `v*` tags).
 - [ ] End-to-end smoke harness: spawn a dummy target process and an in-process socks5
