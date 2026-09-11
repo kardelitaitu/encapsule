@@ -17,6 +17,11 @@
 #include <utils.hpp>
 
 void do_client(HINSTANCE dll_handle, std::uint16_t port) {
+  if (port == 0) { // no IPC port: never start the client, just unload
+    FreeLibrary(dll_handle);
+    return;
+  }
+
   {
     asio::io_context io_context(1);
 
@@ -38,11 +43,22 @@ void do_client(HINSTANCE dll_handle, std::uint16_t port) {
   FreeLibrary(dll_handle);
 }
 
+// The injector publishes the control port in a per-process named mapping.
+// A missing mapping or a failed view means the setup was broken: report port
+// 0 and let the caller unload us, rather than dereferencing null in a victim.
 std::uint16_t get_port() {
   handle mapping = open_mapping(get_port_mapping_name(GetCurrentProcessId()));
+  if (!mapping) {
+    return 0;
+  }
 
   mapped_buffer port_buf(mapping.get());
-  return *(std::uint16_t *)port_buf.get();
+  auto port = port_buf.checked<std::uint16_t>();
+  if (!port) {
+    return 0;
+  }
+
+  return *port;
 }
 
 BOOL WINAPI DllMain(HINSTANCE dll_handle, DWORD reason, LPVOID reserved) {

@@ -38,7 +38,7 @@ struct handle : std::unique_ptr<void, static_function<CloseHandle>> {
 
 struct virtual_memory {
   void *const proc_handle;
-  void *const mem_addr;
+  void *mem_addr; // nulled by free(), dtor is then a no-op
   const SIZE_T size_;
 
   virtual_memory(void *proc_handle, SIZE_T size)
@@ -50,9 +50,14 @@ struct virtual_memory {
   virtual_memory(const virtual_memory &) = delete;
   virtual_memory(virtual_memory &&) = default;
 
-  ~virtual_memory() {
+  ~virtual_memory() { free(); }
+
+  // Release the remote allocation before this object goes out of scope;
+  // safe to call more than once.
+  void free() {
     if (mem_addr) {
       VirtualFreeEx(proc_handle, mem_addr, 0, MEM_RELEASE);
+      mem_addr = nullptr;
     }
   }
 
@@ -146,6 +151,12 @@ struct mapped_buffer : std::unique_ptr<void, static_function<UnmapViewOfFile>> {
       : base_type(MapViewOfFile(mapping,             // handle to map object
                                 FILE_MAP_ALL_ACCESS, // read/write permission
                                 0, offset, size)) {}
+
+  // Typed access to the view: nullptr when the mapping or the view itself
+  // failed, so callers check once instead of dereferencing .get() blindly.
+  template <typename T> T *checked() const {
+    return get() ? (T *)get() : nullptr;
+  }
 };
 
 inline std::optional<std::wstring> get_process_filepath(DWORD pid) {

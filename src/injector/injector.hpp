@@ -66,7 +66,11 @@ struct injector {
     }
 
     mapped_buffer port_buf(mapping.get());
-    *(std::uint16_t *)port_buf.get() = port;
+    auto port_dst = port_buf.checked<std::uint16_t>();
+    if (!port_dst) {
+      return false;
+    }
+    *port_dst = port;
 
     virtual_memory mem(proc, (filename.size() + 1) * sizeof(wchar_t));
     if (!mem)
@@ -91,7 +95,22 @@ struct injector {
     if (!thread)
       return false;
 
-    WaitForSingleObject(thread.get(), INFINITE);
+    // A remote thread that never finishes means LoadLibraryW is wedged in
+    // the target: never hang the injector, and give back the allocation.
+    if (WaitForSingleObject(thread.get(), 5000) != WAIT_OBJECT_0) {
+      mem.free();
+      return false;
+    }
+
+    // The thread exit code is the HMODULE LoadLibraryW returned in the
+    // target. NULL means it did not load (wrong arch, blocked DLL, missing
+    // dependency) - which used to be reported to the user as a success.
+    DWORD module_handle = 0;
+    if (!GetExitCodeThread(thread.get(), &module_handle) ||
+        module_handle == 0) {
+      mem.free();
+      return false;
+    }
 
     return true;
   }
