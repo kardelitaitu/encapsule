@@ -67,7 +67,14 @@ BOOL WINAPI DllMain(HINSTANCE dll_handle, DWORD reason, LPVOID reserved) {
     DisableThreadLibraryCalls(dll_handle);
     minhook::init();
 
-    hook_create_all();
+    if (hook_create_all().error()) {
+      // a half-initialized hook set must never go live: no enable, no
+      // client thread - unload the DLL again from a helper thread
+      std::thread([dll_handle] {
+        FreeLibraryAndExitThread(dll_handle, 0);
+      }).detach();
+      break;
+    }
 
     minhook::enable();
     std::thread(do_client, dll_handle, get_port()).detach();
@@ -76,6 +83,7 @@ BOOL WINAPI DllMain(HINSTANCE dll_handle, DWORD reason, LPVOID reserved) {
   case DLL_PROCESS_DETACH:
     minhook::disable();
     minhook::deinit();
+    hook_cleanup_wsa();
     break;
   }
   return TRUE;

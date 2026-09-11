@@ -420,9 +420,16 @@ struct hook_ConnectEx {
 
   static inline LPFN_CONNECTEX ConnectEx = nullptr;
 
+  // GetConnectEx() starts winsock to probe for the ConnectEx pointer;
+  // remember that, so DLL_PROCESS_DETACH can balance it with WSACleanup
+  static inline bool wsa_started = false;
+
   static LPFN_CONNECTEX GetConnectEx() {
     WSADATA wsaData;
-    WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+      return nullptr;
+    }
+    wsa_started = true;
 
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     DWORD numBytes = 0;
@@ -497,13 +504,28 @@ struct hook_ConnectEx {
   static minhook::status remove() { return minhook::remove(ConnectEx); }
 };
 
+// balance the WSAStartup issued by hook_ConnectEx::GetConnectEx; call it
+// from DLL_PROCESS_DETACH - a no-op unless we started winsock ourselves,
+// so the host process's own winsock refcount is never touched
+inline void hook_cleanup_wsa() {
+  if (hook_ConnectEx::wsa_started) {
+    hook_ConnectEx::wsa_started = false;
+    WSACleanup();
+  }
+}
+
 template <typename T, typename... Ts> minhook::status create_hooks() {
   if (auto status = T::create(); status.error()) {
     return status;
   }
 
   if constexpr (sizeof...(Ts) > 0) {
-    return create_hooks<Ts...>();
+    if (auto status = create_hooks<Ts...>(); status.error()) {
+      // partial failure: unroll - every already-created hook is removed
+      // (deeper frames unrolled themselves before the error reached us)
+      T::remove();
+      return status;
+    }
   }
 
   return MH_OK;
