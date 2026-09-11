@@ -1,6 +1,6 @@
 # AGENTS.md — proxinject
 
-Facts here were read from the cited sources (`master@f2d3027`). Re-verify after refactors.
+Facts here were read from the cited sources (`master@e48f373`). Re-verify after refactors.
 
 ## 1. Project overview
 
@@ -12,7 +12,7 @@ Third-party deps are FetchContent-pinned and downloaded at configure time — no
 
 ## 2. Repository layout
 
-- `CMakeLists.txt` — the **only** CMake file (no per-directory CMakeLists); all targets live here.
+- `CMakeLists.txt` — all product targets live here; the only other CMake files are under `tests/`.
 - `build.ps1` — build driver: configure + build Win32 and/or x64, then copy artifacts to `./release`.
 - `setup.nsi` — NSIS installer script; packs `release\*.*` (setup.nsi:56) into `proxinjectSetup.exe`.
 - `CMakeSettings.json` — Visual Studio IDE configs (Ninja, x64/x86); **not** used by build.ps1.
@@ -59,14 +59,31 @@ Params (`build.ps1:1-7`): `-build_dir` (default `build`), `-release_dir` (`relea
   `proxinjectee.dll`; an x64 run also copies `proxinjectee32.dll` + `wow64-address-dumper.exe` (`:41-42`).
 - Optional installer: `makensis /DVERSION=$(git describe --tags) setup.nsi` → `proxinjectSetup.exe`.
 
-**Configure gotcha (verified):** configuration runs `git describe --tags` and emits
-`FATAL_ERROR` when it fails (`CMakeLists.txt:82-89`). This clone has **no tags**
-(`git tag -l` is empty), so a fresh build fails there until you create one, e.g. `git tag v0.0.0`.
+**CMake 4.x:** every configure carries `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` (`build.ps1:26,28`,
+since d724762; also `CMakePresets.json:29`) because the FetchContent deps still declare
+`cmake_minimum_required(VERSION < 3.5)`. Keep it on any hand-rolled `cmake` configure line.
 
-**Tests: there is no automated test suite — verify via a successful build.** No `add_test()` /
-`enable_testing()` exists in any CMakeLists, and a `**/*test*` glob matches no file.
-(`set(BUILD_TESTS OFF ...)` at `CMakeLists.txt:37` only silences protopuf's own tests.) CI
-(`build.yml`) likewise only builds and packages.
+**Version:** configure reads `git describe --tags`; on failure it warns and falls back to
+`v0.0.0-unknown` (`CMakeLists.txt:83-92`), so a tag-less clone configures fine — no workaround needed.
+
+**Tests: host-side CTest suite (P2), no injection needed.** On by default:
+`option(PROXINJECT_BUILD_TESTS ...)` + `enable_testing()` + `add_subdirectory(tests)`
+(`CMakeLists.txt:146-150`); skipped under `PROXINJECTEE_ONLY=ON`, so the Win32 pass of an x64 run
+has no tests. Run locally after building:
+
+```powershell
+cmake --build build/x64 --config Release -j $env:NUMBER_OF_PROCESSORS   # or: cmake --build --preset x64
+ctest --test-dir build/x64 -C Release --output-on-failure -E '^e2e\.'   # CI blocking step, build.yml:31
+```
+
+- Registered: `common.schema`, `common.utils`, `injectee.winnet`, `common.queue` (targets `proxinject_test_*`,
+  one `add_test` per `tests/<mod>/CMakeLists.txt`) plus `e2e.*` (label `e2e`); exes go to `build/<arch>/test_bin/`.
+- The inject-and-connect e2e harness is **still landing** (ROADMAP P2 #7): `e2e.inject_connect`
+  currently exits 77, which CTest reports as *skipped*, not failed (`tests/e2e/e2e_test.cpp:249-259`;
+  `tests/e2e/CMakeLists.txt:59-60` sets `SKIP_RETURN_CODE 77`, `RUN_SERIAL`, `TIMEOUT 120`).
+- CI splits the suite: the blocking step excludes e2e (`build.yml:31`, `-E '^e2e\.'`); a separate
+  x64/Release step re-runs it non-blocking (`build.yml:33-36`, `-R '^e2e\.'` + `continue-on-error`).
+- `BUILD_TESTING OFF CACHE BOOL "" FORCE` (`CMakeLists.txt:38`) silences only the *deps'* tests, not ours.
 
 ## 4. Codebase-memory index (use this for accurate tool calls)
 
@@ -74,7 +91,8 @@ Indexed as project **`C-dev-encapsule`** (name derived from path `C:\dev\encapsu
 `C:/dev/encapsule`, branch `master`, mode moderate, **459 nodes / 1242 edges** (verified via
 `list_projects` / `index_status`). Packages: `injector` (127 nodes), `common` (69),
 `injectee` (53), `wow64` (1). Measured boundaries (calls): injector→common 38, injectee→common 18,
-injector→injectee 10, injectee→injector 3.
+injector→injectee 10, injectee→injector 3. The index **predates the P2 test tree** (32 File nodes,
+none under `tests/`) — re-index before querying test code.
 
 Caveat — 4 files are `parse_partial` (indexed, but constructs in these ranges MAY be missing;
 use `grep`/`read` as fallback there):
