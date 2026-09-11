@@ -1,0 +1,4 @@
+add_executable(proxinject_test_schema schema_test.cpp)
+target_link_libraries(proxinject_test_schema PRIVATE proxinject_common protopuf)
+target_include_directories(proxinject_test_schema PRIVATE ${CMAKE_SOURCE_DIR}/tests ${asio_SOURCE_DIR}/asio/include)
+add_test(NAME common.schema COMMAND proxinject_test_schema)

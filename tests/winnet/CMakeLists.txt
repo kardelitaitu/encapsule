@@ -1,0 +1,4 @@
+add_executable(proxinject_test_winnet winnet_test.cpp)
+target_link_libraries(proxinject_test_winnet PRIVATE proxinject_common protopuf ws2_32)
+target_include_directories(proxinject_test_winnet PRIVATE ${CMAKE_SOURCE_DIR}/tests ${CMAKE_SOURCE_DIR}/src/injectee ${asio_SOURCE_DIR}/asio/include)
+add_test(NAME injectee.winnet COMMAND proxinject_test_winnet)
