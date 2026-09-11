@@ -122,8 +122,11 @@ UI data-race fixes (`view.post`).
       fallback (fail the connect vs. direct connect). (77d60e8: SO_RCVTIMEO/SNDTIMEO
       deadline 3000ms all 4 detour sites, restore-not-clobber, fail-closed fallback
       per owner decision; nbio_map race + growth fixed. Proxy-connect bound = W7 hardening.)
-- [ ] Authenticate injectee↔injector sessions: per-injection token stored in the port
-      mapping and verified by the control server.
+- [x] Authenticate injectee↔injector sessions: per-injection token stored in the port
+      mapping and verified by the control server. (78b919b contract + 22e6d7c flow:
+      token minted fail-closed, registered before CreateRemoteThread, verified at
+      introduction, mismatch = session refused; mutation-probe proven; DoS on
+      unregistered connect fixed. Per-message auth = available follow-up.)
 - [x] Restrict the named mapping's DACL so same-user processes can't read the IPC
       port or race the mapping name (`src/common/utils.hpp:156`). (e1f4d00: SDDL
       user+SYSTEM, fail-closed on any SD failure; cross-user targets now fail
