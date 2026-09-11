@@ -113,9 +113,11 @@ UI data-race fixes (`view.post`).
 ### P4 — Correctness & hardening
 - [x] Fix the only in-code FIXME: address-family equality in
       `src/injectee/winnet.hpp:98`.
-- [ ] Add a timeout to the `blocking_scope` socks5 handshake path — a server that
+- [x] Add a timeout to the `blocking_scope` socks5 handshake path — a server that
       never answers must not block an application thread indefinitely; decide the
-      fallback (fail the connect vs. direct connect).
+      fallback (fail the connect vs. direct connect). (77d60e8: SO_RCVTIMEO/SNDTIMEO
+      deadline 3000ms all 4 detour sites, restore-not-clobber, fail-closed fallback
+      per owner decision; nbio_map race + growth fixed. Proxy-connect bound = W7 hardening.)
 - [ ] Authenticate injectee↔injector sessions: per-injection token stored in the port
       mapping and verified by the control server.
 - [ ] Restrict the named mapping's DACL so same-user processes can't read the IPC
