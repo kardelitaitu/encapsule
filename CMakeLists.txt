@@ -118,7 +118,7 @@ if(NOT PROXINJECTEE_ONLY)
 	set(ELEMENTS_APP_PROJECT proxinjector)
 	set(ELEMENTS_APP_SOURCES ${INJECTOR_GUI_SRCS})
 
-	set(ELEMENTS_APP_ICON "resources/proxinject.rc")
+	set(ELEMENTS_APP_ICON "resources/encapsule.rc")
 	list(APPEND ELEMENTS_APP_SOURCES ${ELEMENTS_APP_ICON})
 
 	set(ELEMENTS_ROOT ${elements_SOURCE_DIR})
