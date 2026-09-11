@@ -1,0 +1,73 @@
+{
+  "version": 2,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "vendor": {
+    "encapsule/build-ps1": {
+      "mirrors": "./build.ps1 -mode Release -arch x64",
+      "notes": [
+        "build.ps1:26 -> configure preset 'x64': cmake -DCMAKE_BUILD_TYPE=Release -A x64 -S . -B build/x64",
+        "build.ps1:28 -> configure preset 'win32-injectee-only' (via build.ps1:20): -DPROXINJECTEE_ONLY=ON -A Win32 -S . -B build/Win32",
+        "build.ps1:32 -> build preset 'x64': cmake --build build/x64 --config Release",
+        "build.ps1:34 -> build preset 'win32-injectee-only': cmake --build build/Win32 --config Release",
+        "build.ps1:36-45 copies artifacts into ./release (incl. proxinjectee.dll -> proxinjectee32.dll); the presets only configure/build, they do not copy."
+      ]
+    }
+  },
+  "configurePresets": [
+    {
+      "name": "vs-base",
+      "displayName": "Visual Studio base (hidden)",
+      "description": "Settings shared by both build.ps1 passes: the Visual Studio generator build.ps1 gets by default (it passes -A but no -G), and Release, build.ps1's default -mode. CMAKE_BUILD_TYPE is inert for the multi-config VS generator but mirrors build.ps1's -DCMAKE_BUILD_TYPE.",
+      "hidden": true,
+      "generator": "Visual Studio 17 2022",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "x64",
+      "displayName": "x64 full build (Release)",
+      "description": "Full 64-bit pass, mirroring build.ps1 -arch x64 (build.ps1:26,32): -A x64 into build/x64. Builds proxinjectee.dll, proxinjector (GUI) and proxinjector-cli.",
+      "inherits": "vs-base",
+      "binaryDir": "${sourceDir}/build/x64",
+      "architecture": {
+        "value": "x64",
+        "strategy": "set"
+      }
+    },
+    {
+      "name": "win32-injectee-only",
+      "displayName": "Win32 PROXINJECTEE_ONLY build (Release)",
+      "description": "32-bit injectee pass, mirroring the second half of build.ps1 -arch x64 (build.ps1:20,28,34): -A Win32 -DPROXINJECTEE_ONLY=ON into build/Win32. Yields build/Win32/Release/proxinjectee.dll, which build.ps1:41 ships as release/proxinjectee32.dll, plus wow64-address-dumper.exe (build.ps1:42).",
+      "inherits": "vs-base",
+      "binaryDir": "${sourceDir}/build/Win32",
+      "architecture": {
+        "value": "Win32",
+        "strategy": "set"
+      },
+      "cacheVariables": {
+        "PROXINJECTEE_ONLY": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "x64",
+      "displayName": "build x64 (Release)",
+      "description": "Equivalent to: cmake --build build/x64 --config Release (build.ps1:32).",
+      "configurePreset": "x64",
+      "configuration": "Release"
+    },
+    {
+      "name": "win32-injectee-only",
+      "displayName": "build Win32 injectee-only (Release)",
+      "description": "Equivalent to: cmake --build build/Win32 --config Release (build.ps1:34). Run it together with the 'x64' build preset to reproduce a full ./build.ps1 -mode Release -arch x64 run.",
+      "configurePreset": "win32-injectee-only",
+      "configuration": "Release"
+    }
+  ]
+}
