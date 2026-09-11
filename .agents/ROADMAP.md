@@ -1,12 +1,15 @@
-# proxinject — ROADMAP
+# encapsule — ROADMAP
 
 > Living document for contributors and AI agents working in this repository.
-> Grounded in the verified state of `master@b4b29ee`; file/line references included.
+> Grounded in the verified state of `master@ede7e02`; file/line references included.
 > Tick checkboxes as items land, and re-verify line numbers after refactors.
+>
+> Rebrand note: the project is being renamed `proxinject` → `encapsule` (see P1).
+> Until that lands, file/target names in this document still use the old branding.
 
 ## 1. Where the project stands
 
-proxinject is a **Windows-only socks5 proxy injection tool**: it injects `proxinjectee.dll`
+**encapsule** (still branded `proxinject` throughout the tree until the P1 rebrand) is a **Windows-only socks5 proxy injection tool**: it injects `proxinjectee.dll`
 into a running process and redirects that process's outbound TCP connections through a
 user-supplied socks5 server. One codebase, four real build targets
 (CMake ≥ 3.20, C++20, MSVC only, static CRT):
@@ -62,18 +65,45 @@ UI data-race fixes (`view.post`).
 - [ ] Define injectee behavior on injector exit mid-session (reconnect policy, clean
       unload) and on partial injection failure; document it.
 
-### P1 — Protocol & proxy coverage
+### P1 — Rebrand `proxinject` → `encapsule` (owner-approved; do before feature work)
+- [ ] Decide final names: GUI exe `encapsule`, CLI `encapsule-cli`, injectee
+      `encapsule-injectee.dll` / `encapsule-injectee32.dll` (or mirror the old
+      `proxinjectee` naming); keep `wow64-address-dumper` unless decided otherwise.
+- [ ] CMake: `project()` name, target names, `ELEMENTS_APP_PROJECT`, and the
+      `PROXINJECT_VERSION` / `version.hpp.in` variable set (`CMakeLists.txt`).
+- [ ] Code touchpoints: `ce::app("proxinject")` window title
+      (`src/injector/injector_gui.cpp`), `find_injectee` DLL lookup
+      (`src/injector/injector.hpp`), CLI description/help text
+      (`src/injector/injector_cli.cpp`), and the IPC mapping prefix
+      `PROXINJECT_PORT_IPC_<pid>` (`src/common/utils.hpp:156`) — the latter must be
+      renamed on BOTH injector and injectee sides atomically.
+- [ ] Build/packaging: `build.ps1` Win32 copy step (proxinjectee.dll → *32.dll),
+      `setup.nsi` product/shortcut names, `.github/workflows/build.yml`
+      artifact/release names (`proxinject-snapshot-*`), `resources/proxinject.rc`
+      and logo assets.
+- [ ] Docs/meta: README title, badges, screenshots, repo description (origin already
+      points at `kardelitaitu/encapsule.git`). Note: the winget package
+      `PragmaTwice.proxinject` belongs to upstream; decide whether to publish a
+      separate manifest for `kardelitaitu.encapsule`.
+
+### P2 — Protocol & proxy coverage
 - [ ] Hook DNS resolution (`getaddrinfo`, `GetAddrInfoW`, `GetAddrInfoExW`) — currently
       absent (grep-verified), so hostnames still resolve outside the tunnel: DNS leaks
       and connections can break on DNS-blocked hosts.
-- [ ] SOCKS5 username/password auth (RFC 1929); the handshake hardcodes no-auth
-      `{5,1,0}` in `src/injectee/socks5.hpp`.
-- [ ] State the UDP story explicitly: hooks cover TCP connect paths only; either
-      document TCP-only scope in the README or implement UDP ASSOCIATE.
+- [ ] Proxy username + password auth (owner-approved feature; RFC 1929): the handshake
+      hardcodes no-auth `{5,1,0}` in `src/injectee/socks5.hpp`. Offer method `0x02`,
+      implement the user/pass subnegotiation, extend `InjectorConfig`
+      (`src/common/schema.hpp`) to carry credentials over IPC, and add input surfaces
+      (e.g. `user:pass@host:port` in `-p`, or separate GUI fields and
+      `--proxy-user/--proxy-pass` CLI flags).
+- [ ] UDP support (owner-approved feature): implement SOCKS5 UDP ASSOCIATE
+      (RFC 1928 §7) in the injectee, hook the datagram APIs (`sendto`, `WSASendTo`,
+      `recvfrom`, `WSARecvFrom`), and decide the local-relay design and how UDP
+      activity is logged; keep the TCP path untouched.
 - [ ] Focused tests around `to_sockaddr` / `to_ip_addr` for IPv4/IPv6/domain
       (see the IPv6 byte-order note above).
 
-### P2 — Testing & CI (none exists today; `**/*test*` is empty)
+### P3 — Testing & CI (none exists today; `**/*test*` is empty)
 - [ ] First host-side test target (no injection needed): round-trip `schema.hpp`
       protopuf messages, `utils.hpp` wildcard/regex matching, `queue.hpp` behavior,
       socks5 request byte builders.
@@ -83,7 +113,7 @@ UI data-race fixes (`view.post`).
 - [ ] End-to-end smoke harness: spawn a dummy target process and an in-process socks5
       server, inject, assert the connection arrives through the proxy.
 
-### P3 — Build & packaging hygiene
+### P4 — Build & packaging hygiene
 - [ ] Replace `file(GLOB)` source collection (`CMakeLists.txt:98,106,122`) with explicit
       lists or add `CONFIGURE_DEPENDS`.
 - [ ] `git describe` hard-fails configuration outside a git checkout
@@ -96,7 +126,7 @@ UI data-race fixes (`view.post`).
       for injected processes; `docs/` holds only image assets and the logo attribution
       (`docs/logo/attribute.md`).
 
-### P4 — Product / UX
+### P5 — Product / UX
 - [ ] GUI/CLI parity is nearly complete (verified in `make_controls`): the GUI already
       offers all six input modes (pid, name, name-regexp, path, path-regexp, exec) and
       proxy/log/subprocess toggles. Remaining gap: the CLI-only
@@ -122,6 +152,7 @@ UI data-race fixes (`view.post`).
    `proxinjectee32.dll`, `wow64-address-dumper.exe`).
 2. There is no test suite yet — at minimum run
    `proxinjector-cli -p <host:port> -i <pid> -l` against a local socks5 server and a
-   target process, and confirm the redirected connections in the log.
+   target process, and confirm the redirected connections in the log. (Binary names
+   are per the current branding; the P1 rebrand renames them.)
 3. Check `git log --oneline` for the area you are touching; several files
    (`winraii.hpp`, `dynamic_list`) are mid-refactor territory.
