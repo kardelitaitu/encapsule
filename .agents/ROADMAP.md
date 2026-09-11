@@ -108,7 +108,7 @@ UI data-race fixes (`view.post`).
       and confirm the proxy path still works after the rename.
 
 ### P4 — Correctness & hardening
-- [ ] Fix the only in-code FIXME: address-family equality in
+- [x] Fix the only in-code FIXME: address-family equality in
       `src/injectee/winnet.hpp:98`.
 - [ ] Add a timeout to the `blocking_scope` socks5 handshake path — a server that
       never answers must not block an application thread indefinitely; decide the
