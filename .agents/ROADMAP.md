@@ -4,12 +4,12 @@
 > Grounded in the verified state of `master@ede7e02`; file/line references included.
 > Tick checkboxes as items land, and re-verify line numbers after refactors.
 >
-> Rebrand note: the project is being renamed `proxinject` → `encapsule` (see P1).
+> Rebrand note: the project is being renamed `proxinject` → `encapsule` (see P3).
 > Until that lands, file/target names in this document still use the old branding.
 
 ## 1. Where the project stands
 
-**encapsule** (still branded `proxinject` throughout the tree until the P1 rebrand) is a **Windows-only socks5 proxy injection tool**: it injects `proxinjectee.dll`
+**encapsule** (still branded `proxinject` throughout the tree until the P3 rebrand) is a **Windows-only socks5 proxy injection tool**: it injects `proxinjectee.dll`
 into a running process and redirects that process's outbound TCP connections through a
 user-supplied socks5 server. One codebase, four real build targets
 (CMake ≥ 3.20, C++20, MSVC only, static CRT):
@@ -54,89 +54,125 @@ UI data-race fixes (`view.post`).
 
 ## 3. Roadmap
 
-### P0 — Correctness & safety (do first)
-- [ ] Fix the only in-code FIXME: address-family equality in `src/injectee/winnet.hpp:98`.
-- [ ] Audit the `blocking_scope` path for stalls: a socks5 server that never answers
-      blocks an application thread indefinitely. Add a timeout and decide the fallback
-      (fail the connect vs. direct connect).
-- [ ] Harden local IPC: authenticate injectee↔injector sessions (e.g. per-injection
-      token stored in the mapping) and restrict the mapping's DACL; today any same-user
-      process can read the port or connect to the control server.
-- [ ] Define injectee behavior on injector exit mid-session (reconnect policy, clean
-      unload) and on partial injection failure; document it.
+> Sequencing rationale: foundations first (reproducible builds, then a test/CI safety
+> net) so every later change is verifiable → mechanical rebrand before feature work so
+> new code lands under final names → correctness/hardening → protocol features in
+> increasing size (auth → DNS → UDP) → UX polish last.
 
-### P1 — Rebrand `proxinject` → `encapsule` (owner-approved; do before feature work)
-- [ ] Decide final names: GUI exe `encapsule`, CLI `encapsule-cli`, injectee
-      `encapsule-injectee.dll` / `encapsule-injectee32.dll` (or mirror the old
-      `proxinjectee` naming); keep `wow64-address-dumper` unless decided otherwise.
-- [ ] CMake: `project()` name, target names, `ELEMENTS_APP_PROJECT`, and the
-      `PROXINJECT_VERSION` / `version.hpp.in` variable set (`CMakeLists.txt`).
-- [ ] Code touchpoints: `ce::app("proxinject")` window title
-      (`src/injector/injector_gui.cpp`), `find_injectee` DLL lookup
-      (`src/injector/injector.hpp`), CLI description/help text
-      (`src/injector/injector_cli.cpp`), and the IPC mapping prefix
-      `PROXINJECT_PORT_IPC_<pid>` (`src/common/utils.hpp:156`) — the latter must be
-      renamed on BOTH injector and injectee sides atomically.
-- [ ] Build/packaging: `build.ps1` Win32 copy step (proxinjectee.dll → *32.dll),
-      `setup.nsi` product/shortcut names, `.github/workflows/build.yml`
-      artifact/release names (`proxinject-snapshot-*`), `resources/proxinject.rc`
-      and logo assets.
-- [ ] Docs/meta: README title, badges, screenshots, repo description (origin already
-      points at `kardelitaitu/encapsule.git`). Note: the winget package
-      `PragmaTwice.proxinject` belongs to upstream; decide whether to publish a
-      separate manifest for `kardelitaitu.encapsule`.
+### P1 — Build & packaging foundation (quick wins)
+- [ ] Replace `file(GLOB)` source collection with explicit source lists (or add
+      `CONFIGURE_DEPENDS`) at `CMakeLists.txt:98,106,122`.
+- [ ] Add a fallback version string when `git describe` fails outside a git checkout
+      (`CMakeLists.txt:82-89`) instead of hard-failing configuration.
+- [ ] Add `CMakePresets.json` mirroring `build.ps1` (x64 full build + Win32
+      `PROXINJECTEE_ONLY=ON` pass that yields `proxinjectee32.dll`).
+- [ ] Scheduled chore: bump pinned FetchContent deps (asio 1.22.2, spdlog 1.10.0,
+      argparse v2.9, protopuf v2.2.1) and refresh the elements fork pin.
+- [ ] Add contributor docs: build prerequisites (MSVC, Windows SDK, CMake) and
+      debugging tips for injected processes (`docs/` currently holds only image assets
+      and the logo attribution, `docs/logo/attribute.md`).
 
-### P2 — Protocol & proxy coverage
-- [ ] Hook DNS resolution (`getaddrinfo`, `GetAddrInfoW`, `GetAddrInfoExW`) — currently
-      absent (grep-verified), so hostnames still resolve outside the tunnel: DNS leaks
-      and connections can break on DNS-blocked hosts.
-- [ ] Proxy username + password auth (owner-approved feature; RFC 1929): the handshake
-      hardcodes no-auth `{5,1,0}` in `src/injectee/socks5.hpp`. Offer method `0x02`,
-      implement the user/pass subnegotiation, extend `InjectorConfig`
-      (`src/common/schema.hpp`) to carry credentials over IPC, and add input surfaces
-      (e.g. `user:pass@host:port` in `-p`, or separate GUI fields and
-      `--proxy-user/--proxy-pass` CLI flags).
-- [ ] UDP support (owner-approved feature): implement SOCKS5 UDP ASSOCIATE
-      (RFC 1928 §7) in the injectee, hook the datagram APIs (`sendto`, `WSASendTo`,
-      `recvfrom`, `WSARecvFrom`), and decide the local-relay design and how UDP
-      activity is logged; keep the TCP path untouched.
-- [ ] Focused tests around `to_sockaddr` / `to_ip_addr` for IPv4/IPv6/domain
-      (see the IPv6 byte-order note above).
-
-### P3 — Testing & CI (none exists today; `**/*test*` is empty)
-- [ ] First host-side test target (no injection needed): round-trip `schema.hpp`
-      protopuf messages, `utils.hpp` wildcard/regex matching, `queue.hpp` behavior,
-      socks5 request byte builders.
+### P2 — Testing & CI foundation (none exists today; `**/*test*` is empty)
+- [ ] Create a CTest-enabled host-side test target (no injection needed).
+- [ ] Round-trip tests for `schema.hpp` protopuf messages (encode/decode).
+- [ ] Tests for `utils.hpp` wildcard/regex process matching.
+- [ ] Tests for `to_sockaddr` / `to_ip_addr` IPv4/IPv6/domain conversions (locks down
+      the byte-order question flagged in §2).
+- [ ] Tests for socks5 request byte builders and `queue.hpp` behavior.
 - [ ] Wire CTest into `.github/workflows/build.yml` (existing job: windows-2022 with a
       {Debug, Release} × {Win32, x64} matrix; snapshot/installer artifacts; gh-release
       on `v*` tags).
 - [ ] End-to-end smoke harness: spawn a dummy target process and an in-process socks5
       server, inject, assert the connection arrives through the proxy.
 
-### P4 — Build & packaging hygiene
-- [ ] Replace `file(GLOB)` source collection (`CMakeLists.txt:98,106,122`) with explicit
-      lists or add `CONFIGURE_DEPENDS`.
-- [ ] `git describe` hard-fails configuration outside a git checkout
-      (`CMakeLists.txt:82-89`) — add a fallback version string.
-- [ ] Add CMake presets mirroring `build.ps1` (x64 full build + Win32
-      `PROXINJECTEE_ONLY=ON` pass that yields `proxinjectee32.dll`).
-- [ ] Scheduled chore: bump pinned deps (asio 1.22.2, spdlog 1.10.0, argparse v2.9,
-      protopuf v2.2.1) and refresh the elements fork pin.
-- [ ] Contributor docs: build prerequisites (MSVC, Windows SDK, CMake), debugging tips
-      for injected processes; `docs/` holds only image assets and the logo attribution
-      (`docs/logo/attribute.md`).
+### P3 — Rebrand `proxinject` → `encapsule` (owner-approved)
+- [ ] Decide final names: GUI exe `encapsule`, CLI `encapsule-cli`, injectee
+      `encapsule-injectee.dll` / `encapsule-injectee32.dll` (or mirror the old
+      `proxinjectee` naming); keep `wow64-address-dumper` unless decided otherwise.
+- [ ] CMake: `project()` name, target names, `ELEMENTS_APP_PROJECT`, and the
+      `PROXINJECT_VERSION` / `version.hpp.in` variable set (`CMakeLists.txt`).
+- [ ] Rename the IPC mapping prefix `PROXINJECT_PORT_IPC_<pid>` on BOTH injector and
+      injectee sides atomically (`src/common/utils.hpp:156` + the injectee lookup).
+- [ ] Update `find_injectee` DLL lookup (`src/injector/injector.hpp`) and the
+      `build.ps1` Win32 copy step (proxinjectee.dll → *32.dll).
+- [ ] Update UI/CLI strings: `ce::app("proxinject")` window title
+      (`src/injector/injector_gui.cpp`), CLI description/help text
+      (`src/injector/injector_cli.cpp`).
+- [ ] Update packaging: `setup.nsi` product/shortcut names,
+      `.github/workflows/build.yml` artifact/release names (`proxinject-snapshot-*`),
+      `resources/proxinject.rc` and logo assets.
+- [ ] Update docs/meta: README title, badges, screenshots, repo description (origin
+      already points at `kardelitaitu/encapsule.git`); decide whether to publish a
+      `kardelitaitu.encapsule` winget manifest (upstream's package stays theirs).
+- [ ] Full rebuild (x64 + Win32) and end-to-end smoke test: inject into a real process
+      and confirm the proxy path still works after the rename.
 
-### P5 — Product / UX
-- [ ] GUI/CLI parity is nearly complete (verified in `make_controls`): the GUI already
-      offers all six input modes (pid, name, name-regexp, path, path-regexp, exec) and
-      proxy/log/subprocess toggles. Remaining gap: the CLI-only
-      `-w/--new-console-window` for exec mode — surface it as a GUI toggle.
-- [ ] Auto-inject on process start: the matching utilities (`match_process*` in
-      `src/common/winraii.hpp`) already support wildcard/regexp — a process-watch loop
-      can reuse them.
+### P4 — Correctness & hardening
+- [ ] Fix the only in-code FIXME: address-family equality in
+      `src/injectee/winnet.hpp:98`.
+- [ ] Add a timeout to the `blocking_scope` socks5 handshake path — a server that
+      never answers must not block an application thread indefinitely; decide the
+      fallback (fail the connect vs. direct connect).
+- [ ] Authenticate injectee↔injector sessions: per-injection token stored in the port
+      mapping and verified by the control server.
+- [ ] Restrict the named mapping's DACL so same-user processes can't read the IPC
+      port or race the mapping name (`src/common/utils.hpp:156`).
+- [ ] Define and implement injector-exit behavior mid-session: reconnect policy and
+      clean DLL unload; document it.
+- [ ] Audit partial injection failure: mapping cleanup and no half-initialized hooks
+      left in the target process.
+
+### P5 — Feature: proxy username + password (owner-approved; RFC 1929)
+- [ ] Extend `InjectorConfig` (`src/common/schema.hpp`) with credential fields; both
+      sides move together to keep the protopuf wire format compatible.
+- [ ] Injectee: offer methods `{5, 2, 0}` (no-auth + userpass) instead of the
+      hardcoded `{5,1,0}` in `src/injectee/socks5.hpp`.
+- [ ] Injectee: implement the RFC 1929 user/pass subnegotiation and apply configured
+      credentials during `socks5_handshake`.
+- [ ] Server side: validate and forward credentials from the frontends into the
+      config message.
+- [ ] CLI: accept credentials via `-p user:pass@host:port` and/or dedicated
+      `--proxy-user/--proxy-pass` flags.
+- [ ] GUI: accept credentials in the proxy input (URI syntax or dedicated fields).
+- [ ] Unit tests: handshake byte-level tests covering auth success and auth failure.
+- [ ] E2E: verify against a socks5 server that requires authentication.
+
+### P6 — Feature: DNS resolution hooking
+- [ ] Decide the strategy: fake-IP domain mapping vs. pass-through resolution with
+      remote resolve at the proxy (`ATYP=3` domain requests already exist in
+      `socks5_request`).
+- [ ] Hook `getaddrinfo` / `GetAddrInfoW` (+ `GetAddrInfoExW` if async resolution
+      needs it) via the CRTP MinHook wrapper — currently absent (grep-verified), so
+      DNS leaks outside the tunnel.
+- [ ] Implement the chosen strategy in the injectee.
+- [ ] Preserve async semantics for overlapped resolution paths (interplay with the
+      existing `WSAAsyncSelect`/`WSAEventSelect` hooks).
+- [ ] Emit DNS events into the existing connection-log pipeline.
+- [ ] Tests: mapping-table unit tests; E2E check that no DNS query leaves the tunnel.
+
+### P7 — Feature: UDP support (owner-approved)
+- [ ] Survey the datagram API surface to hook: `sendto`, `WSASendTo`, `recvfrom`,
+      `WSARecvFrom`, plus connected-UDP `send`/`recv` on `SOCK_DGRAM` sockets.
+- [ ] Implement the SOCKS5 UDP ASSOCIATE client (RFC 1928 §7): TCP control request,
+      relay endpoint reply, datagram header (FRAG/ATYP/addr/port).
+- [ ] Decide the local-relay architecture (per-socket relay vs. shared relay socket).
+- [ ] Hook outbound datagrams: encapsulate and forward via the relay.
+- [ ] Hook inbound datagrams: decapsulate replies and hand them to the application.
+- [ ] Handle exclusions: localhost targets and proxy-loop prevention for the relay
+      traffic itself.
+- [ ] Report UDP activity through the existing log pipeline.
+- [ ] E2E test against a UDP-capable socks5 server; keep the TCP path regression-free.
+
+### P8 — Product / UX
+- [ ] Surface the CLI-only `-w/--new-console-window` as a GUI toggle (the last
+      GUI/CLI parity gap; the GUI already covers all six input modes and
+      proxy/log/subprocess toggles per `make_controls`).
+- [ ] Auto-inject on process start: a watch loop reusing the `match_process*`
+      utilities (`src/common/winraii.hpp`, wildcard/regexp already supported).
 - [ ] Connection-log improvements: per-process aggregation, copy/export of the log.
-- [ ] Tray icon / minimize behavior; continued `dynamic_list` polish (the active area
-      of recent commits).
+- [ ] Tray icon / minimize behavior.
+- [ ] Continued `dynamic_list` polish (the active area of recent commits).
+- [ ] Refresh the README feature list once auth/DNS/UDP land.
 
 ## 4. Non-goals
 
@@ -153,6 +189,6 @@ UI data-race fixes (`view.post`).
 2. There is no test suite yet — at minimum run
    `proxinjector-cli -p <host:port> -i <pid> -l` against a local socks5 server and a
    target process, and confirm the redirected connections in the log. (Binary names
-   are per the current branding; the P1 rebrand renames them.)
+   are per the current branding; the P3 rebrand renames them.)
 3. Check `git log --oneline` for the area you are touching; several files
    (`winraii.hpp`, `dynamic_list`) are mid-refactor territory.
