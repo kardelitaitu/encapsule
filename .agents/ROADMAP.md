@@ -76,7 +76,7 @@ UI data-race fixes (`view.post`).
 - [x] Create a CTest-enabled host-side test target (no injection needed).
 - [ ] Round-trip tests for `schema.hpp` protopuf messages (encode/decode).
 - [x] Tests for `utils.hpp` wildcard/regex process matching.
-- [ ] Tests for `to_sockaddr` / `to_ip_addr` IPv4/IPv6/domain conversions (locks down
+- [x] Tests for `to_sockaddr` / `to_ip_addr` IPv4/IPv6/domain conversions (locks down
       the byte-order question flagged in §2).
 - [x] Tests for socks5 request byte builders and `queue.hpp` behavior.
 - [x] Wire CTest into `.github/workflows/build.yml` (existing job: windows-2022 with a
