@@ -1,4 +1,4 @@
-﻿# Copyright 2022 PragmaTwice
+# Copyright 2022 PragmaTwice
 #
 # Licensed under the Apache License,
 # Version 2.0(the "License");
@@ -82,10 +82,12 @@ set(WIN32_VERSION 0x0A00)
 execute_process(COMMAND git describe --tags
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 	RESULT_VARIABLE GIT_DESCRIBE_EXITCODE
-	OUTPUT_VARIABLE PROXINJECT_VERSION)
+	OUTPUT_VARIABLE PROXINJECT_VERSION
+	ERROR_QUIET)
 
 if(NOT GIT_DESCRIBE_EXITCODE EQUAL 0)
-	message(FATAL_ERROR "error occurred while dumping version via `git describe`")
+	set(PROXINJECT_VERSION "v0.0.0-unknown")
+	message(WARNING "failed to dump version via `git describe`, falling back to ${PROXINJECT_VERSION}")
 endif()
 
 string(STRIP ${PROXINJECT_VERSION} PROXINJECT_VERSION)
@@ -95,7 +97,9 @@ add_library(proxinject_common INTERFACE)
 target_include_directories(proxinject_common INTERFACE src/common ${CMAKE_BINARY_DIR}/src/common)
 target_compile_definitions(proxinject_common INTERFACE -D_WIN32_WINNT=${WIN32_VERSION} -DUNICODE)
 
-file(GLOB INJECTEE_SRCS src/injectee/*.cpp)
+set(INJECTEE_SRCS
+	src/injectee/injectee.cpp
+)
 
 add_library(proxinjectee SHARED ${INJECTEE_SRCS})
 target_compile_features(proxinjectee PUBLIC cxx_std_20)
@@ -103,7 +107,12 @@ target_link_libraries(proxinjectee PUBLIC minhook ws2_32 protopuf proxinject_com
 target_include_directories(proxinjectee PUBLIC ${asio_SOURCE_DIR}/asio/include)
 
 if(NOT PROXINJECTEE_ONLY)
-	file(GLOB INJECTOR_GUI_SRCS src/injector/injector_gui.cpp src/injector/ui_elements/*.cpp)
+	set(INJECTOR_GUI_SRCS
+		src/injector/injector_gui.cpp
+		src/injector/ui_elements/dynamic_list.cpp
+		src/injector/ui_elements/text_box.cpp
+		src/injector/ui_elements/tooltip.cpp
+	)
 
 	set(ELEMENTS_APP_PROJECT proxinjector)
 	set(ELEMENTS_APP_SOURCES ${INJECTOR_GUI_SRCS})
@@ -119,7 +128,9 @@ if(NOT PROXINJECTEE_ONLY)
 	target_link_libraries(proxinjector PUBLIC protopuf proxinject_common)
 	target_include_directories(proxinjector PUBLIC ${asio_SOURCE_DIR}/asio/include)
 
-	file(GLOB INJECTOR_CLI_SRCS src/injector/injector_cli.cpp)
+	set(INJECTOR_CLI_SRCS
+		src/injector/injector_cli.cpp
+	)
 
 	add_executable(proxinjector-cli ${INJECTOR_CLI_SRCS})
 	target_compile_features(proxinjector-cli PUBLIC cxx_std_20)
