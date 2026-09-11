@@ -87,6 +87,10 @@ UI data-race fixes (`view.post`).
       on `v*` tags).
 - [x] End-to-end smoke harness: spawn a dummy target process and an in-process socks5
       server, inject, assert the connection arrives through the proxy.
+      (CI gate: blocking again with `--repeat until-pass:3` — 6bd44e7 lifts the
+      9445dd4 `continue-on-error` quarantine now that the injection leg is real.
+      Optional polish: fold `e2e.*` back into the single `Test` step and add
+      `--error-on-skip`.)
 
 ### P3 — Rebrand `proxinject` → `encapsule` (owner-approved)
 - [ ] Decide final names: GUI exe `encapsule`, CLI `encapsule-cli`, injectee
@@ -126,8 +130,9 @@ UI data-race fixes (`view.post`).
       cleanly via the W2 fail-safe — same-user injection proven by e2e.inject_connect.)
 - [ ] Define and implement injector-exit behavior mid-session: reconnect policy and
       clean DLL unload; document it.
-- [ ] Audit partial injection failure: mapping cleanup and no half-initialized hooks
-      left in the target process.
+- [x] Audit partial injection failure: mapping cleanup and no half-initialized hooks
+      left in the target process. (256e27d fail-safe mapping + verified load result;
+      41369fd reverse-order hook unroll + DllMain never live half-initialized + WSA refcount guard.)
 
 ### P5 — Feature: proxy username + password (owner-approved; RFC 1929)
 - [ ] Extend `InjectorConfig` (`src/common/schema.hpp`) with credential fields; both
