@@ -42,7 +42,7 @@ int main(int argc, char *argv[]) {
   injector_server server;
   process_vector process_vec;
 
-  ce::app app(argc, argv, "proxinject", "proxinject");
+  ce::app app(argc, argv, "encapsule", "encapsule");
   ce::window win(app.name());
   win.on_close = [&app]() { app.stop(); };
 

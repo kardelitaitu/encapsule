@@ -26,14 +26,14 @@ using argparse::ArgumentParser;
 using namespace std;
 
 auto create_parser() {
-  ArgumentParser parser("proxinjector-cli", proxinject_version,
+  ArgumentParser parser("encapsule-cli", encapsule_version,
                         argparse::default_arguments::help);
 
-  parser.add_description(proxinject_description);
+  parser.add_description(encapsule_description);
 
   parser.add_argument("-v", "--version")
       .action([&](const auto & /*unused*/) {
-        std::cout << proxinject_copyright(proxinject_version) << std::endl;
+        std::cout << encapsule_copyright(encapsule_version) << std::endl;
         std::exit(0);
       })
       .default_value(false)

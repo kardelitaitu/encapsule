@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef PROXINJECT_COMMON_UTILS
-#define PROXINJECT_COMMON_UTILS
+#ifndef ENCAPSULE_COMMON_UTILS
+#define ENCAPSULE_COMMON_UTILS
 
 #include <cstddef>
 #include <cstdint>
@@ -158,7 +158,7 @@ inline bool regex_match_filename(const std::string &pattern,
   return matched;
 }
 
-inline const std::wstring port_mapping_name = L"PROXINJECT_PORT_IPC_";
+inline const std::wstring port_mapping_name = L"ENCAPSULE_PORT_IPC_";
 
 inline std::wstring get_port_mapping_name(DWORD pid) {
   return port_mapping_name + std::to_wstring(pid);
@@ -211,14 +211,14 @@ get_port_mapping_payload(std::uint16_t port) {
   return payload;
 }
 
-inline std::string proxinject_copyright(const std::string &version) {
-  return "proxinject " + version + "\n\n" + "Copyright (c) PragmaTwice\n" +
+inline std::string encapsule_copyright(const std::string &version) {
+  return "encapsule " + version + "\n\n" + "Copyright (c) PragmaTwice\n" +
          "Licensed under the Apache License, Version 2.0";
 }
 
-inline std::string proxinject_description =
+inline std::string encapsule_description =
     "A socks5 proxy injection tool for Windows: just select some processes "
     "and make them proxy-able!\nPlease visit "
-    "https://github.com/PragmaTwice/proxinject for more information.";
+    "https://github.com/kardelitaitu/encapsule for more information.";
 
 #endif

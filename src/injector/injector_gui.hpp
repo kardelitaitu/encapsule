@@ -268,7 +268,7 @@ auto make_controls(injector_server &server, ce::view &view,
 
   auto info_button = icon_button(icons::info, 1.2, bcblue);
   info_button.on_click = [&view](bool) {
-    view.add(message_box1(view, proxinject_copyright(proxinject_version),
+    view.add(message_box1(view, encapsule_copyright(encapsule_version),
                           icons::info, [] {}));
   };
 

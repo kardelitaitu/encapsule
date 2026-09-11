@@ -13,11 +13,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef PROXINJECT_COMMON_VERSION
-#define PROXINJECT_COMMON_VERSION
+#ifndef ENCAPSULE_COMMON_VERSION
+#define ENCAPSULE_COMMON_VERSION
 
 #include <string>
 
-inline const std::string proxinject_version = "@PROXINJECT_VERSION@";
+inline const std::string encapsule_version = "@ENCAPSULE_VERSION@";
 
 #endif
