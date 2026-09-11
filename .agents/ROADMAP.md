@@ -131,8 +131,11 @@ UI data-race fixes (`view.post`).
       port or race the mapping name (`src/common/utils.hpp:156`). (e1f4d00: SDDL
       user+SYSTEM, fail-closed on any SD failure; cross-user targets now fail
       cleanly via the W2 fail-safe — same-user injection proven by e2e.inject_connect.)
-- [ ] Define and implement injector-exit behavior mid-session: reconnect policy and
-      clean DLL unload; document it.
+- [x] Define and implement injector-exit behavior mid-session: reconnect policy and
+      clean DLL unload; document it. (4a37adc: stay-resident, bounded 1s-10s backoff
+      re-presenting the token, fail-closed routing via pinned config, docs §3;
+      manual kill-probe: routing 3ms post-kill, reconnect at 1.006s, per-injection
+      token randomness verified. Follow-up: e2e.inject_kill_reconnect case.)
 - [x] Audit partial injection failure: mapping cleanup and no half-initialized hooks
       left in the target process. (256e27d fail-safe mapping + verified load result;
       41369fd reverse-order hook unroll + DllMain never live half-initialized + WSA refcount guard.)
