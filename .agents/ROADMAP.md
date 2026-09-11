@@ -78,7 +78,7 @@ UI data-race fixes (`view.post`).
 - [x] Tests for `utils.hpp` wildcard/regex process matching.
 - [ ] Tests for `to_sockaddr` / `to_ip_addr` IPv4/IPv6/domain conversions (locks down
       the byte-order question flagged in §2).
-- [ ] Tests for socks5 request byte builders and `queue.hpp` behavior.
+- [x] Tests for socks5 request byte builders and `queue.hpp` behavior.
 - [x] Wire CTest into `.github/workflows/build.yml` (existing job: windows-2022 with a
       {Debug, Release} × {Win32, x64} matrix; snapshot/installer artifacts; gh-release
       on `v*` tags).
