@@ -22,6 +22,8 @@
 #include "utils.hpp"
 #include "winnet.hpp"
 #include <map>
+#include <mutex>
+#include <optional>
 #include <protopuf/fixed_string.h>
 #include <string>
 
@@ -29,10 +31,44 @@ inline blocking_queue<InjecteeMessage> *queue = nullptr;
 inline injectee_config *config = nullptr;
 inline std::map<SOCKET, bool> *nbio_map = nullptr;
 
+// guards nbio_map; never hold it across winsock calls (detour reentry)
+inline std::mutex nbio_mutex;
+
+inline void nbio_store(SOCKET s, bool nb) {
+  if (!nbio_map) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(nbio_mutex);
+  (*nbio_map)[s] = nb;
+}
+
+inline std::optional<bool> nbio_load(SOCKET s) {
+  if (!nbio_map) {
+    return std::nullopt;
+  }
+  std::lock_guard<std::mutex> lock(nbio_mutex);
+  if (auto iter = nbio_map->find(s); iter != nbio_map->end()) {
+    return iter->second;
+  }
+  return std::nullopt;
+}
+
+inline void nbio_erase(SOCKET s) {
+  if (!nbio_map) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(nbio_mutex);
+  nbio_map->erase(s);
+}
+
+// deadline for the socks5 handshake performed inside blocking_scope; a
+// timed-out handshake fails the connect (never silently direct-connects)
+inline constexpr std::uint32_t SOCKS_HANDSHAKE_TIMEOUT_MS = 3000;
+
 struct hook_ioctlsocket : minhook::api<ioctlsocket, hook_ioctlsocket> {
   static int WSAAPI detour(SOCKET s, long cmd, u_long FAR *argp) {
     if (nbio_map && cmd == FIONBIO) {
-      (*nbio_map)[s] = *argp;
+      nbio_store(s, *argp != 0);
     }
 
     return original(s, cmd, argp);
@@ -41,7 +77,7 @@ struct hook_ioctlsocket : minhook::api<ioctlsocket, hook_ioctlsocket> {
 struct hook_WSAAsyncSelect : minhook::api<WSAAsyncSelect, hook_WSAAsyncSelect> {
   static int WSAAPI detour(SOCKET s, HWND hWnd, u_int wMsg, long lEvent) {
     if (nbio_map) {
-      (*nbio_map)[s] = true;
+      nbio_store(s, true);
     }
 
     return original(s, hWnd, wMsg, lEvent);
@@ -51,33 +87,69 @@ struct hook_WSAEventSelect : minhook::api<WSAEventSelect, hook_WSAEventSelect> {
   static int WSAAPI detour(SOCKET s, WSAEVENT hEventObject,
                            long lNetworkEvents) {
     if (nbio_map) {
-      (*nbio_map)[s] = true;
+      nbio_store(s, true);
     }
 
     return original(s, hEventObject, lNetworkEvents);
   }
 };
 
+// forget the per-socket non-blocking state when the target closes the
+// socket, so nbio_map cannot grow without bound
+struct hook_closesocket : minhook::api<closesocket, hook_closesocket> {
+  static int WSAAPI detour(SOCKET s) {
+    nbio_erase(s);
+    return original(s);
+  }
+};
+
 struct blocking_scope {
   SOCKET sock;
+  DWORD old_rcvtimeo = 0;
+  DWORD old_sndtimeo = 0;
 
-  blocking_scope(SOCKET s) : sock(s) {
+  blocking_scope(SOCKET s, std::uint32_t timeout_ms) : sock(s) {
+    int size = sizeof(DWORD);
+    getsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&old_rcvtimeo, &size);
+    size = sizeof(DWORD);
+    getsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char *)&old_sndtimeo, &size);
+
+    const DWORD timeout = timeout_ms;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout,
+               sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout,
+               sizeof(timeout));
+
     u_long nb = FALSE;
     hook_ioctlsocket::original(sock, FIONBIO, &nb);
   }
   ~blocking_scope() {
-    if (nbio_map) {
-      u_long nb = FALSE;
-      if (auto iter = nbio_map->find(sock); iter != nbio_map->end()) {
-        nb = (u_long)iter->second;
-      }
-      hook_ioctlsocket::original(sock, FIONBIO, &nb);
+    bool nb = false;
+    if (auto saved = nbio_load(sock)) {
+      nb = *saved;
     }
+    u_long value = nb ? TRUE : FALSE;
+    hook_ioctlsocket::original(sock, FIONBIO, &value);
+
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&old_rcvtimeo,
+               sizeof(old_rcvtimeo));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char *)&old_sndtimeo,
+               sizeof(old_sndtimeo));
   }
 
   blocking_scope(const blocking_scope &) = delete;
   blocking_scope(blocking_scope &&) = delete;
 };
+
+// fail the proxied connect: tear the proxy link down and leave a fresh
+// error code behind - a handshake timeout surfaces as WSAETIMEDOUT, any
+// other handshake failure as WSAECONNREFUSED, never a stale error
+inline int fail_proxied_connect(SOCKET s, int ret) {
+  const int err = WSAGetLastError();
+  shutdown(s, SD_BOTH);
+  WSASetLastError(err == WSAETIMEDOUT ? WSAETIMEDOUT : WSAECONNREFUSED);
+  return ret;
+}
 
 template <auto F, pp::basic_fixed_string N>
 struct hook_connect_fn : minhook::api<F, hook_connect_fn<F, N>> {
@@ -100,19 +172,17 @@ struct hook_connect_fn : minhook::api<F, hook_connect_fn<F, N>> {
         if (proxy) {
           if (auto [addr, addr_size] = to_sockaddr(*proxy);
               addr && !sockequal(addr.get(), name)) {
-            blocking_scope scope(s);
+            blocking_scope scope(s, SOCKS_HANDSHAKE_TIMEOUT_MS);
 
             auto ret = base::original(s, addr.get(), addr_size, args...);
             if (ret)
               return ret;
 
             if (!socks5_handshake(s)) {
-              shutdown(s, SD_BOTH);
-              return SOCKET_ERROR;
+              return fail_proxied_connect(s, SOCKET_ERROR);
             }
             if (socks5_request(s, name) != SOCKS_SUCCESS) {
-              shutdown(s, SD_BOTH);
-              return SOCKET_ERROR;
+              return fail_proxied_connect(s, SOCKET_ERROR);
             }
 
             return 0;
@@ -154,18 +224,18 @@ struct hook_WSAConnectByList
             if (proxy) {
               if (auto [addr, addr_size] = to_sockaddr(*proxy);
                   addr && !sockequal(addr.get(), name)) {
-                blocking_scope scope(s);
+                blocking_scope scope(s, SOCKS_HANDSHAKE_TIMEOUT_MS);
 
                 auto ret = hook_connect::original(s, addr.get(), addr_size);
                 if (ret)
                   return ret;
 
                 if (!socks5_handshake(s)) {
-                  shutdown(s, SD_BOTH);
+                  fail_proxied_connect(s, FALSE);
                   continue;
                 }
                 if (socks5_request(s, name) != SOCKS_SUCCESS) {
-                  shutdown(s, SD_BOTH);
+                  fail_proxied_connect(s, FALSE);
                   continue;
                 }
 
@@ -254,19 +324,17 @@ struct hook_WSAConnectByName : minhook::api<F, hook_WSAConnectByName<F, N>> {
 
         if (proxy) {
           if (auto [proxysa, addr_size] = to_sockaddr(*proxy); proxysa) {
-            blocking_scope scope(s);
+            blocking_scope scope(s, SOCKS_HANDSHAKE_TIMEOUT_MS);
 
             auto ret = hook_connect::original(s, proxysa.get(), addr_size);
             if (ret)
               return ret;
 
             if (!socks5_handshake(s)) {
-              shutdown(s, SD_BOTH);
-              return FALSE;
+              return fail_proxied_connect(s, FALSE);
             }
             if (socks5_request(s, *addr) != SOCKS_SUCCESS) {
-              shutdown(s, SD_BOTH);
-              return FALSE;
+              return fail_proxied_connect(s, FALSE);
             }
 
             sockaddr peer;
@@ -388,19 +456,17 @@ struct hook_ConnectEx {
         if (proxy) {
           if (auto [addr, addr_size] = to_sockaddr(*proxy);
               addr && !sockequal(addr.get(), name)) {
-            blocking_scope scope(s);
+            blocking_scope scope(s, SOCKS_HANDSHAKE_TIMEOUT_MS);
 
             auto ret = hook_connect::original(s, addr.get(), addr_size);
             if (ret)
               return ret;
 
             if (!socks5_handshake(s)) {
-              shutdown(s, SD_BOTH);
-              return FALSE;
+              return fail_proxied_connect(s, FALSE);
             }
             if (socks5_request(s, name) != SOCKS_SUCCESS) {
-              shutdown(s, SD_BOTH);
-              return FALSE;
+              return fail_proxied_connect(s, FALSE);
             }
 
             if (lpSendBuffer) {
@@ -448,7 +514,8 @@ inline minhook::status hook_create_all() {
                       hook_WSAConnectByNameA, hook_WSAConnectByNameW,
                       hook_CreateProcessA, hook_CreateProcessW,
                       hook_ioctlsocket, hook_WSAAsyncSelect,
-                      hook_WSAEventSelect, hook_ConnectEx>();
+                      hook_WSAEventSelect, hook_closesocket,
+                      hook_ConnectEx>();
 }
 
 #endif
