@@ -20,6 +20,7 @@
 #include "queue.hpp"
 #include "schema.hpp"
 #include "winnet.hpp"
+#include <vector>
 
 struct injectee_config {
   InjectorConfig cfg;
@@ -47,20 +48,27 @@ struct injectee_client : std::enable_shared_from_this<injectee_client> {
   asio::steady_timer timer_;
   blocking_queue<InjecteeMessage> &queue_;
   injectee_config &config_;
+  // Read out of the IPC mapping payload and echoed back with the
+  // introduction; the control server refuses a session without it (P4-3).
+  std::vector<unsigned char> token_;
 
   injectee_client(asio::io_context &io_context, const tcp::endpoint &endpoint,
                   blocking_queue<InjecteeMessage> &queue,
-                  injectee_config &config)
+                  injectee_config &config,
+                  const std::vector<unsigned char> &token = {})
       : socket_(io_context), endpoint_(endpoint), timer_(io_context),
-        queue_(queue), config_(config) {
+        queue_(queue), config_(config), token_(token) {
     timer_.expires_at(std::chrono::steady_clock::time_point::max());
   }
 
   asio::awaitable<void> start() {
     co_await socket_.async_connect(endpoint_, asio::use_awaitable);
 
-    co_await async_write_message(
-        socket_, create_message<InjecteeMessage, "pid">(GetCurrentProcessId()));
+    InjecteeMessage hello =
+        create_message<InjecteeMessage, "pid">(GetCurrentProcessId());
+    hello["token"_f] = token_;
+
+    co_await async_write_message(socket_, hello);
 
     asio::co_spawn(socket_.get_executor(), reader(), asio::detached);
     asio::co_spawn(socket_.get_executor(), writer(), asio::detached);

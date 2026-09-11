@@ -20,6 +20,7 @@
 #include "injector.hpp"
 #include "schema.hpp"
 #include <asio.hpp>
+#include <cstdio>
 #include <map>
 
 using tcp = asio::ip::tcp;
@@ -104,6 +105,9 @@ struct injector_server {
   }
 
   bool remove(DWORD pid) {
+    // The injection is over, so its token is no longer worth keeping.
+    injector::forget_token(pid);
+
     if (auto iter = clients.find(pid); iter != clients.end()) {
       clients.erase(iter);
       return true;
@@ -128,6 +132,7 @@ struct injectee_session : injectee_client,
   asio::steady_timer timer_;
   injector_server &server_;
   DWORD pid_;
+  bool opened_ = false; // registered with the server, so it owns a client
 
   injectee_session(tcp::socket socket, injector_server &server)
       : socket_(std::move(socket)), timer_(socket_.get_executor()),
@@ -175,8 +180,20 @@ struct injectee_session : injectee_client,
 
   asio::awaitable<void> process(const InjecteeMessage &msg) {
     if (auto v = compare_message<"pid">(msg)) {
+      // P4-3: the injectee proves itself with the token that went into its
+      // mapping payload.  No field, a foreign sequence, or a pid nobody ever
+      // injected all refuse the session before it is registered.
+      if (!injector::token_matches(*v, msg["token"_f])) {
+        std::fprintf(stderr,
+                     "encapsule: refused pid %lu, no valid injection token\n",
+                     static_cast<unsigned long>(*v));
+        std::fflush(stderr);
+        stop();
+        co_return;
+      }
+
       pid_ = *v;
-      server_.open(pid_, shared_from_this());
+      opened_ = server_.open(pid_, shared_from_this());
       auto config_ = server_.get_config();
       if (config_["subprocess"_f] && *config_["subprocess"_f]) {
         enumerate_child_pids(pid_, [this](DWORD pid) { server_.inject(pid); });
@@ -193,6 +210,16 @@ struct injectee_session : injectee_client,
   void stop() {
     socket_.close();
     timer_.cancel();
+
+    // A session that was never registered - typically one refused above -
+    // has nothing to unhook, and must not reach process_close(): that hook
+    // ends the whole injector once its last client is gone, so an
+    // unverified connection could otherwise switch the tool off.
+    if (!opened_) {
+      return;
+    }
+
+    opened_ = false;
     server_.remove(pid_);
     process_close();
   }

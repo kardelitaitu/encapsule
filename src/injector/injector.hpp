@@ -18,7 +18,12 @@
 
 #include "utils.hpp"
 #include "winraii.hpp"
+#include <algorithm>
+#include <cstdint>
 #include <filesystem>
+#include <map>
+#include <mutex>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -57,27 +62,89 @@ struct injector {
       get_wow64_load_library().value_or(nullptr);
 #endif
 
+  // Per-injection tokens (P4-3).  inject() mints a random token, writes it
+  // into the mapping next to the control port and records it here; the control
+  // server looks it up when an injectee introduces itself, so guessing the
+  // mapping name (it only embeds a pid) no longer buys a control channel.
+  using injection_token = std::vector<unsigned char>;
+
+  inline static std::mutex token_mutex;
+  inline static std::map<DWORD, injection_token> tokens;
+
+  static void remember_token(DWORD pid, const injection_token &token) {
+    std::lock_guard guard(token_mutex);
+    tokens[pid] = token;
+  }
+
+  static void forget_token(DWORD pid) {
+    std::lock_guard guard(token_mutex);
+    tokens.erase(pid);
+  }
+
+  // Fail-closed: a missing field, a pid nobody injected, a different length or
+  // one different byte all refuse the session.
+  template <typename Presented>
+  static bool token_matches(DWORD pid, const Presented &presented) {
+    if (!presented.has_value()) {
+      return false;
+    }
+
+    std::lock_guard guard(token_mutex);
+    auto iter = tokens.find(pid);
+    if (iter == tokens.end()) {
+      return false;
+    }
+
+    const injection_token &expected = iter->second;
+    const auto &got = *presented;
+    return expected.size() == got.size() &&
+           std::equal(expected.begin(), expected.end(), got.begin(),
+                      [](unsigned char a, auto b) {
+                        return a == static_cast<unsigned char>(b);
+                      });
+  }
+
+  static injection_token token_of(const port_mapping_payload &payload) {
+    return injection_token(payload.token,
+                           payload.token + port_mapping_token_size);
+  }
+
   static bool inject(DWORD pid, HANDLE proc, std::uint16_t port, BOOL isWoW64,
                      std::wstring_view filename) {
-    handle mapping =
-        create_mapping(get_port_mapping_name(pid), sizeof(std::uint16_t));
+    // No RNG, no token: refuse the injection rather than publish a payload
+    // whose "secret" is whatever the zero-initialised struct holds.
+    auto payload = get_port_mapping_payload(port);
+    if (!payload) {
+      return false;
+    }
+
+    handle mapping = create_mapping(get_port_mapping_name(pid),
+                                    (DWORD)get_port_mapping_payload_size());
     if (!mapping) {
       return false;
     }
 
-    mapped_buffer port_buf(mapping.get());
-    auto port_dst = port_buf.checked<std::uint16_t>();
-    if (!port_dst) {
+    mapped_buffer payload_buf(mapping.get());
+    auto payload_dst = payload_buf.checked<port_mapping_payload>();
+    if (!payload_dst) {
       return false;
     }
-    *port_dst = port;
+    *payload_dst = *payload;
+
+    // Record it before the remote thread runs, so an injectee can never
+    // introduce itself ahead of the token it has to present.
+    remember_token(pid, token_of(*payload));
 
     virtual_memory mem(proc, (filename.size() + 1) * sizeof(wchar_t));
-    if (!mem)
+    if (!mem) {
+      forget_token(pid);
       return false;
+    }
 
-    if (!mem.write(filename.data()))
+    if (!mem.write(filename.data())) {
+      forget_token(pid);
       return false;
+    }
 
     FARPROC current_load_library =
 #if defined(_WIN64)
@@ -86,19 +153,23 @@ struct injector {
         load_library;
 #endif
     if (!current_load_library) {
+      forget_token(pid);
       return false;
     }
 
     handle thread = CreateRemoteThread(
         proc, nullptr, 0, (LPTHREAD_START_ROUTINE)current_load_library,
         mem.get(), 0, nullptr);
-    if (!thread)
+    if (!thread) {
+      forget_token(pid);
       return false;
+    }
 
     // A remote thread that never finishes means LoadLibraryW is wedged in
     // the target: never hang the injector, and give back the allocation.
     if (WaitForSingleObject(thread.get(), 5000) != WAIT_OBJECT_0) {
       mem.free();
+      forget_token(pid);
       return false;
     }
 
@@ -109,6 +180,7 @@ struct injector {
     if (!GetExitCodeThread(thread.get(), &module_handle) ||
         module_handle == 0) {
       mem.free();
+      forget_token(pid);
       return false;
     }
 

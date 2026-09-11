@@ -15,12 +15,19 @@
 
 #include "hook.hpp"
 #include <utils.hpp>
+#include <vector>
 
-void do_client(HINSTANCE dll_handle, std::uint16_t port) {
-  if (port == 0) { // no IPC port: never start the client, just unload
+void do_client(HINSTANCE dll_handle, const port_mapping_payload &ipc) {
+  if (ipc.port == 0) { // no IPC port: never start the client, just unload
     FreeLibrary(dll_handle);
     return;
   }
+
+  // The token that came with the port; the client echoes it back in its
+  // introduction so the injector can tell us from a process that merely
+  // guessed the mapping name (P4-3).
+  const std::vector<unsigned char> token(ipc.token,
+                                         ipc.token + port_mapping_token_size);
 
   {
     asio::io_context io_context(1);
@@ -34,8 +41,8 @@ void do_client(HINSTANCE dll_handle, std::uint16_t port) {
     scope_ptr_bind config_bind(config, cfg.get());
     scope_ptr_bind map_bind(nbio_map, sock_map.get());
 
-    injectee_client c(io_context, tcp::endpoint(localhost, port), *queue,
-                      *config);
+    injectee_client c(io_context, tcp::endpoint(localhost, ipc.port), *queue,
+                      *config, token);
     asio::co_spawn(io_context, c.start(), asio::detached);
 
     io_context.run();
@@ -43,22 +50,23 @@ void do_client(HINSTANCE dll_handle, std::uint16_t port) {
   FreeLibrary(dll_handle);
 }
 
-// The injector publishes the control port in a per-process named mapping.
-// A missing mapping or a failed view means the setup was broken: report port
-// 0 and let the caller unload us, rather than dereferencing null in a victim.
-std::uint16_t get_port() {
+// The injector publishes the control port plus a per-injection token in a
+// per-process named mapping.  A missing mapping or a failed view means the
+// setup was broken: hand back the zero payload (port 0, empty token) and let
+// the caller unload us, rather than dereferencing null in a victim.
+port_mapping_payload get_ipc_payload() {
   handle mapping = open_mapping(get_port_mapping_name(GetCurrentProcessId()));
   if (!mapping) {
-    return 0;
+    return {};
   }
 
-  mapped_buffer port_buf(mapping.get());
-  auto port = port_buf.checked<std::uint16_t>();
-  if (!port) {
-    return 0;
+  mapped_buffer payload_buf(mapping.get());
+  auto payload = payload_buf.checked<port_mapping_payload>();
+  if (!payload) {
+    return {};
   }
 
-  return *port;
+  return *payload;
 }
 
 BOOL WINAPI DllMain(HINSTANCE dll_handle, DWORD reason, LPVOID reserved) {
@@ -77,7 +85,7 @@ BOOL WINAPI DllMain(HINSTANCE dll_handle, DWORD reason, LPVOID reserved) {
     }
 
     minhook::enable();
-    std::thread(do_client, dll_handle, get_port()).detach();
+    std::thread(do_client, dll_handle, get_ipc_payload()).detach();
     break;
 
   case DLL_PROCESS_DETACH:
