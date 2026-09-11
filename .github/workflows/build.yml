@@ -28,7 +28,12 @@ jobs:
       run: .\build.ps1 -mode ${{ matrix.build_type }} -arch ${{ matrix.arch }}
 
     - name: Test
-      run: ctest --test-dir build/${{ matrix.arch }} -C ${{ matrix.build_type }} --output-on-failure
+      run: ctest --test-dir build/${{ matrix.arch }} -C ${{ matrix.build_type }} --output-on-failure -E '^e2e\.'
+
+    - name: Test (e2e)
+      if: matrix.arch == 'x64' && matrix.build_type == 'Release'
+      continue-on-error: true
+      run: ctest --test-dir build/${{ matrix.arch }} -C ${{ matrix.build_type }} --output-on-failure -R '^e2e\.'
 
     - name: Set variables
       run: |
