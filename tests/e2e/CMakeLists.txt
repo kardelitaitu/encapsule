@@ -13,16 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Every product artifact this harness touches is named ONCE, here, so the
-# encapsule rename (P3) is a 3-line edit: this block, the two TARGET_FILE
-# uses in the gated add_test() below, and nothing else.
-set(PROXINJECT_E2E_ARTIFACTS
-	proxinjectee.dll             # x64 injectee, target "proxinjectee"
-	proxinjector-cli.exe         # injector driver, target "proxinjector-cli"
-	proxinjectee32.dll           # Win32 injectee, as staged by build.ps1
-	wow64-address-dumper.exe     # Win32 helper, PROXINJECTEE_ONLY pass
-)
-
+# Every product artifact this harness touches is referenced ONCE, via the
+# target variables and the TARGET_FILE generator expressions below, so the
+# encapsule rename (P3) stays a small edit in this file only.
 set(PROXINJECT_E2E_DUMMY_TARGET proxinject_e2e_dummy)
 set(PROXINJECT_E2E_DUMMY_NAME proxinject_e2e_dummy.exe)
 set(PROXINJECT_E2E_TEST_TARGET proxinject_test_e2e)

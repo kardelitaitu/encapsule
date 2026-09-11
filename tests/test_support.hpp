@@ -42,6 +42,7 @@ inline int test_failures = 0;
 template <class F>
 inline int run_test(const char *name, F &&fn) {
 	std::printf("[RUN ] %s\n", name);
+	const int before = test_failures;
 	try {
 		fn();
 	} catch (const std::exception &e) {
@@ -51,7 +52,7 @@ inline int run_test(const char *name, F &&fn) {
 		++test_failures;
 		std::printf("FAIL %s: uncaught non-standard exception\n", name);
 	}
-	std::printf("[DONE] %s (%d failures)\n", name, test_failures);
+	std::printf("[DONE] %s (%d failures)\n", name, test_failures - before);
 	return test_failures;
 }
 

@@ -186,8 +186,7 @@ asio::awaitable<void> cancel_wakes_pending_pop(asio::io_context &ctx) {
   asio::error_code code;
   try {
     int v = co_await q.pop();
-    ++test_failures;
-    std::printf("  pop() returned %d instead of throwing\n", v);
+    (void)v; // a non-throwing pop() is reported by CHECK(caught) below
   } catch (const asio::system_error &e) {
     caught = true;
     code = e.code();
