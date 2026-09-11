@@ -15,7 +15,7 @@ source. For end-user installs see the [README](../README.md).
 | MSVC C++20 toolset | Visual Studio 2019/2022 (Build Tools are enough) with the "Desktop development with C++" workload. MSVC is the only supported compiler; C++20 is required (`CMAKE_CXX_STANDARD 20`). |
 | Windows SDK (winsock2) | Comes with the VS C++ workload. The injectee links `ws2_32`; `_WIN32_WINNT` is pinned to `0x0A00`. |
 | CMake >= 3.20 | On `PATH` (`cmake_minimum_required(VERSION 3.20)`). `build.ps1` only shells out to `cmake`; the VS generator locates MSBuild for the actual compile. |
-| git | Configuration runs `git describe --tags` and hard-fails when it fails. A fresh clone with **no tags** fails too — create a local one (`git tag v0.0.0`) if you hit that fatal error. |
+| git | Configuration runs `git describe --tags` to read the version string; when that fails (e.g. a fresh clone with **no tags**) CMake warns and falls back to `v0.0.0-unknown` (`CMakeLists.txt:82-91`), so a fresh clone configures without needing a tag. |
 
 All third-party libraries (minhook, protopuf, argparse, spdlog, asio, the
 cycfi/elements fork) are FetchContent-pinned and downloaded **at configure
