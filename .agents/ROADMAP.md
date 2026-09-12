@@ -146,11 +146,13 @@ UI data-race fixes (`view.post`).
 - [x] Audit partial injection failure: mapping cleanup and no half-initialized hooks
       left in the target process. (256e27d fail-safe mapping + verified load result;
       41369fd reverse-order hook unroll + DllMain never live half-initialized + WSA refcount guard.)
-      ⚠ FOLLOW-UPS OPEN (races review): C2 — port-0 unload path can still FreeLibrary
-      with detours ENABLED, and the mapping name can expire before the remote thread
-      reads it (both handles are function-locals); C4 — scope_ptr_bind nulls detour
-      globals with no barrier (~mutex-with-waiters on detach too). R2/R3 scheduled in
-      the hook/injectee lane BEFORE P6/P7 resume there.
+      ✅ C2 RESOLVED (R2 @ 7593252, manager-verified e2e 3/3): the port-0 path no longer
+      FreeLibrary's a live hook set and polls the bootstrap mapping ~4.75s, so a late-published
+      mapping attaches 109ms later where it previously NEVER attached (ipc_conns=0 forever).
+      Corrected intel: the reviewer's 'AV on the next winsock call' did NOT reproduce —
+      DLL_PROCESS_DETACH restores the stubs first; the defect was SILENT PERMANENT capsule loss,
+      not a crash. STILL OPEN: C4 — scope_ptr_bind nulls the detours' globals with no barrier
+      (+ ~mutex with waiters on detach) -> R3 in the same lane.
 
 ### P5 — Feature: proxy username + password (owner-approved; RFC 1929)
 - [x] Extend `InjectorConfig` (`src/common/schema.hpp`) with credential fields; both
