@@ -61,7 +61,9 @@ CMake >= 3.20, driven by `build.ps1`. Third-party deps are FetchContent-pinned a
   feeds it real `sockaddr`/`IpAddr` values is still open. `udp_state.hpp` (guard
   `ENCAPSULE_INJECTEE_UDP_STATE`) — the ROADMAP P7a UDP association / per-socket state (caps, drop
   counters, recycled-`SOCKET` quarantine), sockets travel as `std::uintptr_t`, deliberately **not**
-  thread-safe (one pump thread), and there is no pump and no `UDP ASSOCIATE` client yet.
+  thread-safe (one pump thread). The client-side `UDP ASSOCIATE` call DOES exist now
+  (`socks5_associate` + `socks5_relay_endpoint` + the `socks5_reply` verdicts in `socks5.hpp`),
+  but there is still no pump and no `sendto`/`recvfrom` hook, so no datagram is tunnelled yet.
 - `src/injector/` — code that runs **outside**, in the tool's own process: `injector.hpp` (mapping +
   `VirtualAllocEx`/`WriteProcessMemory`/`CreateRemoteThread`; DLL names at :190-191; token store :65-109) ·
   `server.hpp` — cited by symbol, it is growing with P6/P7 too: the control server keeps

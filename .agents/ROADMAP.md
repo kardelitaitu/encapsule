@@ -221,10 +221,18 @@ UI data-race fixes (`view.post`).
       the moment `WSAAsyncSelect`/`WSAEventSelect`/overlapped reads appear on it. Survey
       also found the shipped C0 bug: no SO_TYPE gate meant DGRAM `connect()` was
       TCP-proxified and destroyed — fixed independently at 17c3627.)
-- [ ] Implement the SOCKS5 UDP ASSOCIATE client (RFC 1928 §7): TCP control request,
-      relay endpoint reply, datagram header (FRAG/ATYP/addr/port).
-- [x] Decide the local-relay architecture (per-socket relay vs. shared relay socket).
-      (Decision: ONE shared, lazily-created association per injected process — one TCP
+- [x] Implement the SOCKS5 UDP ASSOCIATE client (RFC 1928 §7): TCP control request,
+      relay endpoint reply, datagram header (FRAG/ATYP/addr/port). (5c9fd91:
+      `socks5_associate` + `socks5_relay_endpoint` (v4/v6 ready `sockaddr`, name kept raw and
+      REFUSED via the 5th verdict `bnd_is_a_name` — resolving it would be an unproxied
+      synchronous lookup inside the victim) + `socks5_read_reply`, with today's
+      `socks5_request`/`_send` kept as one-line delegates so hook.hpp's 4 sites are untouched.
+      Built on 7da5e32 (byte-pinned builders) + 8053eae (pure state). ANY verdict but `ok`
+      kills the control socket (refuse + one report per peer; never silent direct).
+      Bonus defect closed here: the old reader had no MSG_WAITALL and then judged
+      buf[1]/buf[3] — octets of ITS OWN request buffer (`05 00 00 01` for 0.0.0.0:0), so a
+      2-byte reply read back as "success, IPv4 BND" and the next recv returning 0 completed a
+      PHANTOM TUNNEL. Pinned + manager-gated 7/7 at 5c9fd91. Not yet wired: pump + hooks.)
       control connection + one relay UDP socket, refcounted, generation-guarded, idle-
       reaped at 30s, pumped by a DEDICATED io_context on its own detached thread (never
       `client.hpp`'s context: it parks when the injector is lost, i.e. exactly when the
