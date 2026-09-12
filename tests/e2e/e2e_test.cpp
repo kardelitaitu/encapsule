@@ -18,7 +18,7 @@
 //   --selfcheck                loopback only: relay + decoy, no injection.
 //                              Runs anywhere, no admin, no proxy.
 //   --cli X --dummy Y         inject-and-connect: the decoy hammers a dead
-//                              address, proxinjector-cli injects it and points
+//                              address, encapsule-cli injects it and points
 //                              it at the relay, which then asserts on the
 //                              CONNECT the injectee actually built.
 //
@@ -48,8 +48,8 @@
 // only translation unit that includes it.
 #include <winraii.hpp>
 
-#ifndef PROXINJECT_E2E_DUMMY_NAME
-#define PROXINJECT_E2E_DUMMY_NAME "proxinject_e2e_dummy.exe"
+#ifndef ENCAPSULE_E2E_DUMMY_NAME
+#define ENCAPSULE_E2E_DUMMY_NAME "encapsule_e2e_dummy.exe"
 #endif
 
 namespace {
@@ -218,7 +218,7 @@ std::string dummy_path() {
     return g_dummy_override;
   }
   // The dummy lands next to this exe: both use test_bin/<config>/.
-  return exe_dir() + PROXINJECT_E2E_DUMMY_NAME;
+  return exe_dir() + ENCAPSULE_E2E_DUMMY_NAME;
 }
 
 std::string dummy_command(const std::string &exe, const std::string &host,
@@ -317,7 +317,7 @@ void run_selfcheck() {
 // ------------------------------------------------------------------ inject --
 
 // One inject-and-connect scenario against a fresh relay: the decoy hammers an
-// unroutable address, proxinjector-cli injects proxinjectee.dll into it and
+// unroutable address, encapsule-cli injects encapsule-injectee.dll into it and
 // points it at this relay, and the relay asserts on the CONNECT the injectee
 // actually put on the wire.  A fresh relay per case matters, because it serves
 // one session at a time, and so does a fresh decoy pid.
@@ -394,8 +394,8 @@ void injection_case(const char *label, const std::string &decoy_host,
       std::printf("    #%zu %s(%s):%u\n", i, e2e::atyp_name(rec.atyp).c_str(),
                   rec.addr.c_str(), static_cast<unsigned>(rec.port));
     }
-    std::printf("  ---- proxinjector-cli output ----\n%s"
-                "  ---- end of proxinjector-cli output ----\n",
+    std::printf("  ---- encapsule-cli output ----\n%s"
+                "  ---- end of encapsule-cli output ----\n",
                 injector.output().c_str());
   }
 }
@@ -424,7 +424,7 @@ void inject_ipv6_decoy() {
 
 int run_inject() {
   if (g_cli_path.empty() || g_dummy_override.empty()) {
-    std::printf("usage: e2e_test --cli <proxinjector-cli> "
+    std::printf("usage: e2e_test --cli <encapsule-cli> "
                 "--dummy <dummy_target>\n");
     return 2;
   }

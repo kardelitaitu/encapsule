@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef PROXINJECT_E2E_SOCKS5_TEST_SERVER
-#define PROXINJECT_E2E_SOCKS5_TEST_SERVER
+#ifndef ENCAPSULE_E2E_SOCKS5_TEST_SERVER
+#define ENCAPSULE_E2E_SOCKS5_TEST_SERVER
 
 // A header-only, no-auth socks5 CONNECT relay for the end-to-end smoke test.
 //
@@ -376,4 +376,4 @@ private:
 
 } // namespace e2e
 
-#endif // PROXINJECT_E2E_SOCKS5_TEST_SERVER
+#endif // ENCAPSULE_E2E_SOCKS5_TEST_SERVER

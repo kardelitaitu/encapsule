@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef PROXINJECT_TEST_SUPPORT
-#define PROXINJECT_TEST_SUPPORT
+#ifndef ENCAPSULE_TEST_SUPPORT
+#define ENCAPSULE_TEST_SUPPORT
 
 #include <cstdio>
 #include <string>
@@ -58,4 +58,4 @@ inline int run_test(const char *name, F &&fn) {
 
 #define RUN(fn) run_test(#fn, fn)
 
-#endif // PROXINJECT_TEST_SUPPORT
+#endif // ENCAPSULE_TEST_SUPPORT
