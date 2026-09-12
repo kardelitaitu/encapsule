@@ -10,10 +10,10 @@
       "mirrors": "./build.ps1 -mode Release -arch x64",
       "notes": [
         "build.ps1:26 -> configure preset 'x64': cmake -DCMAKE_BUILD_TYPE=Release '-DCMAKE_POLICY_VERSION_MINIMUM=3.5' -A x64 -S . -B build/x64",
-        "build.ps1:28 -> configure preset 'win32-injectee-only' (via build.ps1:20): -DPROXINJECTEE_ONLY=ON '-DCMAKE_POLICY_VERSION_MINIMUM=3.5' -A Win32 -S . -B build/Win32",
+        "build.ps1:28 -> configure preset 'win32-injectee-only' (via build.ps1:20): -DENCAPSULE_INJECTEE_ONLY=ON '-DCMAKE_POLICY_VERSION_MINIMUM=3.5' -A Win32 -S . -B build/Win32",
         "build.ps1:32 -> build preset 'x64': cmake --build build/x64 --config Release",
         "build.ps1:34 -> build preset 'win32-injectee-only': cmake --build build/Win32 --config Release",
-        "build.ps1:36-45 copies artifacts into ./release (incl. proxinjectee.dll -> proxinjectee32.dll); the presets only configure/build, they do not copy."
+        "build.ps1:36-45 copies artifacts into ./release (incl. encapsule-injectee.dll -> encapsule-injectee32.dll); the presets only configure/build, they do not copy."
       ]
     }
   },
@@ -32,7 +32,7 @@
     {
       "name": "x64",
       "displayName": "x64 full build (Release)",
-      "description": "Full 64-bit pass, mirroring build.ps1 -arch x64 (build.ps1:26,32): -A x64 into build/x64. Builds proxinjectee.dll, proxinjector (GUI) and proxinjector-cli.",
+      "description": "Full 64-bit pass, mirroring build.ps1 -arch x64 (build.ps1:26,32): -A x64 into build/x64. Builds encapsule-injectee.dll, encapsule (GUI) and encapsule-cli.",
       "inherits": "vs-base",
       "binaryDir": "${sourceDir}/build/x64",
       "architecture": {
@@ -42,8 +42,8 @@
     },
     {
       "name": "win32-injectee-only",
-      "displayName": "Win32 PROXINJECTEE_ONLY build (Release)",
-      "description": "32-bit injectee pass, mirroring the second half of build.ps1 -arch x64 (build.ps1:20,28,34): -A Win32 -DPROXINJECTEE_ONLY=ON into build/Win32. Yields build/Win32/Release/proxinjectee.dll, which build.ps1:41 ships as release/proxinjectee32.dll, plus wow64-address-dumper.exe (build.ps1:42).",
+      "displayName": "Win32 ENCAPSULE_INJECTEE_ONLY build (Release)",
+      "description": "32-bit injectee pass, mirroring the second half of build.ps1 -arch x64 (build.ps1:20,28,34): -A Win32 -DENCAPSULE_INJECTEE_ONLY=ON into build/Win32. Yields build/Win32/Release/encapsule-injectee.dll, which build.ps1:41 ships as release/encapsule-injectee32.dll, plus wow64-address-dumper.exe (build.ps1:42).",
       "inherits": "vs-base",
       "binaryDir": "${sourceDir}/build/Win32",
       "architecture": {
@@ -51,7 +51,7 @@
         "strategy": "set"
       },
       "cacheVariables": {
-        "PROXINJECTEE_ONLY": "ON"
+        "ENCAPSULE_INJECTEE_ONLY": "ON"
       }
     }
   ],

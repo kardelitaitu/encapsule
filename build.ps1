@@ -17,7 +17,7 @@ if(($arch -ne "Win32") -and ($arch -ne "x64")) {
 
 if(!($skip_cmake)) {
 	if($arch -eq "x64") {
-		$win32_injectee_only="-DPROXINJECTEE_ONLY=ON"
+		$win32_injectee_only="-DENCAPSULE_INJECTEE_ONLY=ON"
 	} else {
 		$win32_injectee_only=""
 	}
@@ -38,7 +38,7 @@ cp $build_dir/$arch/*.dll $release_dir -Force
 cp $build_dir/$arch/resources $release_dir -Recurse -Force
 
 if($arch -eq "x64") {
-	cp $build_dir/Win32/$mode/proxinjectee.dll $release_dir/proxinjectee32.dll -Force
+	cp $build_dir/Win32/$mode/encapsule-injectee.dll $release_dir/encapsule-injectee32.dll -Force
 	cp $build_dir/Win32/$mode/wow64-address-dumper.exe $release_dir -Force
 }
 

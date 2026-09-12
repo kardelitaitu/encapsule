@@ -15,9 +15,9 @@
 
 cmake_minimum_required(VERSION 3.20)
 
-project(proxinject)
+project(encapsule)
 
-option(PROXINJECTEE_ONLY "only build proxyinjectee" OFF)
+option(ENCAPSULE_INJECTEE_ONLY "only build encapsule-injectee" OFF)
 
 if(NOT WIN32)
 	message(FATAL_ERROR "support Windows only")
@@ -52,7 +52,7 @@ FetchContent_Declare(spdlog
 )
 
 FetchContent_MakeAvailable(minhook protopuf)
-if(NOT PROXINJECTEE_ONLY)
+if(NOT ENCAPSULE_INJECTEE_ONLY)
 	FetchContent_MakeAvailable(argparse spdlog)
 endif()
 
@@ -66,7 +66,7 @@ if(NOT asio_POPULATED)
   FetchContent_Populate(asio)
 endif()
 
-if(NOT PROXINJECTEE_ONLY)
+if(NOT ENCAPSULE_INJECTEE_ONLY)
 	set(ELEMENTS_ASIO_INCLUDE_DIR ${asio_SOURCE_DIR}/asio/include CACHE STRING "")
 	set(ELEMENTS_BUILD_EXAMPLES OFF CACHE BOOL "")
 	FetchContent_Declare(elements
@@ -83,31 +83,36 @@ set(WIN32_VERSION 0x0A00)
 execute_process(COMMAND git describe --tags
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 	RESULT_VARIABLE GIT_DESCRIBE_EXITCODE
-	OUTPUT_VARIABLE PROXINJECT_VERSION
+	OUTPUT_VARIABLE ENCAPSULE_VERSION
 	ERROR_QUIET)
 
 if(NOT GIT_DESCRIBE_EXITCODE EQUAL 0)
-	set(PROXINJECT_VERSION "v0.0.0-unknown")
-	message(WARNING "failed to dump version via `git describe`, falling back to ${PROXINJECT_VERSION}")
+	set(ENCAPSULE_VERSION "v0.0.0-unknown")
+	message(WARNING "failed to dump version via `git describe`, falling back to ${ENCAPSULE_VERSION}")
 endif()
 
-string(STRIP ${PROXINJECT_VERSION} PROXINJECT_VERSION)
+string(STRIP ${ENCAPSULE_VERSION} ENCAPSULE_VERSION)
 configure_file(src/common/version.hpp.in src/common/version.hpp)
 
-add_library(proxinject_common INTERFACE)
-target_include_directories(proxinject_common INTERFACE src/common ${CMAKE_BINARY_DIR}/src/common)
-target_compile_definitions(proxinject_common INTERFACE -D_WIN32_WINNT=${WIN32_VERSION} -DUNICODE)
+add_library(encapsule_common INTERFACE)
+target_include_directories(encapsule_common INTERFACE src/common ${CMAKE_BINARY_DIR}/src/common)
+target_compile_definitions(encapsule_common INTERFACE -D_WIN32_WINNT=${WIN32_VERSION} -DUNICODE)
+
+# TEMPORARY (P3): tests/{schema,utils,winnet,queue}/CMakeLists.txt still name the
+# old target and are outside this change's fence. Drop this alias once they say
+# encapsule_common.
+add_library(proxinject_common ALIAS encapsule_common)
 
 set(INJECTEE_SRCS
 	src/injectee/injectee.cpp
 )
 
-add_library(proxinjectee SHARED ${INJECTEE_SRCS})
-target_compile_features(proxinjectee PUBLIC cxx_std_20)
-target_link_libraries(proxinjectee PUBLIC minhook ws2_32 protopuf proxinject_common)
-target_include_directories(proxinjectee PUBLIC ${asio_SOURCE_DIR}/asio/include)
+add_library(encapsule-injectee SHARED ${INJECTEE_SRCS})
+target_compile_features(encapsule-injectee PUBLIC cxx_std_20)
+target_link_libraries(encapsule-injectee PUBLIC minhook ws2_32 protopuf encapsule_common)
+target_include_directories(encapsule-injectee PUBLIC ${asio_SOURCE_DIR}/asio/include)
 
-if(NOT PROXINJECTEE_ONLY)
+if(NOT ENCAPSULE_INJECTEE_ONLY)
 	set(INJECTOR_GUI_SRCS
 		src/injector/injector_gui.cpp
 		src/injector/ui_elements/dynamic_list.cpp
@@ -115,7 +120,7 @@ if(NOT PROXINJECTEE_ONLY)
 		src/injector/ui_elements/tooltip.cpp
 	)
 
-	set(ELEMENTS_APP_PROJECT proxinjector)
+	set(ELEMENTS_APP_PROJECT encapsule)
 	set(ELEMENTS_APP_SOURCES ${INJECTOR_GUI_SRCS})
 
 	set(ELEMENTS_APP_ICON "resources/encapsule.rc")
@@ -125,26 +130,26 @@ if(NOT PROXINJECTEE_ONLY)
 	set(CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH};${ELEMENTS_ROOT}/cmake")
 	include(ElementsConfigApp)
 
-	target_compile_features(proxinjector PUBLIC cxx_std_20)
-	target_link_libraries(proxinjector PUBLIC protopuf proxinject_common)
-	target_include_directories(proxinjector PUBLIC ${asio_SOURCE_DIR}/asio/include)
+	target_compile_features(encapsule PUBLIC cxx_std_20)
+	target_link_libraries(encapsule PUBLIC protopuf encapsule_common)
+	target_include_directories(encapsule PUBLIC ${asio_SOURCE_DIR}/asio/include)
 
 	set(INJECTOR_CLI_SRCS
 		src/injector/injector_cli.cpp
 	)
 
-	add_executable(proxinjector-cli ${INJECTOR_CLI_SRCS})
-	target_compile_features(proxinjector-cli PUBLIC cxx_std_20)
-	target_link_libraries(proxinjector-cli PUBLIC protopuf argparse spdlog proxinject_common advapi32)
-	target_include_directories(proxinjector-cli PUBLIC ${asio_SOURCE_DIR}/asio/include)
+	add_executable(encapsule-cli ${INJECTOR_CLI_SRCS})
+	target_compile_features(encapsule-cli PUBLIC cxx_std_20)
+	target_link_libraries(encapsule-cli PUBLIC protopuf argparse spdlog encapsule_common advapi32)
+	target_include_directories(encapsule-cli PUBLIC ${asio_SOURCE_DIR}/asio/include)
 endif()
 
-if(PROXINJECTEE_ONLY)
+if(ENCAPSULE_INJECTEE_ONLY)
 	add_executable(wow64-address-dumper src/wow64/address_dumper.cpp)
 endif()
 
 option(PROXINJECT_BUILD_TESTS "build host-side CTest targets" ON)
 enable_testing()
-if(PROXINJECT_BUILD_TESTS AND NOT PROXINJECTEE_ONLY)
+if(PROXINJECT_BUILD_TESTS AND NOT ENCAPSULE_INJECTEE_ONLY)
 	add_subdirectory(tests)
 endif()

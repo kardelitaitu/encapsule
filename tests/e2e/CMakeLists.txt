@@ -19,8 +19,8 @@
 set(PROXINJECT_E2E_DUMMY_TARGET proxinject_e2e_dummy)
 set(PROXINJECT_E2E_DUMMY_NAME proxinject_e2e_dummy.exe)
 set(PROXINJECT_E2E_TEST_TARGET proxinject_test_e2e)
-set(PROXINJECT_E2E_INJECTOR_TARGET proxinjector-cli)
-set(PROXINJECT_E2E_INJECTEE_TARGET proxinjectee)
+set(PROXINJECT_E2E_INJECTOR_TARGET encapsule-cli)
+set(PROXINJECT_E2E_INJECTEE_TARGET encapsule-injectee)
 
 # The decoy: a plain TCP client that hammers a dead address until it gets
 # injected and its connect() is proxied somewhere that answers.
@@ -29,7 +29,7 @@ target_link_libraries(${PROXINJECT_E2E_DUMMY_TARGET} PRIVATE ws2_32)
 
 add_executable(${PROXINJECT_E2E_TEST_TARGET} e2e_test.cpp)
 target_link_libraries(${PROXINJECT_E2E_TEST_TARGET} PRIVATE
-	proxinject_common protopuf ws2_32)
+	encapsule_common protopuf ws2_32)
 target_include_directories(${PROXINJECT_E2E_TEST_TARGET} PRIVATE
 	${CMAKE_SOURCE_DIR}/tests
 	${CMAKE_SOURCE_DIR}/src/injectee

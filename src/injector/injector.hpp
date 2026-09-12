@@ -187,8 +187,8 @@ struct injector {
     return true;
   }
 
-  static inline const char injectee_filename[] = "proxinjectee.dll";
-  static inline const char injectee_wow64_filename[] = "proxinjectee32.dll";
+  static inline const char injectee_filename[] = "encapsule-injectee.dll";
+  static inline const char injectee_wow64_filename[] = "encapsule-injectee32.dll";
 
   static std::optional<std::wstring>
   find_injectee(std::wstring_view self_binary_path, BOOL isWoW64) {
