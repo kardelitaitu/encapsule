@@ -58,16 +58,14 @@ using injectee_client_ptr = std::shared_ptr<injectee_client>;
 // inject() has to answer "is this pid already injected?" synchronously on the
 // caller's thread, and it is also called *from* the io_context thread, by
 // process()'s subprocess enumeration and its subpid reply - a post-and-wait
-// there self-deadlocks.  The
-// io_context also is not a member of injector_server, so it could not be
-// posted to from here at all.
+// there self-deadlocks.  The io_context also is not a member of
+// injector_server, so it could not be posted to from here at all.
 //
 // The mutex lives in the table rather than next to it on purpose: `clients`
 // has to stay reachable as a public member - injectee_session_cli::
 // process_close() reads server_.clients.size() to decide whether any client is
 // left - and a lock that sits beside a public map is a lock that public code
-// can
-// walk past.  Every operation here is short, non-blocking and returns a copy
+// can walk past.  Every operation here is short, non-blocking and returns a copy
 // (a bool, a size, or a shared_ptr), so no caller can hold the lock while it
 // calls into asio, and nothing here co_awaits at all.
 //
