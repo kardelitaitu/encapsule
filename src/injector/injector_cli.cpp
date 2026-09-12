@@ -20,10 +20,97 @@
 #include "utils.hpp"
 #include "version.hpp"
 #include <argparse/argparse.hpp>
+#include <cctype>
 #include <iostream>
+#include <optional>
 
 using argparse::ArgumentParser;
 using namespace std;
+
+namespace {
+
+// argparse reports a bad option as `"Unknown argument: " + current_argument`
+// (see `parse_args_internal`), i.e. it quotes the offending token verbatim.
+// A proxy URL glued to a flag spelling is such a token, so `-palice:pw@host`
+// -- a legal-looking spelling -- hands `what()` a string holding the
+// password, which the catch below would print straight to stderr, into the
+// console scrollback and any CI transcript.  Vendored argparse is not
+// editable here, so the message is sanitized instead: nothing derived from a
+// parse exception reaches the user before it has been through
+// `sanitize_parse_error`.
+
+// The option a token names: the text after any leading dashes, cut at the
+// first `:` or `=`, which is where a glued-on value starts.
+string_view option_part(string_view token) {
+  size_t first = 0;
+  while (first < token.size() && token[first] == '-')
+    ++first;
+  size_t last = first;
+  while (last < token.size() && token[last] != ':' && token[last] != '=')
+    ++last;
+  return token.substr(first, last - first);
+}
+
+// True for a proxy flag with a value stuck to it -- `-p...`, `-p=...`,
+// `--set-proxy=...` -- as opposed to a bare flag name, which carries no
+// secret and must stay printable.  Case-sensitive on purpose: lowercase `p`
+// is the proxy option, while uppercase `-P`/`--path` names files.  `path`
+// is excluded so that `--path=...` is never mistaken for `-p...`.
+bool is_proxy_flag_token(string_view token) {
+  if (token.empty() || token.front() != '-')
+    return false;
+  const auto option = option_part(token);
+  const auto separator = token.find_first_of(":=");
+  if (separator == string_view::npos || separator + 1 >= token.size())
+    return false; // no glued value
+  const auto proxy = (option.starts_with('p') && !option.starts_with("path")) ||
+                     option.find("proxy") != string_view::npos;
+  return !option.empty() && proxy;
+}
+
+// One whitespace-separated run of the message -> printable text, or nullopt
+// when none of it may be shown.
+optional<string> scrub_token(string_view token) {
+  // Everything up to and including the LAST '@' is userinfo, the secret,
+  // which is how `parse_proxy_url` and the `-p` diagnostics below split it.
+  // Stripping that prefix keeps the authority: naming host:port is what makes
+  // the rejection actionable.
+  if (auto at = token.rfind('@'); at != string_view::npos)
+    return string{token.substr(at + 1)};
+  // No '@' left to strip, so a proxy-flag token is `user:pass` with nothing
+  // but the secret in it -- there is no safe remainder to print.
+  if (is_proxy_flag_token(token))
+    return nullopt;
+  return string{token};
+}
+
+// Rebuilds the message token by token, preserving its whitespace, so the
+// wording survives and only the userinfo does not.
+string sanitize_parse_error(string_view message) {
+  const auto is_space = [](char c) {
+    return std::isspace(static_cast<unsigned char>(c)) != 0;
+  };
+  string result;
+  result.reserve(message.size());
+  for (size_t pos = 0; pos < message.size();) {
+    if (is_space(message[pos])) {
+      result += message[pos++];
+      continue;
+    }
+    size_t next = pos;
+    while (next < message.size() && !is_space(message[next]))
+      ++next;
+    if (auto token = scrub_token(message.substr(pos, next - pos)))
+      result += *token;
+    pos = next;
+  }
+  // Dropping an offending token can leave a dangling "Unknown argument: ".
+  while (!result.empty() && is_space(result.back()))
+    result.pop_back();
+  return result.empty() ? string{"Invalid argument (value redacted)"} : result;
+}
+
+} // namespace
 
 auto create_parser() {
   ArgumentParser parser("encapsule-cli", encapsule_version,
@@ -114,7 +201,9 @@ int main(int argc, char *argv[]) {
   try {
     parser.parse_args(argc, argv);
   } catch (const runtime_error &err) {
-    cerr << err.what() << endl;
+    // NEVER print `err` raw: argparse quotes the offending token, which
+    // for `-p<proxy-url>` spellings is the proxy address with its password.
+    cerr << sanitize_parse_error(err.what()) << endl;
     cerr << parser;
     return 1;
   }
