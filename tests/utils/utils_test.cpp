@@ -529,6 +529,53 @@ void a_spawned_child_is_named_while_it_survives() {
   }
 }
 
+// ------------------------------------------- process snapshot failure (M1-d) --
+
+void the_snapshot_failure_sentinel_is_not_null() {
+  // The trap this header used to fall into, pinned as a fact about the API
+  // rather than about our code: CreateToolhelp32Snapshot answers "no snapshot"
+  // with (HANDLE)-1, which is truthy, so the 'if (handle snapshot = ...)'
+  // guard that stood there could never fire -- and -1 is also what
+  // GetCurrentProcess() returns, so the destructor's CloseHandle was a call
+  // about a value that is never a closable handle.  Anyone tempted to
+  // "simplify" the raw sentinel test back into a truthiness test has to change
+  // these lines first.
+  CHECK(INVALID_HANDLE_VALUE != nullptr);
+  CHECK(static_cast<bool>(INVALID_HANDLE_VALUE));
+  CHECK(static_cast<LONG_PTR>(reinterpret_cast<std::intptr_t>(
+            INVALID_HANDLE_VALUE)) == -1);
+}
+
+void a_bogus_pid_is_enumerated_and_never_found() {
+  // The other half of the fix: the sentinel test must not turn the enumeration
+  // into a silent no-op.  A guard that always returned early would leave every
+  // "not found" assertion below green by accident, so the success path is
+  // asserted first -- the snapshot yields rows, and we are in them.
+  int seen = 0;
+  bool found_self = false;
+  match_process([&](const PROCESSENTRY32W &entry) {
+    ++seen;
+    if (entry.th32ProcessID == GetCurrentProcessId()) {
+      found_self = true;
+    }
+  });
+  CHECK(seen > 0);
+  CHECK(found_self);
+  CHECK(!enumerate_pids().empty());
+
+  // The documented "do not know" answer, through the public helpers a caller
+  // actually uses: a pid no allocator hands out is simply absent, so
+  // get_process_name yields the empty string (which matches no pattern) and
+  // the pid list does not contain it.  A freshly exited pid gives the same
+  // answer and is deliberately not asserted: pid recycling is legal, so that
+  // variant could turn a correct enumeration into a flaky failure.
+  const DWORD bogus = static_cast<DWORD>(-1);
+  CHECK(get_process_name(bogus).empty());
+  const auto pids = enumerate_pids();
+  CHECK(std::find(pids.begin(), pids.end(), bogus) == pids.end());
+  CHECK(!process_short_name(bogus).has_value());
+}
+
 // --------------------------------------------- scope-bound publication (C4) --
 
 namespace {
@@ -668,6 +715,8 @@ int main() {
   RUN(the_short_name_of_this_process_is_its_stem);
   RUN(a_pid_that_cannot_be_opened_has_no_name);
   RUN(a_spawned_child_is_named_while_it_survives);
+  RUN(the_snapshot_failure_sentinel_is_not_null);
+  RUN(a_bogus_pid_is_enumerated_and_never_found);
   RUN(a_scope_bind_publishes_the_slot_and_retires_it);
   RUN(a_racing_read_uses_the_one_value_it_tested);
   return test_failures;

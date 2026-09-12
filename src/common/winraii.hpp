@@ -190,14 +190,30 @@ template <typename T> T *load_scope(T *&ptr) {
   return std::atomic_ref<T *>(ptr).load(std::memory_order_acquire);
 }
 
+// Every process enumeration in the project walks this snapshot, so the failure
+// answer matters more than the success path -- and Toolhelp reports "no
+// snapshot" as INVALID_HANDLE_VALUE, NOT NULL.  A wrapped -1 is truthy, so the
+// 'if (handle snapshot = CreateToolhelp32Snapshot(...))' guard that stood here
+// could never fire: on failure the code went on to Process32FirstW an invalid
+// snapshot and then handed -1 to CloseHandle on the way out, which is the same
+// value GetCurrentProcess() returns and a documented never-close.  Test the raw
+// handle against its own sentinel before the wrapper takes it on (the pattern
+// injector.hpp uses for the module snapshot).  Failure is the "do not know"
+// answer every caller is already written for: no callback runs, so
+// enumerate_pids() comes back empty and no name or pid is ever matched --
+// never a false positive.
 template <typename F> void match_process(F &&f) {
-  if (handle snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, NULL)) {
-    PROCESSENTRY32W entry = {sizeof(PROCESSENTRY32W)};
-    if (Process32FirstW(snapshot.get(), &entry)) {
-      do {
-        std::forward<F>(f)(entry);
-      } while (Process32NextW(snapshot.get(), &entry));
-    }
+  const HANDLE raw = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, NULL);
+  if (raw == INVALID_HANDLE_VALUE) {
+    return;
+  }
+  handle snapshot(raw);
+
+  PROCESSENTRY32W entry = {sizeof(PROCESSENTRY32W)};
+  if (Process32FirstW(snapshot.get(), &entry)) {
+    do {
+      std::forward<F>(f)(entry);
+    } while (Process32NextW(snapshot.get(), &entry));
   }
 }
 
