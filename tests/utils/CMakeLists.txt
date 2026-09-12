@@ -1,5 +1,5 @@
 add_executable(proxinject_test_utils utils_test.cpp)
-target_link_libraries(proxinject_test_utils PRIVATE proxinject_common)
+target_link_libraries(proxinject_test_utils PRIVATE encapsule_common)
 target_include_directories(proxinject_test_utils PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 add_test(NAME common.utils COMMAND proxinject_test_utils)
 set_tests_properties(common.utils PROPERTIES TIMEOUT 60)

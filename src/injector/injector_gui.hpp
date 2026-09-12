@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef PROXINJECT_INJECTOR_INJECTOR_GUI
-#define PROXINJECT_INJECTOR_INJECTOR_GUI
+#ifndef ENCAPSULE_INJECTOR_INJECTOR_GUI
+#define ENCAPSULE_INJECTOR_INJECTOR_GUI
 
 #include "server.hpp"
 #include "ui_elements/dynamic_list.hpp"

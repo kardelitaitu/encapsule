@@ -98,11 +98,6 @@ add_library(encapsule_common INTERFACE)
 target_include_directories(encapsule_common INTERFACE src/common ${CMAKE_BINARY_DIR}/src/common)
 target_compile_definitions(encapsule_common INTERFACE -D_WIN32_WINNT=${WIN32_VERSION} -DUNICODE)
 
-# TEMPORARY (P3): tests/{schema,utils,winnet,queue}/CMakeLists.txt still name the
-# old target and are outside this change's fence. Drop this alias once they say
-# encapsule_common.
-add_library(proxinject_common ALIAS encapsule_common)
-
 set(INJECTEE_SRCS
 	src/injectee/injectee.cpp
 )

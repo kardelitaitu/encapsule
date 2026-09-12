@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef PROXINJECT_INJECTOR_INJECTOR
-#define PROXINJECT_INJECTOR_INJECTOR
+#ifndef ENCAPSULE_INJECTOR_INJECTOR
+#define ENCAPSULE_INJECTOR_INJECTOR
 
 #include "utils.hpp"
 #include "winraii.hpp"

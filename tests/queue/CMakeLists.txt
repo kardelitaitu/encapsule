@@ -1,5 +1,5 @@
 add_executable(proxinject_test_queue queue_test.cpp)
-target_link_libraries(proxinject_test_queue PRIVATE proxinject_common protopuf ws2_32)
+target_link_libraries(proxinject_test_queue PRIVATE encapsule_common protopuf ws2_32)
 target_include_directories(proxinject_test_queue PRIVATE ${CMAKE_SOURCE_DIR}/tests ${asio_SOURCE_DIR}/asio/include)
 add_test(NAME common.queue COMMAND proxinject_test_queue)
 set_tests_properties(common.queue PROPERTIES TIMEOUT 60)
