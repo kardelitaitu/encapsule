@@ -58,16 +58,40 @@ using InjecteeConnect = pp::message<
 // Field 5 carries the per-injection token from the IPC mapping payload
 // (P4-3): the injectee echoes it back with every message, so the injector can
 // tell a real client from a process that merely guessed the mapping name.
-// Field numbers 6 and up stay free for the P5 credential work.
+// Field numbers 6 and up are reserved -- credentials never travel in report
+// messages (see the InjectorConfig contract below).
 using InjecteeMessage =
     pp::message<pp::string_field<"opcode", 1>,
                 pp::message_field<"connect", 2, InjecteeConnect>,
                 pp::uint32_field<"pid", 3>, pp::uint32_field<"subpid", 4>,
                 pp::bytes_field<"token", 5>>;
 
+// ----------------------------------------------------- P5 credential contract
+//
+// FROZEN: S3 (socks5 auth), S4 (CLI + server) and S5 (GUI) code against this.
+//
+//   InjectorConfig  1 addr        IpAddr  proxy endpoint
+//                   2 log         bool
+//                   3 subprocess  bool
+//                   4 username    string  optional
+//                   5 password    string  optional
+//
+//   * Fields 4/5 are optional and SEPARATE -- not one "user" blob -- so a
+//     password can be redacted, logged or dropped without the username.
+//   * Absent means "skip on the wire" means "no authentication offered".  An
+//     unset field adds zero bytes, so a credential-free InjectorConfig stays
+//     byte-identical to the pre-P5 format; never encode an empty string to
+//     mean "none" (both directions are pinned by tests/schema).
+//   * Direction is injector -> injectee only.  InjecteeMessage and
+//     InjecteeConnect carry ZERO credential fields, and no report message may
+//     ever echo a username or a password back.
+//   * The schema stores raw strings: no length caps here.  Username and
+//     password limits belong to the frontends (S4 CLI, S5 GUI).
 using InjectorConfig =
     pp::message<pp::message_field<"addr", 1, IpAddr>, pp::bool_field<"log", 2>,
-                pp::bool_field<"subprocess", 3>>;
+                pp::bool_field<"subprocess", 3>,
+                pp::string_field<"username", 4>,
+                pp::string_field<"password", 5>>;
 
 using InjectorMessage =
     pp::message<pp::string_field<"opcode", 1>,

@@ -171,7 +171,9 @@ void injectee_message_roundtrip() {
 }
 
 void injector_message_roundtrip() {
-  const InjectorConfig cfg{IpAddr{0x7F000001u, {}, {}, 9000u}, true, false};
+  // No credentials set: fields 4/5 stay absent (the P5 wire-compat case).
+  const InjectorConfig cfg{IpAddr{0x7F000001u, {}, {}, 9000u}, true, false,
+                           {}, {}};
   const InjectorMessage msg = create_message<InjectorMessage, "config">(cfg);
   const auto back = decode<InjectorMessage>(encode(msg));
   CHECK(back.has_value());
@@ -192,6 +194,9 @@ void injector_message_roundtrip() {
       CHECK_EQ(*(*addr)["v4_addr"_f], 0x7F000001u);
       CHECK_EQ(*(*addr)["port"_f], 9000u);
     }
+    // the wire carried no fields 4/5, so nothing was fabricated on decode
+    CHECK(!(*dec)["username"_f].has_value());
+    CHECK(!(*dec)["password"_f].has_value());
   }
 
   // encoding is deterministic: the same message yields the same bytes
@@ -223,8 +228,10 @@ void create_and_compare() {
   CHECK(!compare_message<"connect">(other).has_value());
   CHECK(!compare_message<"subpid">(msg).has_value());
 
-  const InjectorMessage imsg = create_message<InjectorMessage, "config">(
-      InjectorConfig{IpAddr{{}, {}, std::string("h"), 1u}, false, true});
+  const InjectorConfig plain{IpAddr{{}, {}, std::string("h"), 1u}, false,
+                             true, {}, {}};
+  const InjectorMessage imsg =
+      create_message<InjectorMessage, "config">(plain);
   const auto icfg = compare_message<"config">(imsg);
   CHECK(icfg.has_value());
   if (icfg) {
@@ -393,6 +400,284 @@ void mapping_payload_layout() {
   CHECK(name.ends_with(L"4242"));
 }
 
+// (8) the P5 credential fields (P5 #1): InjectorConfig grew "username" (4)
+// and "password" (5).  Both are optional, both round-trip byte-exactly, an
+// absent one encodes NOTHING, and a credential-free config still encodes to
+// exactly the pre-P5 bytes -- an old injector has to keep talking to a new
+// injectee and the other way round.  The field numbers ARE the contract, so
+// they are pinned as wire tags: 4 and 5, both length-delimited.
+
+// InjectorConfig exactly as it stood before P5 #1, declared here (never in the
+// product header) so the credential-free encoding is compared against REAL
+// pre-P5 bytes and not against another message of today's schema.
+using InjectorConfigV1 =
+    pp::message<pp::message_field<"addr", 1, IpAddr>, pp::bool_field<"log", 2>,
+                pp::bool_field<"subprocess", 3>>;
+
+constexpr std::uint8_t kUsernameTag = 0x22;  // (4 << 3) | LEN
+constexpr std::uint8_t kPasswordTag = 0x2a;  // (5 << 3) | LEN
+
+// One length-delimited field as it goes on the wire, for a value below 128
+// bytes (so the LEN prefix is a single varint octet).
+std::vector<std::byte> delimited_field(std::uint8_t tag,
+                                       const std::string &value) {
+  std::vector<std::byte> out;
+  out.push_back(static_cast<std::byte>(tag));
+  out.push_back(static_cast<std::byte>(value.size()));
+  for (const char c : value) {
+    out.push_back(static_cast<std::byte>(static_cast<unsigned char>(c)));
+  }
+  return out;
+}
+
+void append(std::vector<std::byte> &dst, const std::vector<std::byte> &src) {
+  dst.insert(dst.end(), src.begin(), src.end());
+}
+
+bool contains(const std::vector<std::byte> &hay, const std::string &needle) {
+  const auto hit = std::search(
+      hay.begin(), hay.end(), needle.begin(), needle.end(),
+      [](std::byte h, char n) {
+        return static_cast<unsigned char>(h) ==
+               static_cast<unsigned char>(n);
+      });
+  return hit != hay.end();
+}
+
+// The same proxy address with, or without, each credential.  A missing
+// credential is ABSENT -- std::nullopt -- never an empty string, because the
+// contract says absent is what "no authentication offered" means on the wire.
+InjectorConfig make_config(
+    const std::optional<std::string> &user = std::nullopt,
+    const std::optional<std::string> &pass = std::nullopt) {
+  InjectorConfig cfg{
+      IpAddr{{}, {}, std::string("proxy.example.com"), 1080u}, true, false, {},
+      {}};
+  if (user) {
+    cfg["username"_f] = *user;
+  }
+  if (pass) {
+    cfg["password"_f] = *pass;
+  }
+  return cfg;
+}
+
+void injector_config_credentials_round_trip() {
+  const InjectorConfig cfg = make_config("alice", "s3cr3t!");
+  const auto bytes = encode(cfg);
+
+  const auto back = decode<InjectorConfig>(bytes);
+  CHECK(back.has_value());
+  if (back) {
+    CHECK(same_encoding(cfg, *back));
+    CHECK(encode(cfg) == encode(*back));  // byte-equality, not just equal
+    CHECK_EQ(*(*back)["username"_f], std::string("alice"));
+    CHECK_EQ(*(*back)["password"_f], std::string("s3cr3t!"));
+  }
+
+  // They survive the transport that is actually used too: InjectorMessage
+  // wraps the config and compare_message<"config"> hands it to the injectee.
+  const InjectorMessage msg = create_message<InjectorMessage, "config">(cfg);
+  const auto wrapped = decode<InjectorMessage>(encode(msg));
+  CHECK(wrapped.has_value());
+  if (wrapped) {
+    const auto forwarded = compare_message<"config">(*wrapped);
+    CHECK(forwarded.has_value());
+    if (forwarded) {
+      CHECK(same_encoding(*forwarded, cfg));
+      CHECK_EQ(*(*forwarded)["username"_f], std::string("alice"));
+      CHECK_EQ(*(*forwarded)["password"_f], std::string("s3cr3t!"));
+    }
+  }
+
+  // Wire layout: the two fields are APPENDED after the pre-P5 bytes, tagged
+  // with their contract field numbers, username first.
+  const auto no_creds = encode(make_config());
+  std::vector<std::byte> tail;
+  append(tail, delimited_field(kUsernameTag, "alice"));
+  append(tail, delimited_field(kPasswordTag, "s3cr3t!"));
+  CHECK_EQ(bytes.size(), no_creds.size() + tail.size());
+  CHECK(std::equal(no_creds.begin(), no_creds.end(), bytes.begin()));
+  CHECK(std::equal(tail.begin(), tail.end(),
+                   bytes.begin() + no_creds.size()));
+}
+
+// The wire-compat pin: take the credentials away and the message is
+// byte-for-byte what encapsule put on the wire before P5 existed.
+void injector_config_without_credentials_is_wire_identical() {
+  const InjectorConfigV1 v1{
+      IpAddr{{}, {}, std::string("proxy.example.com"), 1080u}, true, false};
+  const InjectorConfig v2 = make_config();
+
+  CHECK(encode(v1) == encode(v2));
+
+  // The style the product code really uses -- default-construct, then assign
+  // the fields it knows -- leaves 4/5 absent too, and lands on the same bytes.
+  InjectorConfig assigned;
+  assigned["addr"_f] =
+      IpAddr{{}, {}, std::string("proxy.example.com"), 1080u};
+  assigned["log"_f] = true;
+  assigned["subprocess"_f] = false;
+  CHECK(encode(v1) == encode(assigned));
+  CHECK(!encode(assigned).empty());
+
+  // New reader, old bytes: fields 4/5 stay ABSENT, the contract's "no
+  // authentication offered"; nothing is fabricated on the way in.
+  const auto upgraded = decode<InjectorConfig>(encode(v1));
+  CHECK(upgraded.has_value());
+  if (upgraded) {
+    CHECK(!(*upgraded)["username"_f].has_value());
+    CHECK(!(*upgraded)["password"_f].has_value());
+    CHECK((*upgraded)["log"_f].value_or(false));
+    CHECK(!(*upgraded)["subprocess"_f].value_or(true));
+    const auto &addr = (*upgraded)["addr"_f];
+    CHECK(addr.has_value());
+    if (addr) {
+      CHECK_EQ(*(*addr)["domain"_f], std::string("proxy.example.com"));
+      CHECK_EQ(*(*addr)["port"_f], 1080u);
+    }
+  }
+
+  // Old reader, new bytes: the unknown fields 4/5 are skipped, not fatal, and
+  // the pre-P5 view of the message holds no trace of them.
+  const auto downgraded =
+      decode<InjectorConfigV1>(encode(make_config("alice", "s3cr3t!")));
+  CHECK(downgraded.has_value());
+  if (downgraded) {
+    CHECK(encode(*downgraded) == encode(v1));
+  }
+}
+
+// Username and password are separate fields, so either can travel alone.  That
+// is what lets a log line or a GUI row redact one and still show the other.
+void injector_config_credential_fields_are_independent() {
+  const InjectorConfig user_only = make_config("anon");
+  const InjectorConfig pass_only = make_config(std::nullopt, "pw");
+  const InjectorConfig both = make_config("anon", "pw");
+  CHECK(!same_encoding(user_only, both));
+  CHECK(!same_encoding(pass_only, both));
+  CHECK(!same_encoding(user_only, pass_only));
+
+  struct case_t {
+    InjectorConfig cfg;
+    const char *user;  // nullptr: the field must stay absent
+    const char *pass;
+  };
+  for (const auto &c : std::vector<case_t>{{user_only, "anon", nullptr},
+                                           {pass_only, nullptr, "pw"},
+                                           {both, "anon", "pw"}}) {
+    const auto back = decode<InjectorConfig>(encode(c.cfg));
+    CHECK(back.has_value());
+    if (!back) {
+      continue;
+    }
+    CHECK(same_encoding(c.cfg, *back));
+    const auto got_user = (*back)["username"_f];
+    const auto got_pass = (*back)["password"_f];
+    CHECK_EQ(static_cast<bool>(got_user), c.user != nullptr);
+    CHECK_EQ(static_cast<bool>(got_pass), c.pass != nullptr);
+    if (c.user) {
+      CHECK_EQ(*got_user, std::string(c.user));
+    }
+    if (c.pass) {
+      CHECK_EQ(*got_pass, std::string(c.pass));
+    }
+  }
+
+  // "none" is ABSENT, not empty: an explicitly-set empty string is a present
+  // field, so a frontend that means "no credentials" has to omit it (S4/S5).
+  InjectorConfig blank_user = make_config();
+  blank_user["username"_f] = std::string();
+  CHECK(encode(blank_user) != encode(make_config()));
+  const auto blank_back = decode<InjectorConfig>(encode(blank_user));
+  CHECK(blank_back.has_value());
+  if (blank_back) {
+    CHECK((*blank_back)["username"_f].has_value());
+    CHECK_EQ((*blank_back)["username"_f]->size(),
+             static_cast<std::size_t>(0));
+  }
+
+  // A credentials-only message is nothing but that one field, tagged 4 or 5.
+  std::vector<std::byte> want;
+  append(want, delimited_field(kUsernameTag, "anon"));
+  CHECK(encode(InjectorConfig{{}, {}, {}, std::string("anon"), {}}) == want);
+
+  want.clear();
+  append(want, delimited_field(kPasswordTag, "pw"));
+  CHECK(encode(InjectorConfig{{}, {}, {}, {}, std::string("pw")}) == want);
+}
+
+// No caps at this layer: 255-byte credentials round-trip, because the schema
+// just carries the bytes and the frontends enforce their own limits.
+void injector_config_long_credentials() {
+  const std::string user(255, 'u');
+  const std::string pass(255, 'p');
+  const InjectorConfig cfg = make_config(user, pass);
+
+  const auto back = decode<InjectorConfig>(encode(cfg));
+  CHECK(back.has_value());
+  if (back) {
+    CHECK_EQ((*back)["username"_f]->size(), static_cast<std::size_t>(255));
+    CHECK_EQ((*back)["password"_f]->size(), static_cast<std::size_t>(255));
+    CHECK_EQ(*(*back)["username"_f], user);
+    CHECK_EQ(*(*back)["password"_f], pass);
+    CHECK(same_encoding(cfg, *back));
+  }
+
+  // 255 does not fit one octet, so LEN becomes the two-octet varint 0xFF 0x01
+  // and each field is 258 bytes: tag + varint + payload.
+  std::vector<std::byte> want;
+  const auto push_long = [&](std::uint8_t tag, char fill) {
+    want.push_back(static_cast<std::byte>(tag));
+    want.push_back(std::byte{0xFF});
+    want.push_back(std::byte{0x01});
+    for (int i = 0; i < 255; ++i) {
+      want.push_back(static_cast<std::byte>(static_cast<unsigned char>(fill)));
+    }
+  };
+  push_long(kUsernameTag, 'u');
+  push_long(kPasswordTag, 'p');
+
+  const auto bare = encode(InjectorConfig{{}, {}, {}, user, pass});
+  CHECK(bare == want);
+  CHECK_EQ(bare.size(), static_cast<std::size_t>(2 * 258));
+}
+
+// The other half of the contract: credentials go IN, they never come BACK.  A
+// report message has no field to carry them in, by count and by content.
+void report_messages_carry_no_credential_fields() {
+  CHECK_EQ(static_cast<unsigned>(InjectorConfig::size), 5u);  // +user +pass
+  CHECK_EQ(static_cast<unsigned>(InjectorMessage::size), 2u);
+  CHECK_EQ(static_cast<unsigned>(InjecteeMessage::size), 5u);  // opcode..token
+  CHECK_EQ(static_cast<unsigned>(InjecteeConnect::size),
+           4u);  // handle, addr, proxy, syscall
+  CHECK_EQ(static_cast<unsigned>(IpAddr::size), 4u);
+
+  // The injector direction does emit them -- this is the one place they ride.
+  const InjectorMessage config =
+      create_message<InjectorMessage, "config">(make_config("alice",
+                                                            "s3cr3t!"));
+  CHECK(contains(encode(config), "s3cr3t!"));
+
+  // The fullest report an injectee can send: a connect payload naming the
+  // same proxy, both pids and a token.  None of it holds a credential.
+  InjecteeMessage report = create_message<InjecteeMessage, "connect">(
+      InjecteeConnect{0x1234u, IpAddr{0x7F000001u, {}, {}, 80u},
+                      IpAddr{{}, {}, std::string("proxy.example.com"), 1080u},
+                      std::string("connect")});
+  report["pid"_f] = 42u;
+  report["subpid"_f] = 43u;
+  report["token"_f] = std::vector<unsigned char>(8, 0xABu);
+
+  const auto report_bytes = encode(report);
+  CHECK(!contains(report_bytes, "s3cr3t!"));
+  CHECK(!contains(report_bytes, "alice"));
+
+  const auto pid_report = create_message<InjecteeMessage, "pid">(42u);
+  CHECK(!contains(encode(pid_report), "alice"));
+  CHECK(!contains(encode(pid_report), "s3cr3t!"));
+}
+
 } // namespace
 
 int main() {
@@ -404,5 +689,10 @@ int main() {
   RUN(truncated_buffer);
   RUN(injectee_token_field);
   RUN(mapping_payload_layout);
+  RUN(injector_config_credentials_round_trip);
+  RUN(injector_config_without_credentials_is_wire_identical);
+  RUN(injector_config_credential_fields_are_independent);
+  RUN(injector_config_long_credentials);
+  RUN(report_messages_carry_no_credential_fields);
   return test_failures;
 }
