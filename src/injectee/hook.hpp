@@ -151,6 +151,42 @@ inline int fail_proxied_connect(SOCKET s, int ret) {
   return ret;
 }
 
+// Is this a TCP stream socket?  Everything below is a TCP machine: the
+// proxification re-points the caller's socket at the proxy, then speaks the
+// socks5 conversation -- send, wait, recv -- over it.  A SOCK_DGRAM socket
+// cannot answer that conversation no matter where it is pointed: connect() on
+// one only records a peer.  Before this check existed, that meant the
+// greeting left as one datagram, nothing ever came back, blocking_scope
+// waited out the handshake timeout, and fail_proxied_connect shut the socket
+// down -- an application lost a perfectly good datagram socket to a
+// proxification that could not have worked.  So the four routing detours ask
+// this first and hand anything else straight to the original: datagrams stay
+// exactly as reachable as they were before the capsule existed, and get a
+// relay of their own in P7 rather than a TCP one borrowed.
+//
+// getsockopt is not one of the hooked APIs (hook_create_all at the bottom of
+// this file: connect, WSAConnect, WSAConnectByList, WSAConnectByName{A,W},
+// CreateProcess{A,W}, ioctlsocket, WSAAsyncSelect, WSAEventSelect,
+// closesocket, ConnectEx), so this is the real winsock entry point and it
+// cannot re-enter a detour -- blocking_scope above already reads
+// SO_RCVTIMEO/SO_SNDTIMEO the same way from inside these very functions.
+// Nothing is cached: a getsockopt per connect sits next to the connect itself
+// and the sockets here are never in a per-datagram loop.
+//
+// A getsockopt that fails -- a bad descriptor, a provider that will not say
+// -- reads as "not a stream", which declines to route rather than running a
+// TCP handshake over something unknown; the original then gives the caller
+// the error it actually expects, instead of one this hook invented.
+inline bool socket_is_stream(SOCKET s) {
+  int type = 0;
+  int size = sizeof(type);
+  if (getsockopt(s, SOL_SOCKET, SO_TYPE, (char *)&type, &size) != 0) {
+    return false;
+  }
+
+  return type == SOCK_STREAM;
+}
+
 template <auto F, pp::basic_fixed_string N>
 struct hook_connect_fn : minhook::api<F, hook_connect_fn<F, N>> {
   using base = minhook::api<F, hook_connect_fn<F, N>>;
@@ -158,6 +194,11 @@ struct hook_connect_fn : minhook::api<F, hook_connect_fn<F, N>> {
   template <typename... T>
   static int WSAAPI detour(SOCKET s, const sockaddr *name, int namelen,
                            T... args) {
+    // A datagram socket is not routed, whatever else is true of it.
+    if (!socket_is_stream(s)) {
+      return base::original(s, name, namelen, args...);
+    }
+
     if (is_inet(name) && config && !is_localhost(name)) {
       auto cfg = config->get();
       if (auto v = to_ip_addr(name)) {
@@ -204,6 +245,14 @@ struct hook_WSAConnectByList
                             LPDWORD RemoteAddressLength,
                             LPSOCKADDR RemoteAddress, const timeval *timeout,
                             LPWSAOVERLAPPED Reserved) {
+    // Not a stream: straight through -- including past the "a proxy is set,
+    // so refuse" fall-out at the bottom of this block, which is a TCP
+    // decision and none of a datagram socket's business.
+    if (!socket_is_stream(s)) {
+      return original(s, SocketAddress, LocalAddressLength, LocalAddress,
+                      RemoteAddressLength, RemoteAddress, timeout, Reserved);
+    }
+
     if (config) {
       auto cfg = config->get();
       auto proxy = cfg["addr"_f];
@@ -361,6 +410,15 @@ struct hook_WSAConnectByName : minhook::api<F, hook_WSAConnectByName<F, N>> {
                             LPSOCKADDR RemoteAddress,
                             const struct timeval *timeout,
                             LPWSAOVERLAPPED Reserved) {
+    // Not a stream: straight through, refusal included -- the fail-closed
+    // below is about not leaking a TCP connection, and a datagram socket
+    // has no TCP connection to leak.
+    if (!socket_is_stream(s)) {
+      return base::original(s, nodename, servicename, LocalAddressLength,
+                            LocalAddress, RemoteAddressLength, RemoteAddress,
+                            timeout, Reserved);
+    }
+
     if (config) {
       auto cfg = config->get();
       auto proxy = cfg["addr"_f];
@@ -530,9 +588,18 @@ struct hook_ConnectEx {
 
   static inline decltype(ConnectEx) original = nullptr;
 
-  static BOOL PASCAL detour(SOCKET s, const struct sockaddr *name, int namelen,
-                            PVOID lpSendBuffer, DWORD dwSendDataLength,
-                            LPDWORD lpdwBytesSent, LPOVERLAPPED lpOverlapped) {
+  static BOOL PASCAL detour(SOCKET s, const struct sockaddr *name,
+                            int namelen, PVOID lpSendBuffer,
+                            DWORD dwSendDataLength, LPDWORD lpdwBytesSent,
+                            LPOVERLAPPED lpOverlapped) {
+    // Not a stream: straight through.  MSDN restricts ConnectEx to
+    // SOCK_STREAM sockets anyway, so this costs nothing and keeps all four
+    // routing sites saying the same thing first.
+    if (!socket_is_stream(s)) {
+      return original(s, name, namelen, lpSendBuffer, dwSendDataLength,
+                      lpdwBytesSent, lpOverlapped);
+    }
+
     if (is_inet(name) && config && !is_localhost(name)) {
       auto cfg = config->get();
       if (auto v = to_ip_addr(name)) {
