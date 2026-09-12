@@ -113,7 +113,7 @@ makensis /DVERSION=$(git describe --tags) setup.nsi # (optional) genrate an inst
 
 - C++ compiler (with C++20 support, currently MSVC)
 - Windows SDK (with winsock2 support)
-- CMake 3
+- CMake >= 3.20 (`cmake_minimum_required`, CMakeLists.txt:16)
 
 ### libraries: 
 (you do not need to download/install them manually)
