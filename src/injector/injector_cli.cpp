@@ -200,10 +200,27 @@ int main(int argc, char *argv[]) {
 
   try {
     parser.parse_args(argc, argv);
-  } catch (const runtime_error &err) {
+  } catch (const exception &err) {
+    // `const exception &`, not `const runtime_error &`: a typed option's
+    // conversion runs inside `parse_args`, and argparse's `scan'<>` throws
+    // `std::invalid_argument` -- a logic_error -- for a malformed number,
+    // so `-i abc` escaped main(), reached std::terminate and aborted the
+    // process.  Measured before this widening: exit 0xC0000409 with an empty
+    // stderr, i.e. no diagnosis at all for the user.  `std::range_error`
+    // -- overflow, e.g. `-i 99999999999999999999` -- is a runtime_error and
+    // already took this path cleanly; widening must not change its text.
+    //
     // NEVER print `err` raw: argparse quotes the offending token, which
     // for `-p<proxy-url>` spellings is the proxy address with its password.
+    // Every message from here goes through the scrubber first.
     cerr << sanitize_parse_error(err.what()) << endl;
+    cerr << parser;
+    return 1;
+  } catch (...) {
+    // Last resort for anything not derived from std::exception: exit with a
+    // diagnosis, but print ONLY fixed text -- an unknown throwable's content
+    // is unreviewed for userinfo and must never reach stderr.
+    cerr << "the command line could not be parsed" << endl;
     cerr << parser;
     return 1;
   }
