@@ -92,6 +92,19 @@ inline constexpr std::size_t kReportQueueTokens = 1024;
 // edit, both knobs, no chance for them to disagree.
 inline constexpr std::size_t kReportQueueCap = kReportQueueTokens;
 
+// Park this thread forever.  It is the only correct answer once the globals
+// are bound: unwinding do_client() would run the three scope_ptr_bind
+// destructors, null the slots, and then free the queue, the config and the
+// socket map -- while the hook set stays enabled and the victim's own threads
+// go on calling connect.  A parked thread costs one stack, and this module
+// never unmaps itself (C2), so nothing here leaks anything that outlives the
+// process.
+[[noreturn]] void stay_resident() {
+  for (;;) {
+    std::this_thread::sleep_for(std::chrono::hours(1));
+  }
+}
+
 void do_client(HINSTANCE dll_handle, port_mapping_payload ipc) {
   // C2: nothing in this file ever unmaps the module, and this is where it
   // used to happen.  By the time this thread runs, DllMain has already
@@ -144,31 +157,45 @@ void do_client(HINSTANCE dll_handle, port_mapping_payload ipc) {
     // acquire read into a local and uses that local, because 'if (config)'
     // followed by 'config->get()' is two reads of the global, not one.
     //
-    // Retiring is, by design, unreachable while the hooks are live: the port-0
-    // give-up above returns BEFORE any of this binds, and past io_context run()
-    // this thread parks rather than unwinding these scopes.  So the objects
-    // bound here outlive every detour that can see them -- and the two plain
-    // reads below are the binding thread using what it just bound itself.
+    // Retiring must never happen while the hooks are live, and it is now
+    // impossible rather than merely unlikely on the paths that were thought
+    // about: the port-0 give-up above returns BEFORE anything binds, and from
+    // the client's construction down this region sits in a catch-all that parks
+    // (C4 review).  Without that catch, one system_error from asio -- a socket
+    // or timer constructor under handle pressure, or an exception escaping the
+    // detached coroutine through run() -- unwound these three destructors and
+    // freed the owners below them with the detours still enabled.  The objects
+    // bound here therefore outlive every detour that can see them, and the
+    // plain reads below are the binding thread using what it just bound.
     scope_ptr_bind queue_bind(queue, qu.get());
     scope_ptr_bind config_bind(config, cfg.get());
     scope_ptr_bind map_bind(nbio_map, sock_map.get());
 
-    injectee_client c(io_context, tcp::endpoint(localhost, ipc.port), *queue,
-                      *config, token);
-    asio::co_spawn(io_context, c.start(), asio::detached);
+    // C4 review: nothing from here may unwind.  The binds above are live and
+    // the owners below them are still alive, so an escaped exception is not a
+    // tidy exit -- it is the same use-after-free as unbinding on purpose, one
+    // frame earlier.  The catch-all is deliberately silent: this thread has no
+    // front end to report to, the queue it would report through is the object
+    // at risk, and logging from inside a victim is not this file's job.
+    try {
+      injectee_client c(io_context, tcp::endpoint(localhost, ipc.port), *queue,
+                        *config, token);
+      asio::co_spawn(io_context, c.start(), asio::detached);
 
-    io_context.run();
+      io_context.run();
+    } catch (...) {
+      stay_resident();
+    }
 
     // run() only comes back if the client could not keep any work pending,
-    // i.e. after its reconnect budget expired.  Stay resident anyway:
-    // unbinding the globals the hooks read would turn every later connect
-    // into a silent direct connect, and unmapping the DLL while other
+    // i.e. after its reconnect budget expired -- at which point it has already
+    // dropped its session, so ending c here closes a dead one.  Stay resident
+    // anyway: unbinding the globals the hooks read would turn every later
+    // connect into a silent direct connect, and unmapping the DLL while other
     // threads may be inside a detour is the use-after-free this path used to
-    // cause (P4 #5).  Park instead: the hooks and the pinned routing then
-    // live for as long as the victim does.
-    for (;;) {
-      std::this_thread::sleep_for(std::chrono::hours(1));
-    }
+    // cause (P4 #5).  Park instead: the hooks and the pinned routing then live
+    // for as long as the victim does.
+    stay_resident();
   }
 }
 

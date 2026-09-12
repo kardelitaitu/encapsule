@@ -23,11 +23,14 @@
 #include "test_support.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cstdint>
 #include <regex>
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <utils.hpp>
@@ -526,6 +529,118 @@ void a_spawned_child_is_named_while_it_survives() {
   }
 }
 
+// --------------------------------------------- scope-bound publication (C4) --
+
+namespace {
+
+// The shape do_client() has in the injectee: a plain pointer slot, an object
+// whose fields are written BEFORE it is published, and reader threads that test
+// the slot and then use what they tested.
+struct scoped_object {
+  std::uint64_t a = 0;
+  std::uint64_t b = 0;
+};
+
+constexpr std::uint64_t k_scope_stamp = 0x0C4E40DE00000000ull;
+
+alignas(void *) scoped_object *scope_slot = nullptr;
+
+} // namespace
+
+void a_scope_bind_publishes_the_slot_and_retires_it() {
+  // Sequential contract first: the bind is visible, the scope end clears it,
+  // and rebinding works after a retirement (the ordering in scope_ptr_bind is
+  // release on both ends, so a later acquire cannot see a stale non-null).
+  scoped_object first{}, second{};
+  first.a = k_scope_stamp;
+  first.b = k_scope_stamp + 1;
+  second.a = k_scope_stamp;
+  second.b = k_scope_stamp + 1;
+
+  CHECK(load_scope(scope_slot) == nullptr);
+
+  {
+    scope_ptr_bind bind(scope_slot, &first);
+    CHECK(load_scope(scope_slot) == &first);
+    if (auto *got = load_scope(scope_slot)) {
+      CHECK(got->a == k_scope_stamp);           // published payload is visible
+      CHECK(got->b == got->a + 1);
+    }
+  }
+  CHECK(load_scope(scope_slot) == nullptr);
+
+  {
+    scope_ptr_bind bind(scope_slot, &second);
+    CHECK(load_scope(scope_slot) == &second);
+  }
+  CHECK(load_scope(scope_slot) == nullptr);
+}
+
+void a_racing_read_uses_the_one_value_it_tested() {
+  // The property C4 actually fixed, pinned: a reader performs ONE load, so the
+  // pointer it tested is the pointer it dereferences.  Four fully initialised
+  // objects cycle through the slot, each published and retired thousands of
+  // times, while three readers hammer load_scope().  Anything other than "null"
+  // or "one of these four, with its own invariant intact" is a torn or stale or
+  // reloaded read -- and the old two-read shape produced exactly that: the
+  // second read coming back null after the first said non-null.
+  scoped_object pool[4];
+  for (auto &o : pool) {
+    o.a = k_scope_stamp;
+    o.b = k_scope_stamp + 1;
+  }
+
+  std::atomic<bool> stop{false};
+  std::atomic<long> good{0}, garbage{0}, torn{0};
+
+  std::thread binder([&] {
+    for (int round = 0; round < 3000 && !stop.load(); ++round) {
+      {
+        scope_ptr_bind bind(scope_slot, &pool[round & 3]);
+        // Hold each publication long enough that an unscheduled reader still
+        // gets to observe it; yield rather than sleep to keep the test under
+        // the millisecond scale.
+        for (int hold = 0; hold < 64; ++hold) {
+          std::this_thread::yield();
+        }
+      }
+      // and the gap where the slot is null is the retirement half of the race
+      for (int gap = 0; gap < 8; ++gap) {
+        std::this_thread::yield();
+      }
+    }
+    stop.store(true);
+  });
+
+  auto reader = [&] {
+    while (!stop.load(std::memory_order_relaxed)) {
+      if (auto *got = load_scope(scope_slot)) {
+        const bool one_of_ours = got == &pool[0] || got == &pool[1] ||
+                                got == &pool[2] || got == &pool[3];
+        if (!one_of_ours) {
+          garbage.fetch_add(1, std::memory_order_relaxed);
+        } else if (got->a != k_scope_stamp || got->b != got->a + 1) {
+          torn.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          good.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    }
+  };
+  std::thread r1(reader), r2(reader), r3(reader);
+  binder.join();
+  r1.join();
+  r2.join();
+  r3.join();
+
+  CHECK_EQ(garbage.load(), 0L); // no read produced a pointer outside the pool
+  CHECK_EQ(torn.load(), 0L);    // no read saw an object before its fields did
+  // The race really ran: readers observed publications, and the test above is
+  // not a tautology about an idle slot.
+  CHECK(good.load() > 0);
+  CHECK(load_scope(scope_slot) == nullptr); // every bind was retired
+}
+
 int main() {
   RUN(wildcard_star);
   RUN(wildcard_question);
@@ -553,5 +668,7 @@ int main() {
   RUN(the_short_name_of_this_process_is_its_stem);
   RUN(a_pid_that_cannot_be_opened_has_no_name);
   RUN(a_spawned_child_is_named_while_it_survives);
+  RUN(a_scope_bind_publishes_the_slot_and_retires_it);
+  RUN(a_racing_read_uses_the_one_value_it_tested);
   return test_failures;
 }

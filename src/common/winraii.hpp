@@ -122,21 +122,30 @@ std::wstring get_current_filename() {
 // thread binds and retires the globals they consult, so a bind is a
 // cross-thread handoff.  A plain assignment publishes the pointer with no
 // ordering at all -- the compiler may sink the initialisation of *bind below
-// the store, and a reader can meet the pointer before the object behind it --
-// and a plain nulling races with a reader that has already tested it.  Both
-// ends are ordered here: release on publish, release on retire, and the reader
-// takes the value once through load_scope() below (acquire).
+// the store -- and a plain nulling races with a reader that has already tested
+// it.  Both ends are ordered here: release on publish, release on retire, and
+// the reader takes the value once through load_scope() below (acquire).
 //
 // The least invasive shape on purpose: the slot stays a plain 'T *'.  Making it
 // std::atomic<T *> instead would retype every scope-bound global and rewrite
 // every '->' and 'if (ptr)' that reads one -- including on the injector side,
 // which shares this header -- to buy what std::atomic_ref (C++20) buys without
-// touching the object's type at all.  atomic_ref's one demand is an address
-// aligned for an atomic pointer access; a scope-bound slot is always a plain
-// pointer object, whose natural alignment is exactly
-// std::atomic_ref<T *>::required_alignment (hook.hpp spells the alignas at the
-// declarations so a reshuffle there cannot break it silently).
+// touching the object's type at all.
+//
+// What atomic_ref does demand is an address aligned for an atomic pointer
+// access, and MSVC only checks that in Debug: its conformance test is
+// _STL_ASSERT, which disappears under NDEBUG, where what is left is
+// _Analysis_assume_ -- the optimiser is TOLD to assume the alignment.  So the
+// check that actually fires is the static_assert below, not a comment and not
+// the alignas(void *) the declarations carry: that spells the natural
+// alignment of a pointer (8 on x64, 4 on x86, which is exactly
+// std::atomic_ref<T *>::required_alignment) and so documents intent without
+// enforcing anything a reshuffle could not break.
 template <typename T> struct scope_ptr_bind {
+  static_assert(alignof(T *) >= std::atomic_ref<T *>::required_alignment,
+                "atomic_ref needs the slot aligned for an atomic pointer "
+                "access; MSVC does not check that in Release");
+
   T *&ptr;
 
   scope_ptr_bind(T *&ptr, T *bind) : ptr(ptr) {
@@ -156,11 +165,28 @@ template <typename T> struct scope_ptr_bind {
 //
 // The second spelling is the C4 window: it is not one value but two, and the
 // compiler is free to reload the global after the test (MSVC does as soon as
-// any call -- even a std::mutex constructor -- sits between the two), while the
-// thread owning the scope may retire it in between.  That is a null dereference
-// of a pointer a detour had just checked, or a use of an object the binder is
-// destroying, in someone else's process.
+// any call -- even a std::mutex constructor -- sits between the two) while the
+// thread owning the scope retires it in between.  A scratch two-thread harness
+// on this toolchain counted that re-read coming back null 1094 times out of
+// 44045 uses in three seconds -- the null dereference of a pointer a detour had
+// just checked, inside a victim.  The in-tree pin of the property is
+// tests/utils/utils_test.cpp, a_racing_read_uses_the_one_value_it_tested.
+//
+// What the release/acquire pair buys is two things and only two: a read is ONE
+// atomic read, so the value tested is the value used, and publication is
+// ORDERED, so a reader that acquires the pointer also sees what the binder
+// wrote before storing it.  Neither is a lifetime guarantee -- acquire does not
+// keep the object alive.  The objects behind these pointers outlive every
+// detour that can see them because of residency: do_client() parks instead of
+// unwinding and this module never unmaps itself (C2, P4 #5).  do_client() also
+// declares its binds after the owners, so a retirement nulls the slots before
+// it frees them, which narrows that window and does not close it.  Nobody
+// should re-introduce an unbind-on-some-path and treat acquire as having made
+// it safe: the guarantee is the park, not the memory order.
 template <typename T> T *load_scope(T *&ptr) {
+  static_assert(alignof(T *) >= std::atomic_ref<T *>::required_alignment,
+                "atomic_ref needs the slot aligned for an atomic pointer "
+                "access; MSVC does not check that in Release");
   return std::atomic_ref<T *>(ptr).load(std::memory_order_acquire);
 }
 
