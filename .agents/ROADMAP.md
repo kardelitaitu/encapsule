@@ -146,16 +146,22 @@ UI data-race fixes (`view.post`).
       sides move together to keep the protopuf wire format compatible. (e7ff326:
       username=4/password=5 optional+separate; credential-free config pinned
       byte-identical to pre-P5 wire; report messages pinned credential-free.)
-- [ ] Injectee: offer methods `{5, 2, 0}` (no-auth + userpass) instead of the
-      hardcoded `{5,1,0}` in `src/injectee/socks5.hpp`.
-- [ ] Injectee: implement the RFC 1929 user/pass subnegotiation and apply configured
-      credentials during `socks5_handshake`.
+- [x] Injectee: offer methods `{5, 2, 0}` (no-auth + userpass) when credentials are
+      configured — `{5,1,0}` unchanged otherwise (701366e; relay no longer
+      mis-parses an auth greeting as a v4 request).
+- [x] Injectee: implement the RFC 1929 user/pass subnegotiation and apply configured
+      credentials during `socks5_handshake` (701366e: socks5_build_auth pinned bytes,
+      required creds param at all 4 hook sites, fail-closed — 0xFF/short-reply/bad
+      status all fail the connect, no silent downgrade).
 - [ ] Server side: validate and forward credentials from the frontends into the
       config message.
 - [ ] CLI: accept credentials via `-p user:pass@host:port` and/or dedicated
       `--proxy-user/--proxy-pass` flags.
-- [ ] GUI: accept credentials in the proxy input (URI syntax or dedicated fields).
-- [ ] Unit tests: handshake byte-level tests covering auth success and auth failure.
+- [x] GUI: accept credentials in the proxy input (41de274: dedicated username/password
+      boxes + no-mask tooltip; CI-compiled — local elements/MSVC exception).
+- [x] Unit tests: handshake byte-level tests covering auth success and auth failure
+      (701366e: live-pipe AF_INET pair — success 00, failure FF/short/garbage,
+      server-side byte assertions; `injectee.socks5` green).
 - [ ] E2E: verify against a socks5 server that requires authentication.
 
 ### P6 — Feature: DNS resolution hooking
