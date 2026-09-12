@@ -204,9 +204,12 @@ UI data-race fixes (`view.post`).
 - [ ] E2E test against a UDP-capable socks5 server; keep the TCP path regression-free.
 
 ### P8 — Product / UX
-- [ ] Surface the CLI-only `-w/--new-console-window` as a GUI toggle (the last
+- [x] Surface the CLI-only `-w/--new-console-window` as a GUI toggle (the last
       GUI/CLI parity gap; the GUI already covers all six input modes and
-      proxy/log/subprocess toggles per `make_controls`).
+      proxy/log/subprocess toggles per `make_controls`). (2a63f95: check_box on the
+      exec row, default OFF = byte-identical flags; `cl /Zs` probe over the exact
+      vcxproj include set reports 0 diagnostics — link-unverified locally, and note
+      GitHub Actions has never run on this fork, so the probe is the only signal.)
 - [ ] Auto-inject on process start: a watch loop reusing the `match_process*`
       utilities (`src/common/winraii.hpp`, wildcard/regexp already supported).
 - [ ] Connection-log improvements: per-process aggregation, copy/export of the log.
