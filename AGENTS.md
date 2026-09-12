@@ -197,7 +197,9 @@ Re-index: `mcp cbm index_repository(repo_path="C:\dev\encapsule", mode="moderate
   run through `sanitize_parse_error`/`scrub_token` in `injector_cli.cpp` (no line cites, in flight),
   which drops everything up to and including that last `@` — so a mistyped
   `-palice:pw@1.2.3.4:1080` prints `1.2.3.4:1080`, and a proxy-flag token holding nothing but the
-  secret is dropped whole (`"Invalid argument (value redacted)"`).
+  secret is dropped whole, leaving only the fixed prefix (measured: `Unknown argument:` with nothing
+  after it; the `"Invalid argument (value redacted)"` fallback exists but argparse's messages all
+  carry fixed words, so it is not reachable today).
 - Two architectures in play: x64 injectee for 64-bit targets, Win32 `encapsule-injectee32.dll` +
   `wow64-address-dumper` for 32-bit targets under WoW64.
 

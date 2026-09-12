@@ -5,6 +5,11 @@
 This guide is for contributors building and debugging the project from
 source. For end-user installs see the [README](../README.md).
 
+Cites into the fast-moving files (`hook.hpp`, `injectee.cpp`, `socks5.hpp`,
+`server.hpp`, `injector_cli.cpp`, `injector_gui.hpp`, `udp_state.hpp`) name a
+**symbol** rather than a line number, because those files move daily; every
+`file:NNN` left in this guide points at a stable file.
+
 ## 1. Build prerequisites
 
 | Requirement | Notes |
@@ -159,9 +164,10 @@ special treatment.
 - Build `-mode Debug` for an unoptimized injectee and point the debugger's
   symbol path at the PDBs of the same build tree (`build/<arch>/<mode>/`).
 - In WinDbg, `sxe ld:encapsule-injectee.dll` breaks the moment the injected
-  DLL maps in. `DllMain` (`src/injectee/injectee.cpp:88`) only initializes
-  MinHook, installs the hooks and **detaches a worker thread** — the real
-  logic (IPC client, config, logging) runs on that thread, so set your
+  DLL maps in. `DllMain` (`src/injectee/injectee.cpp`, cited by symbol)
+  only initializes MinHook, installs the hooks and **detaches a worker
+  thread** — the real logic (IPC client, config, logging) runs on that
+  thread, so set your
   breakpoints in the `src/injectee/hook.hpp` detours and `client.hpp`, not in
   `DllMain`.
 
@@ -199,10 +205,11 @@ then rides to the injectee as `InjectorConfig` fields 4/5
 adds no bytes, which is what keeps a credential-free config byte-identical
 to the pre-P5 wire.
 
-In the target, `socks5_handshake` (`src/injectee/socks5.hpp:268-324`) offers
-methods `{2, 0}` when credentials are configured — username/password first,
-no-auth still selectable — and `{0}` when they are not; a server that picks
-method 2 gets the `{1, ULEN, user, PLEN, pass}` subnegotiation. Any refusal
+In the target, `socks5_handshake` (`src/injectee/socks5.hpp`, cited by
+symbol) offers methods `{2, 0}` when credentials are configured —
+username/password first, no-auth still selectable — and `{0}` when they are not;
+a server that picks method 2 gets the `{1, ULEN, user, PLEN, pass}`
+subnegotiation. Any refusal
 (the usual `{1, 0xFF}`, a short read, an unexpected version) fails the
 handshake and `fail_proxied_connect` in `src/injectee/hook.hpp` surfaces it
 as `WSAECONNREFUSED`: never a silent retry without authentication, never a
@@ -226,8 +233,9 @@ echo — thrown for anything it does not recognise — goes through
 `sanitize_parse_error` (`src/injector/injector_cli.cpp`) before it reaches
 stderr, so a mistyped `-palice:hunter2@1.2.3.4:1080`, a `-p=...` form or a
 bare `--alice:hunter2@1.2.3.4:1080` prints `1.2.3.4:1080`; a token holding
-nothing but a secret, with no authority to name, is dropped and reported as
-`Invalid argument (value redacted)`. The practical rule is unchanged: treat a
+nothing but a secret, with no authority to name, is dropped whole and leaves
+only the parser's fixed prefix (measured: a bare `Unknown argument:` with
+nothing after it). The practical rule is unchanged: treat a
 credential typed onto the command line as visible to whatever can read argv —
 but no longer as something the tool will echo back at you.
 
@@ -252,9 +260,9 @@ full table lives in `.agents/ROADMAP.md` §2:
   socks5 handshake, then restores the remembered mode; that state is tracked
   in `nbio_map` by the `ioctlsocket`, `WSAAsyncSelect` and `WSAEventSelect`
   hooks (sockets that never went non-blocking stay blocking). The handshake
-  is bounded by a 3 s timeout (`SOCKS_HANDSHAKE_TIMEOUT_MS`, `hook.hpp:66`),
-  applied as `SO_RCVTIMEO`/`SO_SNDTIMEO` in `blocking_scope` (`hook.hpp:111-121`)
-  and surfacing as `WSAETIMEDOUT` — so a hung proxy fails the connect after
+  is bounded by a 3 s timeout (`SOCKS_HANDSHAKE_TIMEOUT_MS` in `hook.hpp`),
+  applied as `SO_RCVTIMEO`/`SO_SNDTIMEO` by the `blocking_scope` constructor,
+  surfacing as `WSAETIMEDOUT` — so a hung proxy fails the connect after
   ~3 s rather than hanging the victim's thread. When stepping here, check that
   the non-blocking state is restored correctly — a wrongly restored mode looks
   like an unrelated async-I/O bug in the target application.
@@ -290,9 +298,10 @@ contract below.
   built by `get_port_mapping_payload`, :334-351), and the injectee re-presents
   that token in every message it sends (`src/injectee/client.hpp:113-123`). The
   control server refuses any session whose token does not match
-  (`src/injector/server.hpp:217-229`). No RNG, no token, no injection
-  (`src/injector/injector.hpp:114`).
+  (`injectee_session::process()`, `src/injector/server.hpp`). No RNG, no
+  token, no injection (`src/injector/injector.hpp:114`).
 - The mapping is created with an explicit user+SYSTEM DACL
   (`D:P(A;;GA;;;SY)(A;;GA;;;<current-user-SID>)`) and **fails closed**: if the
   descriptor cannot be built, the mapping is not created at all — never
-  silently left world-accessible (`create_mapping`, `src/common/winraii.hpp:150-200`).
+  silently left world-accessible (`create_mapping`,
+  `src/common/winraii.hpp:153-203`).
