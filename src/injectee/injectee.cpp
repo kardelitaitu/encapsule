@@ -19,9 +19,83 @@
 #include <thread>
 #include <vector>
 
-void do_client(HINSTANCE dll_handle, const port_mapping_payload &ipc) {
-  if (ipc.port == 0) { // no IPC port: never start the client, just unload
-    FreeLibrary(dll_handle);
+// The injector publishes the control port plus a per-injection token in a
+// per-process named mapping.  A missing mapping or a failed view is reported
+// as the zero payload (port 0, empty token) rather than a null dereference in
+// a victim.
+//
+// One read is not enough, because "not there yet" is not evidence of "never":
+// injector::inject() creates the mapping from a FUNCTION-LOCAL handle
+// (injector.hpp:121), so its destructor can take the name away before or
+// while our reader opens it -- on a loaded machine, before the client thread
+// has even been scheduled.  So the bootstrap tries again on a bounded budget:
+// about five seconds, one sleep in front of every retry, which is also how
+// long the injector is willing to wait for its remote LoadLibraryW to finish
+// (injector.hpp:170).  Holding that mapping for the whole session instead
+// belongs to the injector (M1-b); that is what makes a late read possible at
+// all, and this is what makes losing the race survivable rather than fatal
+// while the injector-side half is still outstanding.
+constexpr int kMappingProbeTries = 20;
+constexpr std::chrono::milliseconds kMappingProbeDelay{250};
+
+port_mapping_payload get_ipc_payload() {
+  handle mapping = open_mapping(get_port_mapping_name(GetCurrentProcessId()));
+  if (!mapping) {
+    return {};
+  }
+
+  mapped_buffer payload_buf(mapping.get());
+  auto payload = payload_buf.checked<port_mapping_payload>();
+  if (!payload) {
+    return {};
+  }
+
+  return *payload;
+}
+
+// Retry until a port turns up or the budget runs out.  Only ever called from
+// the client thread: the sleeps here must never run under the loader lock.
+// Every open and every view is RAII, so a long poll cannot leak a handle even
+// when the view keeps failing.
+port_mapping_payload get_ipc_payload_waiting() {
+  for (int attempt = 1; attempt < kMappingProbeTries; ++attempt) {
+    std::this_thread::sleep_for(kMappingProbeDelay);
+    if (auto payload = get_ipc_payload(); payload.port != 0) {
+      return payload;
+    }
+  }
+
+  return {};
+}
+
+void do_client(HINSTANCE dll_handle, port_mapping_payload ipc) {
+  // C2: nothing in this file ever unmaps the module, and this is where it
+  // used to happen.  By the time this thread runs, DllMain has already
+  // created AND enabled the hook set, so ws2_32 jumps into code that lives
+  // here, and this thread is itself executing inside the image with the CRT's
+  // std::thread invoke wrapper below it on the stack.  FreeLibrary() at that
+  // moment returns through freed code and leaves live detours pointing at
+  // freed trampolines: an access violation in the victim on its next winsock
+  // call, a far worse outcome than the un-encapsulated one this replaces.
+  // P4 #5 already made the opposite choice for the mid-session case further
+  // down (stay resident, never unbind the globals), so that unload was a
+  // leftover contradiction.
+  //
+  // Who unmaps it, then?  Nobody: the OS takes the image back at process
+  // exit, and DLL_PROCESS_DETACH disables the hooks on the way out.  A hooking
+  // DLL has to outlive the hooks it installed.
+  (void)dll_handle;
+
+  if (ipc.port == 0) {
+    ipc = get_ipc_payload_waiting(); // C2: the mapping may still be on its way
+  }
+
+  if (ipc.port == 0) {
+    // No mapping within the budget: the injector never finished its setup, or
+    // died trying.  Give up quietly and stay resident -- the hooks remain
+    // enabled and config remains null, which is this file's documented
+    // direct-passthrough state.  The host keeps talking (just not through the
+    // capsule), and a broken bootstrap refuses nothing.
     return;
   }
 
@@ -56,34 +130,19 @@ void do_client(HINSTANCE dll_handle, const port_mapping_payload &ipc) {
     // threads may be inside a detour is the use-after-free this path used to
     // cause (P4 #5).  Park instead: the hooks and the pinned routing then
     // live for as long as the victim does.
-    (void)dll_handle;
     for (;;) {
       std::this_thread::sleep_for(std::chrono::hours(1));
     }
   }
 }
 
-// Pre-session failures still unload (nothing is live in another thread yet);
-// losing the injector mid-session does not - see the note in do_client().
-//
-// The injector publishes the control port plus a per-injection token in a
-// per-process named mapping.  A missing mapping or a failed view means the
-// setup was broken: hand back the zero payload (port 0, empty token) and let
-// the caller unload us, rather than dereferencing null in a victim.
-port_mapping_payload get_ipc_payload() {
-  handle mapping = open_mapping(get_port_mapping_name(GetCurrentProcessId()));
-  if (!mapping) {
-    return {};
-  }
-
-  mapped_buffer payload_buf(mapping.get());
-  auto payload = payload_buf.checked<port_mapping_payload>();
-  if (!payload) {
-    return {};
-  }
-
-  return *payload;
-}
+// Losing the injector mid-session does not unmap us, and neither does a
+// bootstrap that never found the mapping -- see do_client().  The only path
+// that still hands the image back is the hook-creation failure in DllMain
+// below: nothing was enabled and no thread of ours was started there, so no
+// part of the host can be standing inside us, and FreeLibraryAndExitThread is
+// the documented way for a module to leave by itself.  Everything after
+// minhook::enable() is resident for good.
 
 BOOL WINAPI DllMain(HINSTANCE dll_handle, DWORD reason, LPVOID reserved) {
   switch (reason) {
@@ -101,6 +160,14 @@ BOOL WINAPI DllMain(HINSTANCE dll_handle, DWORD reason, LPVOID reserved) {
     }
 
     minhook::enable();
+    // The FIRST mapping read is deliberately still taken here, inline, while
+    // the injector's handle to the section is certain to be alive: this runs
+    // under the loader lock inside the remote LoadLibraryW, and the name can
+    // be gone before any thread of ours is scheduled.  One non-blocking
+    // OpenFileMapping plus MapViewOfFile is all it costs DllMain -- no sleep,
+    // which is exactly why the retry does not belong here.  Everything after
+    // this belongs to do_client(): the backoff, and the answer to port 0,
+    // which is stay resident and inert, never unload.
     std::thread(do_client, dll_handle, get_ipc_payload()).detach();
     break;
 
