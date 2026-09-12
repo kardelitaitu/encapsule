@@ -23,6 +23,8 @@
 #include <filesystem>
 #include <map>
 #include <mutex>
+#include <string_view>
+#include <tlhelp32.h>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -290,7 +292,8 @@ struct injector {
   }
 
   static inline const char injectee_filename[] = "encapsule-injectee.dll";
-  static inline const char injectee_wow64_filename[] = "encapsule-injectee32.dll";
+  static inline const char injectee_wow64_filename[] =
+      "encapsule-injectee32.dll";
 
   static std::optional<std::wstring>
   find_injectee(std::wstring_view self_binary_path, BOOL isWoW64) {
@@ -305,7 +308,142 @@ struct injector {
     return path.wstring();
   }
 
-  static bool inject(DWORD pid, std::uint16_t port) {
+  // Case-insensitive compare of one NUL-terminated Toolhelp name against one
+  // of the two injectee literals above.  ASCII folding only, the same rule
+  // process_short_name() uses, so a name outside ASCII can merely fail to
+  // match, and no CRT case helper, code page or temporary sits on the way.
+  // The length comes from the string_view, so the narrow side is never read
+  // past its own end and the wide side must stop exactly where it does.
+  static bool module_name_matches(const wchar_t *module,
+                                  std::string_view expected) {
+    auto fold = [](wchar_t c) {
+      return (c >= L'A' && c <= L'Z') ? wchar_t(c + (L'a' - L'A')) : c;
+    };
+
+    std::size_t i = 0;
+    for (; i < expected.size(); ++i) {
+      if (fold(module[i]) !=
+          fold(static_cast<wchar_t>(static_cast<unsigned char>(expected[i])))) {
+        return false;
+      }
+    }
+
+    return module[i] == 0; // the toolhelp name holds nothing extra
+  }
+
+  // Does this entry name our capsule?  Asked twice: szModule is documented as
+  // a base name WITHOUT its extension, while the file the remote LoadLibraryW
+  // was handed certainly has one.  Whichever spelling the snapshot uses it
+  // names the same loaded module, and matching only one of them would leave
+  // the message to chance.  Both literals above end in '.dll', so the second
+  // spelling is always the stem -- and only the stem, so some other
+  // 'encapsule-injectee.<ext>' is not mistaken for ours.
+  static bool module_is_ours(const wchar_t *module, std::string_view name) {
+    if (module_name_matches(module, name)) {
+      return true;
+    }
+
+    static constexpr std::string_view extension = ".dll";
+    if (!name.ends_with(extension)) {
+      return false;
+    }
+
+    return module_name_matches(module,
+                               name.substr(0, name.size() - extension.size()));
+  }
+
+  // -------------------------------------------------- already encapsulated? --
+  //
+  // Best-effort answer to: is an encapsule capsule already mapped into pid?
+  //
+  // Why the question needs asking.  7593252 took away the injectee's
+  // self-FreeLibrary, so a capsule that has once loaded stays resident for the
+  // life of the target, and LoadLibraryW on a module that is already mapped
+  // does NOT run DllMain again -- it bumps the refcount and returns the SAME
+  // HMODULE.  load_into() reads that HMODULE as the remote thread's exit code
+  // and calls any nonzero value a success, so a second inject() into the same
+  // pid reports a fresh injection that attached nothing: no new DllMain, no
+  // new client thread, and nobody left to read the token publish() has just
+  // written.  This is what lets the caller say 'already encapsulated' instead.
+  //
+  // UI TRUTH, NOT A SECURITY GATE.  Everything here runs against a process a
+  // same-user attacker owns and can arrange to misreport: the snapshot can be
+  // refused outright, can come back short, or can be made to carry a name that
+  // merely looks like ours.  NOTHING may be authorized, permitted, refused or
+  // gated on this answer, and it is never compared with a token.
+  // Authentication stays exactly where it was, in token_matches() and in the
+  // mapping DACL.  The most a wrong answer can do is print one inaccurate
+  // sentence -- which is the same thing the phantom re-injection it replaces
+  // costs today, and less than it costs the user.
+  //
+  // Every way of NOT knowing returns false: a rejected snapshot, a pid that
+  // has already exited, a 32-bit module list this tool cannot enumerate.
+  // false is also the answer for a process that was never encapsulated, which
+  // is why callers read it as 'say what you used to say'.  Degrading to
+  // today's message is the designed failure mode: no path through here blocks,
+  // throws, writes to the target, or refuses an injection.
+  static bool module_resident(DWORD pid, bool is_wow64) {
+    const std::string_view name =
+        is_wow64 ? injectee_wow64_filename : injectee_filename;
+
+    // TH32CS_SNAPMODULE32 is what makes a WoW64 target's 32-bit list visible
+    // to a 64-bit tool.  Without it every 32-bit target answers false and the
+    // message stays a lie, which is the only thing this helper is for.
+    const DWORD flags =
+        TH32CS_SNAPMODULE | (is_wow64 ? TH32CS_SNAPMODULE32 : 0);
+
+    // Toolhelp reports failure as INVALID_HANDLE_VALUE, not NULL, so the raw
+    // handle is tested before the wrapper takes it on: handing -1 to
+    // CloseHandle would be a call about something that was never a handle.
+    const HANDLE raw = CreateToolhelp32Snapshot(flags, pid);
+    if (raw == INVALID_HANDLE_VALUE) {
+      return false;
+    }
+    handle snapshot(raw);
+
+    MODULEENTRY32W entry = {sizeof(MODULEENTRY32W)};
+    if (!Module32FirstW(snapshot.get(), &entry)) {
+      return false; // nothing enumerable is not proof of absence
+    }
+
+    do {
+      if (module_is_ours(entry.szModule, name)) {
+        return true;
+      }
+    } while (Module32NextW(snapshot.get(), &entry));
+
+    return false;
+  }
+
+  // The entry point both front ends call.  Its bool is exactly what it has
+  // always been: publish and load succeeded, or did not.  It cannot also carry
+  // the new distinction, and it does not try to -- a re-injection of a
+  // resident capsule really does succeed at the Win32 level, so turning this
+  // bool into an enum or a struct would be a change every caller has to make,
+  // and 'attaching' versus 'already encapsulated' would arrive as a compile
+  // error in the front ends instead of as a better sentence.
+  //
+  // So the distinction is additive: hand it a bool and it receives whether the
+  // capsule was ALREADY mapped before this call, i.e. which of the two words
+  // is true.  Pass nothing, as every caller does today, and this is the old
+  // call with the old behaviour, byte for byte.
+  //
+  //    bool resident = false;
+  //    if (injector::inject(pid, port, &resident)) {
+  //      info(resident ? "{}: already encapsulated" : "{}: injected", pid);
+  //    }
+  //
+  // The out value is defined on every exit, the failures included, and it is
+  // filled BEFORE publish/load -- after a load the module is of course
+  // resident, so this is the last moment at which the answer says whether THIS
+  // call is the one that attached.  Nothing on this path is refused, skipped
+  // or reordered because of it: module_resident() reports, it does not gate.
+  static bool inject(DWORD pid, std::uint16_t port,
+                     bool *already_encapsulated = nullptr) {
+    if (already_encapsulated) {
+      *already_encapsulated = false; // defined on every path out of here
+    }
+
     handle proc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!proc)
       return false;
@@ -316,6 +454,10 @@ struct injector {
       return false;
     }
 #endif
+
+    if (already_encapsulated) {
+      *already_encapsulated = module_resident(pid, isWoW64 != FALSE);
+    }
 
     if (auto path = find_injectee(get_current_filename(), isWoW64)) {
       return inject(pid, proc.get(), port, isWoW64, path.value());
