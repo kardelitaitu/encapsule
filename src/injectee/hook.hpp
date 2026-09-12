@@ -272,25 +272,38 @@ struct hook_connect_fn : minhook::api<F, hook_connect_fn<F, N>> {
         is_inet(name) && bound && !is_localhost(name)) {
       auto cfg = bound->get();
       auto proxy = cfg["addr"_f];
+      auto log = cfg["log"_f];
+      // One acquire read of the queue, shared by the gate below and by the
+      // report site: two reads would be two answers to the same question, and
+      // a plain read of a scope-bound global is the exact thing C4 rules out.
+      auto *q = load_scope(queue);
 
-      // A datagram socket is not routed, whatever else is true of it.
-      const auto verdict = socket_stream_type(s);
-      if (verdict == socket_stream_verdict::not_stream) {
-        return base::original(s, name, namelen, args...);
-      }
-      // No answer from the provider: with a proxy configured this connect must
-      // fail like a refused proxy would, not leave direct.
-      if (verdict == socket_stream_verdict::unknown) {
-        if (proxy) {
-          return fail_proxied_connect(s, SOCKET_ERROR);
+      // And the query pays for itself only where it can still change the
+      // answer: with no proxy this site neither routes nor refuses, so the one
+      // thing left for the verdict to move is a report -- a record claiming a
+      // connect this capsule never made.  No proxy and no logging, and nothing
+      // is asked: straight to the original, no getsockopt.  A proxy is enough
+      // on its own, whatever logging says: that is the case where the verdict
+      // decides between a refusal and a leak, and it is the whole point of F1.
+      if (proxy || (q && log && log.value())) {
+        // A datagram socket is not routed, whatever else is true of it.
+        const auto verdict = socket_stream_type(s);
+        if (verdict == socket_stream_verdict::not_stream) {
+          return base::original(s, name, namelen, args...);
         }
-        return base::original(s, name, namelen, args...);
+        // No answer from the provider: with a proxy configured this connect
+        // must fail like a refused proxy would, not leave direct.
+        if (verdict == socket_stream_verdict::unknown) {
+          if (proxy) {
+            return fail_proxied_connect(s, SOCKET_ERROR);
+          }
+          return base::original(s, name, namelen, args...);
+        }
       }
 
       if (auto v = to_ip_addr(name)) {
 
-        auto log = cfg["log"_f];
-        if (auto *q = load_scope(queue); q && log && log.value()) {
+        if (q && log && log.value()) {
           q->push(create_message<InjecteeMessage, "connect">(
               InjecteeConnect{(std::uint32_t)s, *v, proxy, N}));
         }
@@ -334,10 +347,12 @@ struct hook_WSAConnectByList
       auto cfg = bound->get();
       auto proxy = cfg["addr"_f];
       auto log = cfg["log"_f];
+      auto *q = load_scope(queue);  // once, for the gate and the report site
 
-      // Asked once per call, and only at the first address this site would
-      // route: a list of nothing but loopback, or a process whose config
-      // carries no routing at all, must not pay a syscall per connect.
+      // Asked at most once per call, only at the first address this site would
+      // route, and only while the answer can still move the call: a list of
+      // nothing but loopback, or a process whose config neither routes nor
+      // reports, must not pay a syscall per connect.
       std::optional<socket_stream_verdict> verdict;
       auto ask_type = [&] {
         if (!verdict) {
@@ -350,29 +365,31 @@ struct hook_WSAConnectByList
         LPSOCKADDR name = SocketAddress->Address[i].lpSockaddr;
 
         if (is_inet(name) && !is_localhost(name)) {
-          // Not a stream: straight through -- including past the "a proxy is
-          // set, so refuse" fall-out at the bottom of this block, which is a
-          // TCP decision and none of a datagram socket's business.  Unknown is
-          // the same walk with a proxy attached: the list is refused here,
-          // whole, rather than sent out direct.
-          const auto type = ask_type();
-          if (type == socket_stream_verdict::not_stream) {
-            return original(s, SocketAddress, LocalAddressLength, LocalAddress,
-                            RemoteAddressLength, RemoteAddress, timeout,
-                            Reserved);
-          }
-          if (type == socket_stream_verdict::unknown) {
-            if (proxy) {
-              return fail_proxied_connect(s, FALSE);
+          if (proxy || (q && log && log.value())) {
+            // Not a stream: straight through -- including past the "a proxy is
+            // set, so refuse" fall-out at the bottom of this block, which is a
+            // TCP decision and none of a datagram socket's business.  Unknown
+            // is the same walk with a proxy attached: the list is refused here,
+            // whole, rather than sent out direct.
+            const auto type = ask_type();
+            if (type == socket_stream_verdict::not_stream) {
+              return original(s, SocketAddress, LocalAddressLength,
+                              LocalAddress, RemoteAddressLength, RemoteAddress,
+                              timeout, Reserved);
             }
-            return original(s, SocketAddress, LocalAddressLength, LocalAddress,
-                            RemoteAddressLength, RemoteAddress, timeout,
-                            Reserved);
+            if (type == socket_stream_verdict::unknown) {
+              if (proxy) {
+                return fail_proxied_connect(s, FALSE);
+              }
+              return original(s, SocketAddress, LocalAddressLength,
+                              LocalAddress, RemoteAddressLength, RemoteAddress,
+                              timeout, Reserved);
+            }
           }
 
           if (auto v = to_ip_addr(name)) {
 
-            if (auto *q = load_scope(queue); q && log && log.value()) {
+            if (q && log && log.value()) {
               q->push(
                   create_message<InjecteeMessage, "connect">(InjecteeConnect{
                       (std::uint32_t)s, *v, proxy, "WSAConnectByList"}));
@@ -525,26 +542,33 @@ struct hook_WSAConnectByName : minhook::api<F, hook_WSAConnectByName<F, N>> {
       auto cfg = bound->get();
       auto proxy = cfg["addr"_f];
       auto log = cfg["log"_f];
+      auto *q = load_scope(queue);  // once, for the gate and the report site
 
-      // Not a stream: straight through, refusal included -- the fail-closed
-      // below is about not leaking a TCP connection, and a datagram socket
-      // has no TCP connection to leak.  "No answer" is not that: with a proxy
-      // set, the node this hook cannot classify is refused exactly the way a
-      // node it cannot name is, and only without a proxy does it reach the
-      // original.
-      const auto verdict = socket_stream_type(s);
-      if (verdict == socket_stream_verdict::not_stream) {
-        return base::original(s, nodename, servicename, LocalAddressLength,
-                              LocalAddress, RemoteAddressLength, RemoteAddress,
-                              timeout, Reserved);
-      }
-      if (verdict == socket_stream_verdict::unknown) {
-        if (proxy) {
-          return fail_proxied_connect(s, FALSE);
+      // Paid for only where it can still change the call: with no proxy this
+      // site refuses nothing and routes nothing, so the verdict is left with
+      // only a report to suppress.  "No proxy" never skips the refusal: the
+      // gate asks whenever a proxy exists, whatever logging says.
+      if (proxy || (q && log && log.value())) {
+        // Not a stream: straight through, refusal included -- the fail-closed
+        // below is about not leaking a TCP connection, and a datagram socket
+        // has no TCP connection to leak.  "No answer" is not that: with a
+        // proxy set, the node this hook cannot classify is refused exactly the
+        // way a node it cannot name is, and only without a proxy does it reach
+        // the original.
+        const auto verdict = socket_stream_type(s);
+        if (verdict == socket_stream_verdict::not_stream) {
+          return base::original(s, nodename, servicename, LocalAddressLength,
+                                LocalAddress, RemoteAddressLength,
+                                RemoteAddress, timeout, Reserved);
         }
-        return base::original(s, nodename, servicename, LocalAddressLength,
-                              LocalAddress, RemoteAddressLength, RemoteAddress,
-                              timeout, Reserved);
+        if (verdict == socket_stream_verdict::unknown) {
+          if (proxy) {
+            return fail_proxied_connect(s, FALSE);
+          }
+          return base::original(s, nodename, servicename, LocalAddressLength,
+                                LocalAddress, RemoteAddressLength,
+                                RemoteAddress, timeout, Reserved);
+        }
       }
 
       // Neither pointer may be handed over unchecked: WSAConnectByName
@@ -582,7 +606,7 @@ struct hook_WSAConnectByName : minhook::api<F, hook_WSAConnectByName<F, N>> {
       }
 
       if (addr) {
-        if (auto *q = load_scope(queue); q && log && log.value()) {
+        if (q && log && log.value()) {
           q->push(create_message<InjecteeMessage, "connect">(
               InjecteeConnect{(std::uint32_t)s, addr, proxy, N}));
         }
@@ -722,30 +746,36 @@ struct hook_ConnectEx {
         is_inet(name) && bound && !is_localhost(name)) {
       auto cfg = bound->get();
       auto proxy = cfg["addr"_f];
+      auto log = cfg["log"_f];
+      auto *q = load_scope(queue);  // once, for the gate and the report site
 
-      // Not a stream: straight through.  MSDN restricts ConnectEx to
-      // SOCK_STREAM sockets anyway, so this costs nothing and keeps all four
-      // routing sites saying the same thing first.
-      const auto verdict = socket_stream_type(s);
-      if (verdict == socket_stream_verdict::not_stream) {
-        return original(s, name, namelen, lpSendBuffer, dwSendDataLength,
-                        lpdwBytesSent, lpOverlapped);
-      }
-      // No answer: refused, not overlapped-and-then-silently-direct -- a
-      // ConnectEx that goes out of the capsule unproxied would take the
-      // lpSendBuffer payload with it.
-      if (verdict == socket_stream_verdict::unknown) {
-        if (proxy) {
-          return fail_proxied_connect(s, FALSE);
+      // Same economy as the site above: no proxy and no logging leaves the
+      // verdict nothing to change, so nothing is asked of the provider.  A
+      // proxy alone still asks -- an unanswered question must not be allowed
+      // to become an unproxied ConnectEx carrying lpSendBuffer out.
+      if (proxy || (q && log && log.value())) {
+        // Not a stream: straight through.  MSDN restricts ConnectEx to
+        // SOCK_STREAM sockets anyway, so this costs nothing and keeps all four
+        // routing sites saying the same thing first.
+        const auto verdict = socket_stream_type(s);
+        if (verdict == socket_stream_verdict::not_stream) {
+          return original(s, name, namelen, lpSendBuffer, dwSendDataLength,
+                          lpdwBytesSent, lpOverlapped);
         }
-        return original(s, name, namelen, lpSendBuffer, dwSendDataLength,
-                        lpdwBytesSent, lpOverlapped);
+        // No answer: refused, not overlapped-and-then-silently-direct -- a
+        // ConnectEx that goes out of the capsule unproxied would take the
+        // lpSendBuffer payload with it.
+        if (verdict == socket_stream_verdict::unknown) {
+          if (proxy) {
+            return fail_proxied_connect(s, FALSE);
+          }
+          return original(s, name, namelen, lpSendBuffer, dwSendDataLength,
+                          lpdwBytesSent, lpOverlapped);
+        }
       }
 
       if (auto v = to_ip_addr(name)) {
-
-        auto log = cfg["log"_f];
-        if (auto *q = load_scope(queue); q && log && log.value()) {
+        if (q && log && log.value()) {
           q->push(create_message<InjecteeMessage, "connect">(
               InjecteeConnect{(std::uint32_t)s, *v, proxy, "ConnectEx"}));
         }
