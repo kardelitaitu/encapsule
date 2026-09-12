@@ -89,8 +89,9 @@ auto create_parser() {
       .implicit_value(true);
 
   parser.add_argument("-p", "--set-proxy")
-      .help("set a proxy address for network connections (string, e.g. "
-            "`127.0.0.1:1080`)")
+      .help("set a proxy address for network connections (string, "
+            "`[user[:pass]@]host:port`, e.g. `127.0.0.1:1080`, "
+            "`[2001:db8::1]:1080` or `user:pass@127.0.0.1:1080`)")
       .default_value(string{});
 
   parser.add_argument("-w", "--new-console-window")
@@ -131,6 +132,39 @@ int main(int argc, char *argv[]) {
     return 2;
   }
 
+  // The proxy endpoint is parsed here, before anything is started, for two
+  // reasons.  A malformed `-p` has to be a hard error rather than a silently
+  // unproxied run, and that exit can only be taken while there is no io thread
+  // to wait for: returning once `io_thread` runs would block in its destructor
+  // on an accept loop that never ends.
+  std::optional<proxy_endpoint> proxy;
+  std::optional<ip::address> proxy_addr;
+  if (auto proxy_str = trim_copy(parser.get<string>("-p"));
+      !proxy_str.empty()) {
+    auto fail = [&](const string &why) {
+      cerr << "Invalid proxy address `" + proxy_str + "`: " + why << endl;
+      cerr << parser;
+      return 2;
+    };
+
+    auto endpoint = parse_proxy_url(proxy_str);
+    if (!endpoint) {
+      return fail("expected [user[:pass]@]host:port");
+    }
+
+    // IpAddr carries a numeric address and never a name, so a hostname is
+    // refused here instead of throwing out of the conversion below.
+    asio::error_code ec;
+    auto addr = ip::make_address(endpoint->host, ec);
+    if (ec) {
+      return fail("`" + endpoint->host +
+                  "` is not a numeric IPv4 or IPv6 address");
+    }
+
+    proxy = std::move(endpoint);
+    proxy_addr = addr;
+  }
+
   asio::io_context io_context(1);
   injector_server server;
 
@@ -154,12 +188,21 @@ int main(int argc, char *argv[]) {
     info("subprocess injection enabled");
   }
 
-  if (auto proxy_str = trim_copy(parser.get<string>("-p"));
-      !proxy_str.empty()) {
-    if (auto res = parse_address(proxy_str)) {
-      auto [addr, port] = res.value();
-      server.set_proxy(ip::address::from_string(addr), port);
-      info("proxy address set to {}:{}", addr, port);
+  if (proxy) {
+    server.set_proxy(*proxy_addr, proxy->port);
+    info("proxy address set to {}:{}", proxy->host, proxy->port);
+
+    // Address and credentials are two lines on purpose: the second one is the
+    // only place a credential is ever mentioned, and it names the user and the
+    // length of the secret instead of the secret, which a log would otherwise
+    // copy forever.  The parsed values go to the server exactly as they were
+    // parsed: a field the user left out stays unset rather than becoming an
+    // empty string, because on the wire those two mean different things.
+    if (proxy->username) {
+      info("credentials set (user: {}, password: {} chars)", *proxy->username,
+           proxy->password ? proxy->password->size() : std::size_t(0));
+      server.set_proxy_credentials(std::move(proxy->username),
+                                   std::move(proxy->password));
     }
   }
 

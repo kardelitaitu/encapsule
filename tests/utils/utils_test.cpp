@@ -250,6 +250,153 @@ void port_mapping_name_contract() {
   CHECK_EQ(port_mapping_name.empty(), false);
 }
 
+// ------------------------------------------------------- proxy endpoint --
+
+// parse_proxy_url is pure, so what a case really asserts is which of the four
+// fields the string lands on -- and for a rejected string, that it lands on
+// none of them.  Both helpers name the input on failure: a CHECK inside this
+// file would otherwise point at a shared line and say nothing about which of
+// the thirty endpoint spellings below went wrong.
+
+using opt = std::optional<std::string>;
+
+void check_endpoint(const std::string &url, const std::string &host,
+                    std::uint16_t port, const opt &user = std::nullopt,
+                    const opt &pass = std::nullopt) {
+  const auto ep = parse_proxy_url(url);
+  if (ep && ep->host == host && ep->port == port &&
+      ep->username == user && ep->password == pass) {
+    return;
+  }
+
+  ++test_failures;
+  std::printf("FAIL proxy endpoint \"%s\" -> ", url.c_str());
+  if (!ep) {
+    std::printf("rejected\n");
+    return;
+  }
+  // Both values are echoed here: this is a test binary, not a product log,
+  // and the interesting part of a failure is which separator landed on
+  // which side of which field.
+  const auto shown = [](const opt &v) -> std::string {
+    return v ? *v : std::string("unset");
+  };
+  std::printf("  got %s:%u username=%s password=%s\n", ep->host.c_str(),
+              static_cast<unsigned>(ep->port),
+              shown(ep->username).c_str(), shown(ep->password).c_str());
+}
+
+void check_rejected(const std::string &url) {
+  const auto ep = parse_proxy_url(url);
+  if (!ep) {
+    return;
+  }
+
+  ++test_failures;
+  std::printf("FAIL proxy endpoint \"%s\" accepted as \"%s\":%u\n", url.c_str(),
+              ep->host.c_str(), static_cast<unsigned>(ep->port));
+}
+
+void endpoint_host_and_port() {
+  check_endpoint("127.0.0.1:1080", "127.0.0.1", 1080);
+  check_endpoint("localhost:1", "localhost", 1);
+  check_endpoint("proxy.example.com:8080", "proxy.example.com", 8080);
+  check_endpoint("10.0.0.1:65535", "10.0.0.1", 65535); // widest legal port
+  // the host is syntax here, not an address to validate
+  check_endpoint("0.0.0.0:1", "0.0.0.0", 1);
+}
+
+void endpoint_credentials() {
+  check_endpoint("user:pass@127.0.0.1:1080", "127.0.0.1", 1080, opt("user"),
+                 opt("pass"));
+  check_endpoint("alice:s3cr3t!@socks.host:1", "socks.host", 1,
+                 opt("alice"), opt("s3cr3t!"));
+
+  // A userinfo with no ":" carries a username and no password at all: unset,
+  // never an empty string, because the two encode differently on the wire.
+  check_endpoint("user@host:1080", "host", 1080, opt("user"));
+  check_endpoint("user:@host:1080", "host", 1080, opt("user"));
+
+  // The password keeps every ":" after the first one, and every "@" after the
+  // last one, and it is never un-escaped: those are literal characters.
+  check_endpoint("user:a:b@h:1", "h", 1, opt("user"), opt("a:b"));
+  check_endpoint("p@ss:w@host:1080", "host", 1080, opt("p@ss"), opt("w"));
+  check_endpoint("user:p@ss@host:1080", "host", 1080, opt("user"),
+                 opt("p@ss"));
+  check_endpoint("user:a@b:c@h:1", "h", 1, opt("user"), opt("a@b:c"));
+  check_endpoint("user:%70ass@h:1", "h", 1, opt("user"), opt("%70ass"));
+  check_endpoint("us er:pa ss@h:1", "h", 1, opt("us er"), opt("pa ss"));
+}
+
+void endpoint_ipv6_host() {
+  // The brackets exist because a v6 host is full of ":", so they come off
+  // before any of the host/port reasoning: what is stored is the plain
+  // address, ready for ip::make_address, with the port after the last ":".
+  check_endpoint("[2001:db8::1]:1080", "2001:db8::1", 1080);
+  check_endpoint("[::1]:1", "::1", 1);
+  check_endpoint("[fe80::1]:65535", "fe80::1", 65535);
+  check_endpoint("user:pass@[2001:db8::1]:1080", "2001:db8::1", 1080,
+                 opt("user"), opt("pass"));
+  check_endpoint("user@[::1]:1080", "::1", 1080, opt("user"));
+  check_endpoint(":pw@[fe80::1]:1", "fe80::1", 1); // no user, brackets kept
+
+  check_rejected("[2001:db8::1]");     // brackets, but no port
+  check_rejected("[2001:db8::1]1080"); // port, but no separator
+  check_rejected("[2001:db8::1:1080"); // bracket never closed
+  check_rejected("[::1]:");            // separator, empty port
+  check_rejected("[]:1080");           // nothing inside the brackets
+  check_rejected("[[::1]:1080");       // a bracket inside the host
+  check_rejected("a]b:1080");          // ... or outside it
+}
+
+void endpoint_without_a_username_has_no_credentials() {
+  // Every spelling here has an empty username, and an empty username is nobody
+  // to sign in as: the endpoint stands, the credentials do not.
+  check_endpoint(":pw@h:1080", "h", 1080);
+  check_endpoint("@h:1080", "h", 1080);
+  check_endpoint("@[2001:db8::1]:1080", "2001:db8::1", 1080);
+  check_endpoint("::@h:1", "h", 1); // the first ":" splits, and the user is ""
+}
+
+void endpoint_credential_length_caps() {
+  const std::string ok(255, 'u');
+  const std::string too_long(256, 'u');
+  const std::string pw(255, 'p');
+  const std::string pw_too_long(256, 'p');
+
+  // RFC 1929 sends both lengths in one octet, so 255 is the widest pair there
+  // is and 256 could never be offered to a server.
+  check_endpoint(ok + ":pw@h:1080", "h", 1080, opt(ok), opt("pw"));
+  check_endpoint("user:" + pw + "@h:1080", "h", 1080, opt("user"), opt(pw));
+  check_endpoint(ok + ":" + pw + "@h:1080", "h", 1080, opt(ok), opt(pw));
+  check_rejected(too_long + ":pw@h:1080");
+  check_rejected("user:" + pw_too_long + "@h:1080");
+  check_rejected(too_long + ":" + pw_too_long + "@h:1080");
+  // The cap is checked before the empty-username rule, so a credential too
+  // long to send is a typo to report, not a silent drop to no auth.
+  check_rejected(":" + pw_too_long + "@h:1080");
+}
+
+void endpoint_rejects_garbage() {
+  check_rejected("");
+  check_rejected("host");        // no port at all
+  check_rejected("host:");       // an empty port is no port
+  check_rejected("host:port");   // not numeric
+  check_rejected("host:1080x");  // ... nor partly numeric
+  check_rejected("host:-1");     // ... nor signed
+  check_rejected("host:+80");
+  check_rejected("host: 1080");  // ... nor with room to breathe
+  check_rejected("host:1080 ");
+  check_rejected("host:65536");  // out of range, though it is all digits
+  check_rejected("host:99999999");
+  check_rejected("host:0");      // "no port" in another costume
+  check_rejected(":1080");       // empty host
+  check_rejected("@:1080");      // empty credentials and an empty host
+  check_rejected("user@");       // userinfo, but no host
+  check_rejected("user@host");   // credentials, but no port
+  check_rejected("@");
+}
+
 int main() {
   RUN(wildcard_star);
   RUN(wildcard_question);
@@ -263,5 +410,11 @@ int main() {
   RUN(trim_copy_variants);
   RUN(all_of_digit_cases);
   RUN(port_mapping_name_contract);
+  RUN(endpoint_host_and_port);
+  RUN(endpoint_credentials);
+  RUN(endpoint_ipv6_host);
+  RUN(endpoint_without_a_username_has_no_credentials);
+  RUN(endpoint_credential_length_caps);
+  RUN(endpoint_rejects_garbage);
   return test_failures;
 }

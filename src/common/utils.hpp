@@ -23,6 +23,7 @@
 #include <random>
 #include <regex>
 #include <string>
+#include <string_view>
 
 // trim from start (in place)
 inline void ltrim(std::string &s) {
@@ -156,6 +157,144 @@ inline bool regex_match_filename(const std::string &pattern,
   }
 
   return matched;
+}
+
+// --------------------------------------------------------- proxy endpoint --
+
+// The proxy endpoint every frontend takes, spelled
+//
+//     [user[:pass]@]host:port
+//
+// There is no scheme in it and nothing is percent-decoded: every character is
+// literal, which is exactly what makes a password containing '@' or ':'
+// expressible.  Both separators are therefore resolved structurally instead of
+// by escaping:
+//
+//   * the endpoint splits at the LAST '@', so everything in front of it is the
+//     userinfo and an '@' inside a password stays part of the password;
+//   * the userinfo splits at its FIRST ':', so "user:a:b" is user "user" with
+//     password "a:b";
+//   * a password with nothing in it -- no ':' in the userinfo at all, or a ':'
+//     with nothing after it -- leaves the password UNSET rather than handing
+//     back an empty string.  The two are not interchangeable further down:
+//     schema.hpp adds no bytes for an unset field and a length-only field for
+//     an empty one, so an empty password means "sign in with this username
+//     only", exactly as the GUI's empty password box already means.
+//   * an EMPTY username means no credentials at all, so "@host:1080" and
+//     ":pass@host:1080" come back with neither field set: a password with
+//     nobody to sign in as is not a credential.
+//
+// A bare IPv6 host cannot be told apart from a port, so it has to arrive
+// bracketed the way every other tool spells it, "[2001:db8::1]:1080"; the
+// brackets are stripped here, before any ':' logic runs, so a caller never
+// sees them and the address keeps its plain, storable form.
+//
+// Refused, i.e. nullopt: an empty host, or one carrying a stray bracket; a
+// missing, empty, non-numeric or out-of-range port (0 included -- it is "no
+// port", not a port); an unterminated '['; and a username or password longer
+// than RFC 1929 can carry, which could never be sent no matter what a server
+// were willing to accept.
+struct proxy_endpoint {
+  std::string host;
+  std::uint16_t port = 0;
+  std::optional<std::string> username;
+  std::optional<std::string> password;
+};
+
+// Both credential lengths travel in a single octet, so a longer string could
+// never reach a server no matter which frontend accepted it.
+inline constexpr std::size_t proxy_credential_max_length = 255;
+
+// The widest port is "65535".
+inline constexpr std::size_t proxy_port_max_length = 5;
+
+inline std::optional<proxy_endpoint> parse_proxy_url(std::string_view url) {
+  std::string_view userinfo, authority;
+  if (const auto at = url.rfind('@'); at != std::string_view::npos) {
+    userinfo = url.substr(0, at);
+    authority = url.substr(at + 1);
+  } else {
+    authority = url;
+  }
+
+  std::string_view host, port_text;
+  if (!authority.empty() && authority.front() == '[') {
+    const auto close = authority.find(']');
+    if (close == std::string_view::npos) {
+      return std::nullopt;
+    }
+    host = authority.substr(1, close - 1);
+    const auto tail = authority.substr(close + 1);
+    if (tail.empty() || tail.front() != ':') {
+      return std::nullopt; // whatever follows ']' has to be ":port"
+    }
+    port_text = tail.substr(1);
+  } else {
+    const auto colon = authority.rfind(':');
+    if (colon == std::string_view::npos) {
+      return std::nullopt; // no separator means no port
+    }
+    host = authority.substr(0, colon);
+    port_text = authority.substr(colon + 1);
+  }
+
+  if (host.empty()) {
+    return std::nullopt;
+  }
+  // Brackets belong to the IPv6 form above and to nothing else, so a stray
+  // one -- "[[::1]:1080", "a]b:1" -- is refused here instead of becoming part
+  // of a host nobody can resolve.
+  if (host.find_first_of("[]") != std::string_view::npos) {
+    return std::nullopt;
+  }
+
+  // Accumulated digit by digit rather than handed to std::stoul: the port is
+  // digits or nothing (no sign, no space, no trailing garbage), and the value
+  // has to be bounded without throwing on the garbage refused here.
+  if (port_text.empty() || port_text.size() > proxy_port_max_length) {
+    return std::nullopt;
+  }
+  std::uint32_t port = 0;
+  for (const char digit : port_text) {
+    if (digit < '0' || digit > '9') {
+      return std::nullopt;
+    }
+    port = port * 10 + static_cast<std::uint32_t>(digit - '0');
+  }
+  if (port == 0 || port > 65535) {
+    return std::nullopt; // port 0 is not an endpoint, it is "no port"
+  }
+
+  proxy_endpoint endpoint;
+  endpoint.host = std::string(host);
+  endpoint.port = static_cast<std::uint16_t>(port);
+
+  if (userinfo.empty()) {
+    return endpoint;
+  }
+
+  const auto colon = userinfo.find(':');
+  const auto name = userinfo.substr(0, colon);
+  const auto password = colon == std::string_view::npos
+                            ? std::string_view{}
+                            : userinfo.substr(colon + 1);
+
+  // The caps are checked before the empty-username rule, so a credential too
+  // long to put on the wire is a typo to report rather than a silent
+  // downgrade to an unauthenticated connection.
+  if (name.size() > proxy_credential_max_length ||
+      password.size() > proxy_credential_max_length) {
+    return std::nullopt;
+  }
+
+  if (!name.empty()) {
+    endpoint.username = std::string(name);
+    if (!password.empty()) {
+      endpoint.password = std::string(password);
+    }
+  }
+
+  return endpoint;
 }
 
 inline const std::wstring port_mapping_name = L"ENCAPSULE_PORT_IPC_";

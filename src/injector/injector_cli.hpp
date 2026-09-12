@@ -49,17 +49,10 @@ struct injectee_session_cli : injectee_session {
   }
 };
 
-std::optional<std::pair<std::string, uint16_t>>
-parse_address(const std::string &addr) {
-  auto delimiter = addr.find_last_of(':');
-  if (delimiter == std::string::npos) {
-    return std::nullopt;
-  }
-
-  auto host = addr.substr(0, delimiter);
-  uint16_t port = std::stoul(addr.substr(delimiter + 1));
-
-  return make_pair(host, port);
-}
+// The endpoint string itself is parsed in <utils.hpp> (parse_proxy_url), which
+// both frontends share and which understands [user[:pass]@] and bracketed
+// IPv6 hosts.  It replaces the find_last_of(':') helper that used to live
+// here: that one turned "[2001:db8::1]:1080" into the host "[2001:db8::1]" --
+// brackets included, so un-parseable -- and threw on a non-numeric port.
 
 #endif

@@ -22,6 +22,8 @@
 #include <asio.hpp>
 #include <cstdio>
 #include <map>
+#include <mutex>
+#include <optional>
 
 using tcp = asio::ip::tcp;
 
@@ -80,6 +82,40 @@ struct injector_server {
   }
 
   void clear_proxy() { config_proxy(std::nullopt); }
+
+  // The credentials of P5, kept in the same config the proxy address lives
+  // in, and set the same way: take the lock, write the field, push the result
+  // to every session already connected.  Both arguments are optional and
+  // separate because the wire says so (schema.hpp): a field that is not set
+  // adds no bytes at all, which is what "no authentication offered" means, so
+  // a value that is not present is left exactly as it was -- encoding an empty
+  // std::string instead would emit a length-only field, a different request on
+  // the wire that no user asked for.  Dropping a credential that is already
+  // there is what clear_proxy_credentials() is for.
+  void set_proxy_credentials(std::optional<std::string> username,
+                             std::optional<std::string> password) {
+    std::lock_guard guard(config_mutex);
+
+    if (username) {
+      config_["username"_f] = std::move(*username);
+    }
+    if (password) {
+      config_["password"_f] = std::move(*password);
+    }
+
+    broadcast_config();
+  }
+
+  // Back to "nothing offered": both fields are erased, not emptied, so the
+  // config encodes byte-for-byte what a credential-free injector always did.
+  void clear_proxy_credentials() {
+    std::lock_guard guard(config_mutex);
+
+    config_["username"_f] = std::nullopt;
+    config_["password"_f] = std::nullopt;
+
+    broadcast_config();
+  }
 
   void enable_log(bool enable = true) {
     std::lock_guard guard(config_mutex);
