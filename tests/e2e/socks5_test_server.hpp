@@ -16,7 +16,7 @@
 #ifndef ENCAPSULE_E2E_SOCKS5_TEST_SERVER
 #define ENCAPSULE_E2E_SOCKS5_TEST_SERVER
 
-// A header-only, no-auth socks5 CONNECT relay for the end-to-end smoke test.
+// A header-only socks5 CONNECT relay for the end-to-end smoke test.
 //
 // It speaks exactly the client half of src/injectee/socks5.hpp: greeting
 // {5, nmethods, ...} -> {5, 0}; request {5, 1, 0, atyp, addr, port} -> the
@@ -27,12 +27,25 @@
 // proxy for.  An optional on_connect hook decides the reply code, which lets a
 // test prove the failure path too.
 //
+// Authentication is OFF by default, which keeps the whole no-auth walk above
+// byte-for-byte what it was.  require_auth(true) turns on RFC 1929: a client
+// that offered method 2 gets {5, 2}, then its {1, ULEN, USER, PLEN, PASS}
+// subnegotiation is parsed and judged by the auth hook, and it gets {1, 0} or
+// {1, 0xFF} -- a refusal closes the session right there, and a client that
+// offered nothing to auth with gets {5, 0xFF}.  Every greeting is recorded,
+// accepted or not, in offered order.
+//
+// CREDENTIALS NEVER GET LOGGED.  Nothing in here prints a username or a
+// password; traces name lengths and verdicts only.
+//
 // THREADING: one worker thread, one session at a time, all I/O polled with a
 // bounded idle timeout so ~socks5_test_server() never hangs.  That is plenty
 // for a decoy that opens one connection, exchanges a sentinel and closes.
 //
-// NOTE: <socks5.hpp> has NO include guard and defines functions, so this
-// header must be included by exactly one translation unit (e2e_test.cpp).
+// NOTE: <socks5.hpp> is guarded (since 410a54e) but still DEFINES socket
+// functions at namespace scope without inline, so this header belongs to
+// exactly one translation unit (e2e_test.cpp).  Its pure byte builders are
+// inline, so this relay and the tests can share one spelling of the wire.
 
 #include <algorithm>
 #include <atomic>
@@ -62,6 +75,32 @@ struct socks5_request_record {
   std::uint16_t port = 0; // host byte order
 };
 
+// One session's authentication attempt, newest last.  Public so tests can
+// assert on it; never print username or password from in here -- in the
+// general case they are live credentials, and this relay is reused by tests
+// that run against the real product.
+struct socks5_auth_record {
+  std::vector<std::uint8_t> offered;  // METHODS from the greeting, in order
+  bool chose_auth = false;            // the relay answered {5, 2}
+  bool parsed = false;                // a complete 1929 request was read
+  bool ok = false;                    // the hook's verdict (refuse if no hook)
+  std::string username;
+  std::string password;
+};
+
+inline std::string method_list_text(const std::vector<std::uint8_t> &methods) {
+  static const char *digits = "0123456789abcdef";
+  std::string out;
+  for (const std::uint8_t m : methods) {
+    if (!out.empty()) {
+      out += ' ';
+    }
+    out += digits[m >> 4];
+    out += digits[m & 0xF];
+  }
+  return out;
+}
+
 inline std::string atyp_name(char atyp) {
   switch (atyp) {
   case SOCKS_IPV4:
@@ -79,6 +118,9 @@ class socks5_test_server {
 public:
   using request = socks5_request_record;
   using hook_type = std::function<char(const request &)>;
+  // Judges one RFC 1929 attempt: true -> {1, 00}, false -> {1, FF}.
+  using auth_hook_type =
+      std::function<bool(const std::string &, const std::string &)>;
 
   // port 0 -> let the OS pick, so parallel runs never collide.
   explicit socks5_test_server(std::uint16_t port = 0,
@@ -129,12 +171,42 @@ public:
     return records_.size();
   }
 
+  std::size_t auth_count() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return auth_records_.size();
+  }
+
   // Decide the reply for each CONNECT; return SOCKS_SUCCESS to let the
   // echo-loop start, anything else to refuse the request.  Set it before
   // spawning the client; the hook must not outlive the server.
   void set_on_connect(hook_type hook) {
     std::lock_guard<std::mutex> guard(mutex_);
     on_connect_ = std::move(hook);
+  }
+
+  // Demand (or stop demanding) RFC 1929 credentials.  Default false, which
+  // leaves the no-auth walk byte-for-byte alone.  Set it before the client.
+  void require_auth(bool required) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    auth_required_ = required;
+  }
+
+  bool auth_required() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return auth_required_;
+  }
+
+  // Set the judge.  Deliberately NO accept-all default: a relay that demands
+  // auth with no hook installed refuses every login.
+  void set_auth_hook(auth_hook_type hook) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    auth_hook_ = std::move(hook);
+  }
+
+  // Copies of every greeting seen so far (accepted or not), newest last.
+  std::vector<socks5_auth_record> auth_records() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return auth_records_;
   }
 
   std::size_t echoed_round_trips() const { return echoed_round_trips_.load(); }
@@ -147,6 +219,20 @@ public:
       std::chrono::milliseconds step = std::chrono::milliseconds(50)) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (request_count() < n) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return false;
+      }
+      std::this_thread::sleep_for(step);
+    }
+    return true;
+  }
+
+  // Same polling contract, for greetings and authentication attempts.
+  bool wait_for_auth_count(
+      std::size_t n, std::chrono::milliseconds timeout,
+      std::chrono::milliseconds step = std::chrono::milliseconds(50)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (auth_count() < n) {
       if (std::chrono::steady_clock::now() >= deadline) {
         return false;
       }
@@ -192,9 +278,79 @@ private:
     if (!read_exact(sock, methods.data(), methods.size(), kHandshakeIdleMs)) {
       return;
     }
-    const char chosen[2] = {SOCKS_VERSION, SOCKS_NO_AUTHENTICATION};
-    if (!write_all(sock, chosen, sizeof(chosen))) {
+    // What the client offered, recorded for every session -- whatever the
+    // relay decides next.  This is the one question P5 asks the wire.
+    socks5_auth_record auth_rec;
+    auth_rec.offered.assign(methods.begin(), methods.end());
+    const bool offered_auth =
+        std::find(methods.begin(), methods.end(), SOCKS_USERNAME_PASSWORD) !=
+        methods.end();
+
+    bool required = false;
+    auth_hook_type auth_hook;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      required = auth_required_;
+      auth_hook = auth_hook_;
+    }
+
+    if (!required) {
+      // Auth not demanded: byte-for-byte the reply this relay has always
+      // given, even against a client that offered method 2.  A proxy with
+      // authentication disabled really does answer {5, 00}.
+      const char chosen[2] = {SOCKS_VERSION, SOCKS_NO_AUTHENTICATION};
+      if (!write_all(sock, chosen, sizeof(chosen))) {
+        return;
+      }
+      record_auth(auth_rec);
+      if (offered_auth) {
+        std::printf("  [relay] offered [%s], auth not required -> 05 00\n",
+                    method_list_text(auth_rec.offered).c_str());
+      }
+    } else if (!offered_auth) {
+      // Demanded, and the client had nothing to offer.  RFC 1928: {5, FF},
+      // "no acceptable methods" -- and the session ends before any login.
+      const char refused[2] = {SOCKS_VERSION, static_cast<char>(0xFF)};
+      write_all(sock, refused, sizeof(refused));
+      record_auth(auth_rec);
+      std::printf("  [relay] auth demanded, offered [%s] -> 05 ff\n",
+                  method_list_text(auth_rec.offered).c_str());
       return;
+    } else {
+      const char chosen[2] = {SOCKS_VERSION, SOCKS_USERNAME_PASSWORD};
+      auth_rec.chose_auth = true;
+      if (!write_all(sock, chosen, sizeof(chosen))) {
+        record_auth(auth_rec);
+        return;
+      }
+      // A malformed 1929 request is a refusal, not a crash: answer {1, FF}
+      // with whatever was parsed and close the session.
+      if (!read_auth(sock, auth_rec)) {
+        const char refused[2] = {static_cast<char>(SOCKS_AUTH_VERSION),
+                                 static_cast<char>(SOCKS_AUTH_FAILURE)};
+        write_all(sock, refused, sizeof(refused));
+        record_auth(auth_rec);
+        std::printf("  [relay] malformed 1929 request -> 01 ff\n");
+        return;
+      }
+      auth_rec.ok =
+          auth_hook ? auth_hook(auth_rec.username, auth_rec.password) : false;
+      const char verdict[2] = {
+          static_cast<char>(SOCKS_AUTH_VERSION),
+          auth_rec.ok ? static_cast<char>(SOCKS_SUCCESS)
+                      : static_cast<char>(SOCKS_AUTH_FAILURE)};
+      record_auth(auth_rec);
+      std::printf("  [relay] %s [%s] user=%zu pass=%zu -> 01 %02x\n",
+                  auth_rec.ok ? "accepted" : "refused",
+                  method_list_text(auth_rec.offered).c_str(),
+                  auth_rec.username.size(), auth_rec.password.size(),
+                  static_cast<unsigned char>(verdict[1]));
+      if (!write_all(sock, verdict, sizeof(verdict))) {
+        return;
+      }
+      if (!auth_rec.ok) {
+        return;  // a refused login closes the session: no CONNECT follows
+      }
     }
 
     char head[4] = {};
@@ -331,9 +487,45 @@ private:
     return !ec && written == n;
   }
 
+  // Reads one client subnegotiation {VER=1, ULEN, USER, PLEN, PASS}.  False on
+  // a short read or a wrong VER; whatever was parsed stays in the record,
+  // because "what did it send" is exactly what a test wants to know.
+  bool read_auth(ip::tcp::socket &sock, socks5_auth_record &rec) {
+    char head[2] = {};
+    if (!read_exact(sock, head, 2, kHandshakeIdleMs)) {
+      return false;
+    }
+    if (static_cast<std::uint8_t>(head[0]) != SOCKS_AUTH_VERSION) {
+      return false;
+    }
+    const std::size_t ulen = static_cast<std::uint8_t>(head[1]);
+    rec.username.resize(ulen);
+    if (ulen > 0 &&
+        !read_exact(sock, &rec.username[0], ulen, kHandshakeIdleMs)) {
+      return false;
+    }
+    char plen_byte = 0;
+    if (!read_exact(sock, &plen_byte, 1, kHandshakeIdleMs)) {
+      return false;
+    }
+    const std::size_t plen = static_cast<std::uint8_t>(plen_byte);
+    rec.password.resize(plen);
+    if (plen > 0 &&
+        !read_exact(sock, &rec.password[0], plen, kHandshakeIdleMs)) {
+      return false;
+    }
+    rec.parsed = true;
+    return true;
+  }
+
   void record(const request &rec) {
     std::lock_guard<std::mutex> guard(mutex_);
     records_.push_back(rec);
+  }
+
+  void record_auth(const socks5_auth_record &rec) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    auth_records_.push_back(rec);
   }
 
   static std::string ipv4_text(const char *raw) {
@@ -370,6 +562,9 @@ private:
   mutable std::mutex mutex_;
   std::vector<request> records_;
   hook_type on_connect_;
+  std::vector<socks5_auth_record> auth_records_;
+  bool auth_required_ = false;  // off => the pre-P5 no-auth relay, unchanged
+  auth_hook_type auth_hook_;    // empty + required => refuse everything
   std::atomic<std::size_t> echoed_round_trips_{0};
   std::atomic<std::size_t> echoed_bytes_{0};
 };

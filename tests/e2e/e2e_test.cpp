@@ -309,9 +309,261 @@ void on_connect_hook_can_refuse() {
   std::printf("  refused %zu CONNECT(s), echoed nothing\n", hook_calls.load());
 }
 
+// ------------------------------------------------- in-process handshakes ---
+//
+// These drive the INJECTEE'S OWN client half -- src/injectee/socks5.hpp's
+// socks5_handshake(SOCKET, creds) and socks5_request -- over a real AF_INET
+// loopback pair against the relay above, so the P5 negotiation is proven
+// against a live peer rather than a hand-computed buffer.  No injection, no
+// child process: this is what --selfcheck is for.  Raw winsock on the client
+// side because those functions take a SOCKET; asio boots itself on the relay
+// side.  One relay per case, because it serves one session at a time.
+
+std::string hex_dump(const void *data, std::size_t n) {
+  static const char *digits = "0123456789abcdef";
+  const auto *bytes = static_cast<const std::uint8_t *>(data);
+  std::string out;
+  for (std::size_t i = 0; i < n; ++i) {
+    if (i != 0) {
+      out += ' ';
+    }
+    out += digits[bytes[i] >> 4];
+    out += digits[bytes[i] & 0xF];
+  }
+  return out;
+}
+
+SOCKET loopback_connect(const std::string &addr, std::uint16_t port) {
+  static const bool wsa_started = [] {
+    WSADATA data{};
+    return WSAStartup(MAKEWORD(2, 2), &data) == 0;
+  }();
+  CHECK(wsa_started);
+
+  const SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (s == INVALID_SOCKET) {
+    return INVALID_SOCKET;
+  }
+  sockaddr_in sa{};
+  sa.sin_family = AF_INET;
+  sa.sin_port = htons(port);
+  sa.sin_addr.s_addr = inet_addr(addr.c_str());
+  if (sa.sin_addr.s_addr == INADDR_NONE ||
+      ::connect(s, reinterpret_cast<const sockaddr *>(&sa), sizeof(sa)) ==
+          SOCKET_ERROR) {
+    closesocket(s);
+    return INVALID_SOCKET;
+  }
+  return s;
+}
+
+// What the client is about to put on the wire.  The greeting is the real
+// bytes, from the same builder socks5_handshake() calls; the login is named by
+// its shape only -- credentials do not belong in a log, not even fake ones.
+void log_client_offer(const char *label, const socks5_credentials &creds) {
+  uint8_t methods[2] = {};
+  std::size_t n = 0;
+  if (creds.enabled()) {
+    methods[n++] = SOCKS_USERNAME_PASSWORD;
+    methods[n++] = SOCKS_NO_AUTHENTICATION;
+  } else {
+    methods[n++] = SOCKS_NO_AUTHENTICATION;
+  }
+  char greet[SOCKS_GREETING_MAX_SIZE] = {};
+  const std::size_t gn = socks5_build_greeting(methods, n, greet);
+  std::printf("  [%s] client offers %s", label, hex_dump(greet, gn).c_str());
+  if (creds.enabled()) {
+    std::printf(", then auth 01 u%zu p%zu", creds.username.size(),
+                creds.password.size());
+  }
+  std::printf("\n");
+}
+
+// Runs the client half through the whole walk: greet, (negotiate), CONNECT,
+// then one echoed sentinel.  Returns false if any step failed.
+bool tunnel_round_trip(SOCKET s, const socks5_credentials &creds,
+                       const std::string &probe) {
+  if (!socks5_handshake(s, creds)) {
+    std::printf("  handshake refused\n");
+    return false;
+  }
+  sockaddr_in dst{};
+  dst.sin_family = AF_INET;
+  dst.sin_port = htons(8080);
+  dst.sin_addr.s_addr = inet_addr("203.0.113.7");  // TEST-NET-3, never real
+  if (socks5_request(s, reinterpret_cast<const sockaddr *>(&dst)) !=
+      SOCKS_SUCCESS) {
+    std::printf("  CONNECT refused\n");
+    return false;
+  }
+  if (send(s, probe.data(), static_cast<int>(probe.size()), 0) !=
+      static_cast<int>(probe.size())) {
+    return false;
+  }
+  std::vector<char> back(probe.size(), '\0');
+  const int got = recv(s, back.data(), static_cast<int>(back.size()), 0);
+  if (got != static_cast<int>(probe.size())) {
+    return false;
+  }
+  return std::equal(probe.begin(), probe.end(), back.begin());
+}
+
+// The relay demanded RFC 1929 and the client knew the login.
+void handshake_accepts_correct_credentials() {
+  e2e::socks5_test_server server;
+  server.require_auth(true);
+  server.set_auth_hook([](const std::string &user, const std::string &pass) {
+    return user == "alice" && pass == "s3cr3t!";
+  });
+
+  const socks5_credentials creds{"alice", "s3cr3t!"};
+  log_client_offer("accept", creds);
+
+  const SOCKET s = loopback_connect(server.address(), server.port());
+  CHECK(s != INVALID_SOCKET);
+  if (s == INVALID_SOCKET) {
+    return;
+  }
+  const std::string probe = "E2E-AUTH-PING";
+  CHECK(tunnel_round_trip(s, creds, probe));
+  closesocket(s);
+
+  CHECK(server.wait_for_auth_count(1, std::chrono::milliseconds(5000)));
+  const auto auth = server.auth_records();
+  CHECK_EQ(auth.size(), std::size_t(1));
+  if (auth.empty()) {
+    return;
+  }
+  const auto &rec = auth[0];
+  // Both methods offered, method 2 first (the order socks5_handshake uses)...
+  const std::vector<std::uint8_t> offered{SOCKS_USERNAME_PASSWORD,
+                                          SOCKS_NO_AUTHENTICATION};
+  CHECK(rec.offered == offered);
+  // ...the relay chose it, parsed the login, and the bytes were the real ones.
+  CHECK(rec.chose_auth);
+  CHECK(rec.parsed);
+  CHECK(rec.ok);
+  CHECK_EQ(rec.username, std::string("alice"));
+  CHECK_EQ(rec.password, std::string("s3cr3t!"));
+  // The CONNECT and the echo happened AFTER the login, not before.
+  CHECK_EQ(server.request_count(), std::size_t(1));
+  CHECK(server.echoed_round_trips() >= 1);
+}
+
+// Right username, wrong password: the client must be refused, and refused
+// BEFORE it gets to ask for a CONNECT.
+void handshake_refuses_wrong_password() {
+  e2e::socks5_test_server server;
+  server.require_auth(true);
+  server.set_auth_hook([](const std::string &user, const std::string &pass) {
+    return user == "alice" && pass == "s3cr3t!";
+  });
+
+  const socks5_credentials creds{"alice", "s3cr3t?"};
+  log_client_offer("refuse", creds);
+
+  const SOCKET s = loopback_connect(server.address(), server.port());
+  CHECK(s != INVALID_SOCKET);
+  if (s == INVALID_SOCKET) {
+    return;
+  }
+  CHECK(!socks5_handshake(s, creds));  // relay answered {01, ff}
+  closesocket(s);
+
+  CHECK(server.wait_for_auth_count(1, std::chrono::milliseconds(5000)));
+  const auto auth = server.auth_records();
+  CHECK_EQ(auth.size(), std::size_t(1));
+  if (auth.empty()) {
+    return;
+  }
+  const auto &rec = auth[0];
+  CHECK(rec.chose_auth);
+  CHECK(rec.parsed);
+  CHECK(!rec.ok);
+  CHECK_EQ(rec.username, std::string("alice"));
+  CHECK_EQ(rec.password, std::string("s3cr3t?"));  // what was SENT, not what
+                                                   // was wanted
+  CHECK_EQ(server.request_count(), std::size_t(0));  // refusal closed it
+  CHECK_EQ(server.echoed_round_trips(), std::size_t(0));
+}
+
+// A client with no credentials against a proxy that demands them gets
+// "no acceptable methods" -- encapsule never drops the connection through
+// unauthenticated instead.
+void handshake_without_credentials_is_refused() {
+  e2e::socks5_test_server server;
+  server.require_auth(true);  // deliberately no auth hook: refuse by default
+
+  const socks5_credentials creds;
+  log_client_offer("no-creds", creds);
+
+  const SOCKET s = loopback_connect(server.address(), server.port());
+  CHECK(s != INVALID_SOCKET);
+  if (s == INVALID_SOCKET) {
+    return;
+  }
+  CHECK(!socks5_handshake(s, creds));  // relay answered {05, ff}
+  closesocket(s);
+
+  CHECK(server.wait_for_auth_count(1, std::chrono::milliseconds(5000)));
+  const auto auth = server.auth_records();
+  CHECK_EQ(auth.size(), std::size_t(1));
+  if (auth.empty()) {
+    return;
+  }
+  const auto &rec = auth[0];
+  const std::vector<std::uint8_t> offered{SOCKS_NO_AUTHENTICATION};
+  CHECK(rec.offered == offered);
+  CHECK(!rec.chose_auth);   // there was nothing to negotiate with
+  CHECK(!rec.parsed);       // no login was ever sent
+  CHECK(!rec.ok);
+  CHECK_EQ(server.request_count(), std::size_t(0));
+}
+
+// And the compatibility case the relay has to keep answering exactly as it
+// always did: method 2 offered, auth NOT required -> {05, 00}, then the normal
+// no-auth walk.  This is the inject_connect path with credentials available.
+void relay_picks_no_auth_when_auth_is_not_required() {
+  e2e::socks5_test_server server;
+  CHECK(!server.auth_required());
+
+  const socks5_credentials creds{"alice", "s3cr3t!"};
+  log_client_offer("not-required", creds);
+
+  const SOCKET s = loopback_connect(server.address(), server.port());
+  CHECK(s != INVALID_SOCKET);
+  if (s == INVALID_SOCKET) {
+    return;
+  }
+  const std::string probe = "E2E-NOAUTH-PING";
+  CHECK(tunnel_round_trip(s, creds, probe));
+  closesocket(s);
+
+  CHECK(server.wait_for_auth_count(1, std::chrono::milliseconds(5000)));
+  const auto auth = server.auth_records();
+  CHECK_EQ(auth.size(), std::size_t(1));
+  if (auth.empty()) {
+    return;
+  }
+  const auto &rec = auth[0];
+  const std::vector<std::uint8_t> offered{SOCKS_USERNAME_PASSWORD,
+                                          SOCKS_NO_AUTHENTICATION};
+  CHECK(rec.offered == offered);
+  CHECK(!rec.chose_auth);
+  CHECK(!rec.parsed);
+  CHECK(rec.username.empty() && rec.password.empty());
+  CHECK_EQ(server.request_count(), std::size_t(1));
+  CHECK(server.echoed_round_trips() >= 1);
+}
+
 void run_selfcheck() {
   RUN(relay_records_connect_and_echoes);
   RUN(on_connect_hook_can_refuse);
+  // The P5 negotiation, client half against relay half, in this process.
+  RUN(handshake_accepts_correct_credentials);
+  RUN(handshake_refuses_wrong_password);
+  RUN(handshake_without_credentials_is_refused);
+  RUN(relay_picks_no_auth_when_auth_is_not_required);
 }
 
 // ------------------------------------------------------------------ inject --
