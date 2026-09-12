@@ -218,16 +218,18 @@ The CLI takes the endpoint as an argument, so the whole
 `[user[:pass]@]host:port` string — password included — sits in the process
 command line, where any same-user process and any process-audit provider
 (Sysmon EID 1 logs it verbatim) can read it; the GUI's separate
-username/password boxes keep it out of argv. encapsule's own rejection path
-is redacted — a `-p` it cannot parse names only the authority after the last
-`@`, never the userinfo. That is NOT the whole error surface: the argument
-parser throws `Unknown argument: <token>` for anything it does not recognise
-and the CLI prints that message verbatim, so a mistyped
-`-palice:hunter2@1.2.3.4:1080`, a `-p=...` form, or a bare
-`--alice:hunter2@1.2.3.4:1080` echoes the secret to stderr exactly the way
-argv does — and any console capture, terminal log or CI transcript inherits
-it. Until that parser message is scrubbed, treat a credential typed onto the
-command line as already exposed.
+username/password boxes keep it out of argv. That argv window is the only
+credential exposure left open: every error path encapsule itself prints is
+redacted. A `-p` it cannot parse names only the authority after the last `@`,
+never the userinfo, and the argument parser's `Unknown argument: <token>`
+echo — thrown for anything it does not recognise — goes through
+`sanitize_parse_error` (`src/injector/injector_cli.cpp`) before it reaches
+stderr, so a mistyped `-palice:hunter2@1.2.3.4:1080`, a `-p=...` form or a
+bare `--alice:hunter2@1.2.3.4:1080` prints `1.2.3.4:1080`; a token holding
+nothing but a secret, with no authority to name, is dropped and reported as
+`Invalid argument (value redacted)`. The practical rule is unchanged: treat a
+credential typed onto the command line as visible to whatever can read argv —
+but no longer as something the tool will echo back at you.
 
 The other detail is whitespace. Nothing unescapes or percent-decodes either
 credential: `parse_proxy_url` (`src/common/utils.hpp:162-298`) treats every

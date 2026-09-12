@@ -190,10 +190,14 @@ Re-index: `mcp cbm index_repository(repo_path="C:\dev\encapsule", mode="moderate
   accepted). The CLI logs the user name plus the password *length* and nothing more; the GUI's
   password box is **not masked** (elements has no password box) and holds credentials in memory
   only.
-- Two credential exposures stay OPEN and are documented in `docs/BUILDING.md`: the endpoint is argv on
-  the CLI (readable by same-user processes and by Sysmon EID 1), and argparse's
-  `"Unknown argument: " + token` message is printed verbatim by the CLI's catch-all, so a mistyped
-  `-p…`/`-p=…`/`--user:pass@…` leaks the secret past the project's authority-only redaction.
+- One credential exposure stays OPEN and is documented in `docs/BUILDING.md`: the CLI's endpoint is
+  an argument, so a `-p user:pass@host:port` sits in argv where same-user processes and Sysmon EID 1
+  can read it (the GUI's separate boxes keep it out of argv). The error paths are closed: a rejected `-p`
+  names only the authority after the last `@`, and argparse's `"Unknown argument: " + token` echo is
+  run through `sanitize_parse_error`/`scrub_token` in `injector_cli.cpp` (no line cites, in flight),
+  which drops everything up to and including that last `@` — so a mistyped
+  `-palice:pw@1.2.3.4:1080` prints `1.2.3.4:1080`, and a proxy-flag token holding nothing but the
+  secret is dropped whole (`"Invalid argument (value redacted)"`).
 - Two architectures in play: x64 injectee for 64-bit targets, Win32 `encapsule-injectee32.dll` +
   `wow64-address-dumper` for 32-bit targets under WoW64.
 
