@@ -178,7 +178,7 @@ struct hook_connect_fn : minhook::api<F, hook_connect_fn<F, N>> {
             if (ret)
               return ret;
 
-            if (!socks5_handshake(s)) {
+            if (!socks5_handshake(s, socks5_credentials_from(cfg))) {
               return fail_proxied_connect(s, SOCKET_ERROR);
             }
             if (socks5_request(s, name) != SOCKS_SUCCESS) {
@@ -230,7 +230,7 @@ struct hook_WSAConnectByList
                 if (ret)
                   return ret;
 
-                if (!socks5_handshake(s)) {
+                if (!socks5_handshake(s, socks5_credentials_from(cfg))) {
                   fail_proxied_connect(s, FALSE);
                   continue;
                 }
@@ -330,7 +330,7 @@ struct hook_WSAConnectByName : minhook::api<F, hook_WSAConnectByName<F, N>> {
             if (ret)
               return ret;
 
-            if (!socks5_handshake(s)) {
+            if (!socks5_handshake(s, socks5_credentials_from(cfg))) {
               return fail_proxied_connect(s, FALSE);
             }
             if (socks5_request(s, *addr) != SOCKS_SUCCESS) {
@@ -469,7 +469,7 @@ struct hook_ConnectEx {
             if (ret)
               return ret;
 
-            if (!socks5_handshake(s)) {
+            if (!socks5_handshake(s, socks5_credentials_from(cfg))) {
               return fail_proxied_connect(s, FALSE);
             }
             if (socks5_request(s, name) != SOCKS_SUCCESS) {

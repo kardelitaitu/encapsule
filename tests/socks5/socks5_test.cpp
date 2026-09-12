@@ -84,6 +84,10 @@ void check_bytes(const char *expr, const char *file, int line, const char *buf,
 #define CHECK_BYTES(buf, n, want) \
   check_bytes(#buf, __FILE__, __LINE__, (buf), (size_t)(n), (want))
 
+// Same, for a uint8_t buffer (the auth builder deals in uint8_t*).
+#define CHECK_BYTES_U8(buf, n, want) \
+  CHECK_BYTES((const char *)(buf), n, want)
+
 // 203.0.113.7 (TEST-NET-3) and 2001:db8::1 (documentation range) -- the two
 // addresses pinned by the expectations below.
 constexpr std::uint32_t k203_0_113_7_host_order = 0xCB007107u;
@@ -115,9 +119,14 @@ const sockaddr *as_sockaddr(const sockaddr_in6 *sa) {
   return (const sockaddr *)sa;
 }
 
-// The four vectors this suite exists to pin.
+// The vectors this suite exists to pin.
 const bytes kGreetingNoAuth{0x05, 0x01, 0x00};
-const bytes kGreetingNoAuthUserpass{0x05, 0x02, 0x00, 0x02};
+// Credentials in play: RFC 1929 (method 2) offered FIRST, no-auth kept on the
+// list so a server with auth disabled can still answer 0.
+const bytes kGreetingUserpassFirst{0x05, 0x02, 0x02, 0x00};
+const bytes kAuthRequest{0x01, 0x05, 0x61, 0x6c, 0x69, 0x63, 0x65,  // 1 alice
+                         0x07, 0x73, 0x33, 0x63, 0x72, 0x33, 0x74,
+                         0x21};  // s3cr3t!  -- VER ULEN U PLEN P, 15 bytes
 const bytes kRequestV4{0x05, 0x01, 0x00, 0x01, 0xCB, 0x00, 0x71,
                        0x07, 0x1F, 0x90};  // 203.0.113.7:8080
 // 22 bytes: VER CMD RSV ATYP + 16 address octets + PORT.
@@ -142,14 +151,14 @@ void build_greeting_offers_no_auth() {
   CHECK_BYTES(buf, n, kGreetingNoAuth);
 }
 
-void build_greeting_offers_no_auth_plus_userpass() {
-  // The shape P5 sends once credentials exist: RFC 1929 is method 0x02.
+void build_greeting_offers_userpass_then_no_auth() {
+  // What socks5_handshake sends with credentials configured (P5 #2).
   char buf[SOCKS_GREETING_MAX_SIZE] = {};
-  const uint8_t methods[] = {SOCKS_NO_AUTHENTICATION, 0x02};
+  const uint8_t methods[] = {SOCKS_USERNAME_PASSWORD, SOCKS_NO_AUTHENTICATION};
 
   const size_t n = socks5_build_greeting(methods, sizeof(methods), buf);
   CHECK_EQ(n, 4u);
-  CHECK_BYTES(buf, n, kGreetingNoAuthUserpass);
+  CHECK_BYTES(buf, n, kGreetingUserpassFirst);
 }
 
 void build_greeting_rejects_unencodable_method_lists() {
@@ -345,13 +354,149 @@ void overloads_agree_byte_for_byte_ipv6() {
   CHECK(std::memcmp(via_sockaddr, via_ip_addr, a) == 0);
 }
 
+// ---------------------------------------------------------------- RFC 1929
+//
+// socks5_build_auth lays out the subnegotiation request; socks5_handshake is
+// the state machine around it (greeting -> server choice -> auth -> status).
+// Only the bytes are host-testable -- the state machine needs a live proxy, so
+// the accept/refuse walks belong to the e2e auth test (P5 S6).
+
+namespace {
+
+// The greeting socks5_handshake() emits for a given credential state, spelled
+// out with the same method order the handshake uses.
+bytes handshake_greeting_for(const socks5_credentials &creds) {
+  uint8_t methods[2];
+  size_t count = 0;
+  if (creds.enabled()) {
+    methods[count++] = SOCKS_USERNAME_PASSWORD;
+    methods[count++] = SOCKS_NO_AUTHENTICATION;
+  } else {
+    methods[count++] = SOCKS_NO_AUTHENTICATION;
+  }
+
+  char buf[SOCKS_GREETING_MAX_SIZE] = {};
+  return to_bytes(buf, socks5_build_greeting(methods, count, buf));
+}
+
+}  // namespace
+
+void auth_constants_match_the_contract() {
+  CHECK_EQ((int)SOCKS_USERNAME_PASSWORD, 2);   // greeting method id
+  CHECK_EQ((int)SOCKS_AUTH_VERSION, 1);        // subnegotiation VER
+  CHECK_EQ((int)SOCKS_AUTH_FAILURE, 0xFF);     // the usual rejection status
+  CHECK_EQ(SOCKS_AUTH_MAX_SIZE, 513u);         // 1 + 1 + 255 + 1 + 255
+}
+
+void build_auth_pins_the_request_bytes() {
+  uint8_t buf[SOCKS_AUTH_MAX_SIZE] = {};
+
+  const size_t n = socks5_build_auth("alice", "s3cr3t!", buf);
+  CHECK_EQ(n, 15u);
+  CHECK_EQ(kAuthRequest.size(), 15u);
+  CHECK_BYTES_U8(buf, n, kAuthRequest);
+}
+
+void build_auth_takes_the_255_octet_boundary() {
+  const std::string user(255, 'u');
+  const std::string pass(255, 'p');
+  uint8_t buf[SOCKS_AUTH_MAX_SIZE] = {};
+
+  const size_t n = socks5_build_auth(user, pass, buf);
+  CHECK_EQ(n, SOCKS_AUTH_MAX_SIZE);  // the widest legal login fills it exactly
+  CHECK_EQ((int)buf[0], (int)SOCKS_AUTH_VERSION);
+  CHECK_EQ((int)buf[1], 255);            // ULEN
+  CHECK_EQ((int)buf[2], (int)'u');       // first username octet
+  CHECK_EQ((int)buf[256], (int)'u');     // the 255th
+  CHECK_EQ((int)buf[257], 255);          // PLEN sits right behind it
+  CHECK_EQ((int)buf[258], (int)'p');
+  CHECK_EQ((int)buf[512], (int)'p');
+}
+
+void build_auth_rejects_what_one_length_octet_cannot_hold() {
+  const std::string ok(255, 'u');
+  const std::string too_long(256, 'u');
+  uint8_t buf[SOCKS_AUTH_MAX_SIZE] = {};
+
+  CHECK_EQ(socks5_build_auth(too_long, ok, buf), 0u);
+  CHECK_EQ(socks5_build_auth(ok, too_long, buf), 0u);
+  CHECK_EQ(socks5_build_auth(too_long, too_long, buf), 0u);
+  CHECK_EQ(socks5_build_auth(ok, ok, nullptr), 0u);
+  // one octet shorter on each side still fits, and reports its real length
+  CHECK_EQ(socks5_build_auth(ok, ok.substr(0, 254), buf), 512u);
+}
+
+void build_auth_encodes_empty_credential_fields() {
+  // A zero-length field is legal 1929; whether the server takes it is its own
+  // business.  Deciding whether to offer method 2 at all is enabled()'s job.
+  uint8_t buf[SOCKS_AUTH_MAX_SIZE] = {};
+  const bytes want{0x01, 0x00, 0x00};
+
+  const size_t n = socks5_build_auth("", "", buf);
+  CHECK_EQ(n, 3u);
+  CHECK_BYTES_U8(buf, n, want);
+}
+
+void credentials_are_views_with_enablement_semantics() {
+  // Views only, no storage: what the caller handed over is what it holds.
+  const socks5_credentials none;
+  const socks5_credentials both{"alice", "s3cr3t!"};
+  const socks5_credentials user_only{"alice", ""};
+  const socks5_credentials pass_only{"", "pw"};
+
+  CHECK(!none.enabled());
+  CHECK(both.enabled());
+  CHECK(user_only.enabled());   // a blank password is still a credential
+  CHECK(pass_only.enabled());
+
+  CHECK_EQ(both.username, std::string_view("alice"));
+  CHECK_EQ(both.password, std::string_view("s3cr3t!"));
+  CHECK(user_only.password.empty());
+  CHECK(pass_only.username.empty());
+}
+
+void credentials_borrowed_from_the_injector_config() {
+  InjectorConfig cfg{IpAddr{{}, {}, std::string("proxy.example.com"), 1080u},
+                     true, false, {}, {}};
+  // schema.hpp fields 4/5 absent => no auth offered, the P5 contract.
+  CHECK(!socks5_credentials_from(cfg).enabled());
+
+  cfg["username"_f] = std::string("alice");
+  cfg["password"_f] = std::string("s3cr3t!");
+  const socks5_credentials creds = socks5_credentials_from(cfg);
+  CHECK(creds.enabled());
+  CHECK_EQ(creds.username, std::string_view("alice"));
+  CHECK_EQ(creds.password, std::string_view("s3cr3t!"));
+  // views into the config the caller keeps alive -- nothing was copied
+  CHECK_EQ(creds.username.data(), cfg["username"_f]->data());
+
+  // Username only (a genuinely blank password) is still an offer to auth.
+  const InjectorConfig user_only{IpAddr{0x0A000001u, {}, {}, 1080u}, {}, {},
+                                 std::string("anon"), {}};
+  const auto partial = socks5_credentials_from(user_only);
+  CHECK(partial.enabled());
+  CHECK_EQ(partial.username, std::string_view("anon"));
+  CHECK(partial.password.empty());
+}
+
+void handshake_offer_tracks_the_credential_state() {
+  CHECK_EQ(handshake_greeting_for(socks5_credentials{}), kGreetingNoAuth);
+  CHECK_EQ(handshake_greeting_for(socks5_credentials{"alice", "pw"}),
+           kGreetingUserpassFirst);
+
+  // The two greetings are the only shapes the injectee can send, and the
+  // credential-free one is byte-for-byte what it sent before P5.
+  CHECK(handshake_greeting_for(socks5_credentials{}) == kGreetingNoAuth);
+}
+
 // ------------------------------------------------------------------- output
 
 void print_pinned_vectors() {
   std::printf("\npinned wire bytes:\n");
   std::printf("  greeting no-auth        %s\n", hex(kGreetingNoAuth).c_str());
-  std::printf("  greeting no-auth+userpass %s\n",
-              hex(kGreetingNoAuthUserpass).c_str());
+  std::printf("  greeting userpass-first %s\n",
+              hex(kGreetingUserpassFirst).c_str());
+  std::printf("  auth   alice/s3cr3t!    %s\n", hex(kAuthRequest).c_str());
   std::printf("  v4   203.0.113.7:8080   %s\n", hex(kRequestV4).c_str());
   std::printf("  v6   [2001:db8::1]:4433 %s\n", hex(kRequestV6).c_str());
   std::printf("  domain example.com:80   %s\n", hex(kRequestDomain).c_str());
@@ -366,7 +511,7 @@ int main() {
   }
 
   RUN(build_greeting_offers_no_auth);
-  RUN(build_greeting_offers_no_auth_plus_userpass);
+  RUN(build_greeting_offers_userpass_then_no_auth);
   RUN(build_greeting_rejects_unencodable_method_lists);
   RUN(build_request_ipv4_is_network_order);
   RUN(build_request_ipv6);
@@ -382,6 +527,14 @@ int main() {
   RUN(request_from_ip_addr_rejects_unusable_messages);
   RUN(overloads_agree_byte_for_byte_ipv4);
   RUN(overloads_agree_byte_for_byte_ipv6);
+  RUN(auth_constants_match_the_contract);
+  RUN(build_auth_pins_the_request_bytes);
+  RUN(build_auth_takes_the_255_octet_boundary);
+  RUN(build_auth_rejects_what_one_length_octet_cannot_hold);
+  RUN(build_auth_encodes_empty_credential_fields);
+  RUN(credentials_are_views_with_enablement_semantics);
+  RUN(credentials_borrowed_from_the_injector_config);
+  RUN(handshake_offer_tracks_the_credential_state);
 
   print_pinned_vectors();
 

@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstring>
 #include <schema.hpp>
+#include <string_view>
 
 constexpr const char SOCKS_VERSION = 5;
 constexpr const char SOCKS_NO_AUTHENTICATION = 0;
@@ -34,6 +35,11 @@ constexpr const char SOCKS_IPV6 = 4;
 constexpr const char SOCKS_SUCCESS = 0;
 constexpr const char SOCKS_GENERAL_FAILURE = 4;
 
+// RFC 1929 username/password subnegotiation, offered as greeting method 2.
+constexpr const char SOCKS_USERNAME_PASSWORD = 2;
+constexpr const uint8_t SOCKS_AUTH_VERSION = 1;    // the subnegotiation VER
+constexpr const uint8_t SOCKS_AUTH_FAILURE = 0xFF;  // the usual rejection code
+
 // A DOMAINNAME request is the widest one the builders below can emit:
 // VER + CMD + RSV + ATYP (4) + LEN + name (1 + 255) + PORT (2) == 262.
 constexpr const size_t SOCKS_DOMAIN_MAX_LENGTH = 255;
@@ -43,12 +49,47 @@ constexpr const size_t SOCKS_REQUEST_MAX_SIZE =
 // VER + NMETHODS + up to 255 methods (RFC 1928 section 3).
 constexpr const size_t SOCKS_GREETING_MAX_SIZE = 2 + 255;
 
+// VER + ULEN + 255 + PLEN + 255 (RFC 1929).  Note this is 513, not a round
+// 512: a caller that sizes its buffer with SOCKS_AUTH_MAX_SIZE must hold the
+// widest legal subnegotiation, and 255 + 255 + 3 is 513 bytes.
+constexpr const size_t SOCKS_AUTH_MAX_SIZE = 1 + 1 + 255 + 1 + 255;
+
+// ---------------------------------------------------------------- credentials
+
+// A proxy login, borrowed rather than owned: both members are views into
+// whatever the caller already holds (an InjectorConfig, a test buffer).  An
+// absent credential and an empty one look the same from here, which is fine --
+// the P5 contract in schema.hpp says "no authentication" is encoded as ABSENT,
+// so nothing (or two empties) means "do not offer method 2".
+struct socks5_credentials {
+  std::string_view username;
+  std::string_view password;
+
+  // True when the config carries at least one credential, i.e. when the
+  // greeting should offer RFC 1929.  A username with an empty password stays
+  // enabled: some servers really do accept a blank password.
+  bool enabled() const {
+    return !username.empty() || !password.empty();
+  }
+};
+
+// Borrow the credentials out of an InjectorConfig (schema.hpp fields 4 and 5,
+// the frozen P5 contract).  The views point INTO `cfg`, so `cfg` has to
+// outlive the handshake -- at every hook call site it is a local copy that
+// does.  Never copies, never allocates: this runs inside a hooked connect().
+inline socks5_credentials socks5_credentials_from(const InjectorConfig &cfg) {
+  const auto &user = cfg["username"_f];
+  const auto &pass = cfg["password"_f];
+  return socks5_credentials{user ? *user : std::string_view{},
+                            pass ? *pass : std::string_view{}};
+}
+
 // ----------------------------------------------------------- pure builders
 //
 // Everything that only *lays out bytes* is inline, socket-free and heap-free,
 // so it is testable on the host (see tests/socks5).  The SOCKET taking
 // functions underneath are thin: build the bytes, send them, read the reply.
-// P5 (RFC 1929 username/password negotiation) grows on top of these builders.
+// RFC 1929 (username/password) was added on top of exactly this seam.
 
 // Writes the client greeting {VER, NMETHODS, METHODS...}.  `methods` holds
 // `n` method ids; `out` needs room for `n` + 2 bytes, at most
@@ -187,15 +228,58 @@ inline size_t socks5_build_request_from_ip_addr(const IpAddr &addr, char *out) {
   return 0;
 }
 
+// Writes the RFC 1929 client subnegotiation
+//   {VER=1, ULEN, USERNAME..., PLEN, PASSWORD...}
+// into `out`, which needs room for SOCKS_AUTH_MAX_SIZE bytes.  Both lengths fit
+// one octet, so a credential longer than 255 bytes cannot be encoded and yields
+// 0 (as does a null `out`); the caller reports that as a handshake failure
+// rather than truncating a login.  Returns the number of bytes written.
+inline size_t socks5_build_auth(std::string_view user, std::string_view pass,
+                                uint8_t *out) {
+  if (out == nullptr || user.size() > 0xFF || pass.size() > 0xFF) {
+    return 0;
+  }
+
+  uint8_t *p = out;
+  *p++ = SOCKS_AUTH_VERSION;
+  *p++ = (uint8_t)user.size();
+  for (const char c : user) {
+    *p++ = (uint8_t)c;
+  }
+  *p++ = (uint8_t)pass.size();
+  for (const char c : pass) {
+    *p++ = (uint8_t)c;
+  }
+
+  return (size_t)(p - out);
+}
+
 // ------------------------------------------------------------ socket layer
 //
 // NOTE: these define functions at namespace scope WITHOUT `inline`, so this
 // header may be included by exactly ONE translation unit per binary.
 
-bool socks5_handshake(SOCKET s) {
-  const uint8_t methods[] = {SOCKS_NO_AUTHENTICATION};
+// The RFC 1928 greeting, plus the RFC 1929 subnegotiation when the caller has
+// credentials.  creds is REQUIRED, not defaulted: every call site has to say
+// where the login comes from, and hook.hpp passes the InjectorConfig it already
+// holds.  Any failure returns false and the caller's fail_proxied_connect()
+// turns it into WSAECONNREFUSED -- a proxy that refused the login is never
+// silently downgraded to an unauthenticated connection.
+bool socks5_handshake(SOCKET s, const socks5_credentials &creds) {
+  // No credentials: one method, exactly the pre-P5 greeting.  With them: offer
+  // username/password FIRST but keep no-auth on the list, so a server with auth
+  // disabled can still pick method 0.
+  uint8_t methods[2];
+  size_t count = 0;
+  if (creds.enabled()) {
+    methods[count++] = SOCKS_USERNAME_PASSWORD;
+    methods[count++] = SOCKS_NO_AUTHENTICATION;
+  } else {
+    methods[count++] = SOCKS_NO_AUTHENTICATION;
+  }
+
   char req[SOCKS_GREETING_MAX_SIZE];
-  const size_t size = socks5_build_greeting(methods, sizeof(methods), req);
+  const size_t size = socks5_build_greeting(methods, count, req);
 
   if (size == 0 || send(s, req, (int)size, 0) != (int)size)
     return false;
@@ -204,7 +288,39 @@ bool socks5_handshake(SOCKET s) {
   if (recv(s, res, sizeof(res), MSG_WAITALL) != sizeof(res))
     return false;
 
-  return res[0] == SOCKS_VERSION && res[1] == SOCKS_NO_AUTHENTICATION;
+  if (res[0] != SOCKS_VERSION)
+    return false;
+
+  // Method 0: no authentication required -- the outcome P5 left untouched.
+  if (res[1] == SOCKS_NO_AUTHENTICATION)
+    return true;
+
+  // Method 2 only leads anywhere if we actually offered it.  Everything else,
+  // including 0xFF ("no acceptable methods"), fails the handshake.
+  if (res[1] != SOCKS_USERNAME_PASSWORD || !creds.enabled())
+    return false;
+
+  uint8_t auth[SOCKS_AUTH_MAX_SIZE];
+  const size_t auth_size =
+      socks5_build_auth(creds.username, creds.password, auth);
+
+  if (auth_size == 0 ||
+      send(s, (const char *)auth, (int)auth_size, 0) != (int)auth_size)
+    return false;
+
+  char auth_res[2];
+  if (recv(s, auth_res, sizeof(auth_res), MSG_WAITALL) != sizeof(auth_res))
+    return false;
+
+  const auto auth_ver = (uint8_t)auth_res[0];
+  const auto auth_status = (uint8_t)auth_res[1];
+
+  // A refused login normally comes back as {1, 0xFF}; any status but 0 is a
+  // refusal, whatever the server dressed it in.
+  if (auth_status == SOCKS_AUTH_FAILURE)
+    return false;
+
+  return auth_ver == SOCKS_AUTH_VERSION && auth_status == SOCKS_SUCCESS;
 }
 
 char socks5_request_send(SOCKET s, char *buf, size_t size) {
