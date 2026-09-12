@@ -189,9 +189,17 @@ UI data-race fixes (`view.post`).
       'fail-open' annotation of dfc82f4.)
 
 ### P6 — Feature: DNS resolution hooking
-- [ ] Decide the strategy: fake-IP domain mapping vs. pass-through resolution with
+- [x] Decide the strategy: fake-IP domain mapping vs. pass-through resolution with
       remote resolve at the proxy (`ATYP=3` domain requests already exist in
-      `socks5_request`).
+      `socks5_request`). (794a9069 dossier, accepted: HYBRID — hand the app a fake IP
+      from 198.51.100.0/24 (TEST-NET-2, v6 as ::ffff:<fake>) so no DNS query leaves the
+      capsule, then reverse-map fake->name at the connect sites so the WIRE keeps
+      ATYP=3 remote-resolve; no-TTL LRU + quarantine ring because a reused fake IP
+      misrouting live traffic is the worst failure; never fake NetBIOS/.local/.arpa/
+      _msdcs/WPAD; the startup window resolves via the original rather than black-holing;
+      `freeaddrinfo` must be hooked too (static CRT => HeapAlloc-tagged) or the victim
+      crashes. Slices T1..T7; T1 landed 0f78d72, T3..T6 serialized behind R2/R3 in
+      hook.hpp/injectee.cpp.)
 - [ ] Hook `getaddrinfo` / `GetAddrInfoW` (+ `GetAddrInfoExW` if async resolution
       needs it) via the CRTP MinHook wrapper — currently absent (grep-verified), so
       DNS leaks outside the tunnel.
@@ -202,11 +210,26 @@ UI data-race fixes (`view.post`).
 - [ ] Tests: mapping-table unit tests; E2E check that no DNS query leaves the tunnel.
 
 ### P7 — Feature: UDP support (owner-approved)
-- [ ] Survey the datagram API surface to hook: `sendto`, `WSASendTo`, `recvfrom`,
-      `WSARecvFrom`, plus connected-UDP `send`/`recv` on `SOCK_DGRAM` sockets.
+- [x] Survey the datagram API surface to hook: `sendto`, `WSASendTo`, `recvfrom`,
+      `WSARecvFrom`, plus connected-UDP `send`/`recv` on `SOCK_DGRAM` sockets. (794a9069
+      dossier: P7a = the four To-variants ONLY, served from our own queues; connected-UDP
+      `send`/`recv` + event/IOCP/`select`-driven delivery = P7b because every app shape we
+      do not intercept is a HANG not a leak — so a socket is taken over only on its first
+      `sendto` and is marked permanently unmanaged (reported as `syscall="udp-direct"`)
+      the moment `WSAAsyncSelect`/`WSAEventSelect`/overlapped reads appear on it. Survey
+      also found the shipped C0 bug: no SO_TYPE gate meant DGRAM `connect()` was
+      TCP-proxified and destroyed — fixed independently at 17c3627.)
 - [ ] Implement the SOCKS5 UDP ASSOCIATE client (RFC 1928 §7): TCP control request,
       relay endpoint reply, datagram header (FRAG/ATYP/addr/port).
-- [ ] Decide the local-relay architecture (per-socket relay vs. shared relay socket).
+- [x] Decide the local-relay architecture (per-socket relay vs. shared relay socket).
+      (Decision: ONE shared, lazily-created association per injected process — one TCP
+      control connection + one relay UDP socket, refcounted, generation-guarded, idle-
+      reaped at 30s, pumped by a DEDICATED io_context on its own detached thread (never
+      `client.hpp`'s context: it parks when the injector is lost, i.e. exactly when the
+      tunnel matters); keying by relay socket makes proxy-side rebind a non-issue and the
+      app's local UDP endpoint is documented as NOT preserved. Caps not TTLs: 32
+      associations / 256 rows / 64 datagrams + 1 MiB per socket, evict-LRU + quarantine.
+      Implemented as pure modules 8053eae (state) + S3 (associate call) with S5/S6 to wire.)
 - [ ] Hook outbound datagrams: encapsulate and forward via the relay.
 - [ ] Hook inbound datagrams: decapsulate replies and hand them to the application.
 - [ ] Handle exclusions: localhost targets and proxy-loop prevention for the relay
