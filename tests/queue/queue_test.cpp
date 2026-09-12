@@ -31,8 +31,11 @@
 // blocking_queue<T> is a std::queue guarded by a channel<void(error_code)>.
 // Every scenario below runs on its own io_context, started with asio::co_spawn
 // and bounded by a steady_timer watchdog, so a stuck channel fails the test
-// instead of hanging CI.  The per-scenario budget keeps the worst case
-// (7 scenarios) below the 60s TIMEOUT set on common.queue in CMake.
+// instead of hanging CI.  The per-scenario budget keeps the common case (a
+// channel that wakes again) well inside the 60s TIMEOUT set on common.queue.
+// Caveat for the bounded-push scenarios below: a push() that really wedges
+// takes the single io thread with it, so no watchdog can fire and that failure
+// lands as the CTest timeout instead of a scenario FAIL -- still a red build.
 namespace {
 
 constexpr int kWatchdogMs = 8000;
@@ -395,6 +398,267 @@ asio::awaitable<void> concurrent_bounded_accounting(asio::io_context &ctx) {
   CHECK_EQ(got.size() + q.drops() + q.size(), pushed);
 }
 
+// (8) The bound has to bind by DROPPING, never by blocking: push() runs on a
+// hooked winsock call inside somebody else's process, so the only acceptable
+// price of a full queue is a lost report.  Burst shape is the worst case for a
+// push that tries to wait -- max (4) sits far below capacity (16) so the token
+// channel is full with no receiver long before the item bound is reached, and
+// nothing services `ctx` while the loop runs, because this body owns the only
+// io thread.  That is the wedged-UI/injector M5 was about.
+//
+// Eviction DIRECTION is pinned by value too, since queue.hpp chose
+// `_qu.pop()` (drop the oldest, keep the newest report) rather than refusing
+// the newcomer; the two are only told apart by looking at what survives.
+asio::awaitable<void> bounded_push_drops_instead_of_blocking(
+    asio::io_context &ctx) {
+  constexpr std::size_t cap = 16;
+  constexpr int burst = 4000;
+  constexpr long long budget_ms = 100;
+
+  // Warm up on a throwaway queue first, so the measured loop is the loop under
+  // test and not the process's first touch of the deque/coroutine allocations.
+  {
+    blocking_queue<int> warm(ctx, 4, cap);
+    for (int i = 0; i < 256; ++i) {
+      warm.push(i);
+    }
+  }
+
+  blocking_queue<int> q(ctx, 4, cap);
+  CHECK_EQ(q.capacity(), cap);
+  CHECK_EQ(q.drops(), static_cast<std::size_t>(0));
+
+  const auto begin = std::chrono::steady_clock::now();
+  for (int i = 0; i < burst; ++i) {
+    q.push(i);
+  }
+  const auto end = std::chrono::steady_clock::now();
+  const long long elapsed_ms = std::chrono::duration_cast<
+      std::chrono::milliseconds>(end - begin).count();
+
+  std::printf("  note: %d pushes into a capacity-%d queue took %lldms\n",
+              burst, static_cast<int>(cap), elapsed_ms);
+  std::printf("  note: budget for that loop was %lldms\n", budget_ms);
+  CHECK(elapsed_ms < budget_ms);
+
+  // The producer never waited, and the bound held: the first cap items got in
+  // and every one after them evicted exactly one, so the queue is at capacity.
+  CHECK_EQ(q.size(), cap);
+  CHECK_EQ(q.drops(), static_cast<std::size_t>(burst) - cap);
+
+  // What survives is the NEWEST window, 3984..3999 in order.  Sixteen tokens
+  // were ever posted (an eviction takes the dropped item's token with it), so
+  // exactly sixteen pops are satisfiable -- no phantom, no stranded send.
+  for (int i = burst - static_cast<int>(cap); i < burst; ++i) {
+    CHECK_EQ(co_await q.pop(), i);
+  }
+  CHECK_EQ(q.size(), static_cast<std::size_t>(0));
+  CHECK_EQ(q.drops(), static_cast<std::size_t>(burst) - cap);
+
+  {
+    // capacity 1 is the smallest honest window and the case that separates the
+    // two eviction directions outright: oldest-drop keeps the LAST value that
+    // came in, newest-drop (refusing the newcomer) would have kept the first.
+    blocking_queue<int> one(ctx, 4, 1);
+    one.push(11);
+    one.push(22);
+    one.push(33);
+    CHECK_EQ(one.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(one.drops(), static_cast<std::size_t>(2));
+    CHECK_EQ(co_await one.pop(), 33);
+    CHECK_EQ(one.size(), static_cast<std::size_t>(0));
+  }
+}
+
+// (9) Drop accounting across more than one burst: drops() is a lifetime
+// counter, not a per-burst one.  Nothing pops between the two bursts, so the
+// second one evicts on every single push and the counter only climbs.
+asio::awaitable<void> drop_counter_accumulates_across_bursts(
+    asio::io_context &ctx) {
+  constexpr std::size_t cap = 32;
+  constexpr int burst_a = 100;
+  constexpr int burst_b = 50;
+
+  blocking_queue<int> q(ctx, 1024, cap);
+  CHECK_EQ(q.drops(), static_cast<std::size_t>(0));
+
+  for (int i = 0; i < burst_a; ++i) {
+    q.push(i);
+  }
+  const auto drops_a = q.drops();
+  CHECK_EQ(drops_a, static_cast<std::size_t>(burst_a) - cap);
+  CHECK_EQ(q.size(), cap);
+
+  for (int i = 0; i < burst_b; ++i) {
+    q.push(burst_a + i);
+  }
+  // Added to, not reset and not clamped at the first burst's overflow...
+  CHECK_EQ(q.drops(), drops_a + static_cast<std::size_t>(burst_b));
+  // ... so the honest closed form after an undrained producer is exactly
+  // (produced - capacity), and the queue still holds precisely one window.
+  CHECK_EQ(q.drops(), static_cast<std::size_t>(burst_a + burst_b) - cap);
+  CHECK_EQ(q.size(), cap);
+
+  std::vector<int> survivors;
+  survivors.reserve(cap);
+  for (std::size_t i = 0; i < cap; ++i) {
+    survivors.push_back(co_await q.pop());
+  }
+  CHECK_EQ(survivors.front(), burst_a + burst_b - static_cast<int>(cap));
+  CHECK_EQ(survivors.back(), burst_a + burst_b - 1);
+  // pushed == delivered + dropped + queued, with the counter unchanged by the
+  // draining pops themselves (popping is not a drop).
+  CHECK_EQ(static_cast<std::size_t>(burst_a + burst_b),
+           survivors.size() + q.drops() + q.size());
+
+  // Emptying the window does not reset the counter either: a push that fits
+  // adds nothing to it.
+  const auto drops_after = q.drops();
+  q.push(999);
+  CHECK_EQ(q.drops(), drops_after);
+  CHECK_EQ(co_await q.pop(), 999);
+  CHECK_EQ(q.drops(), drops_after);
+}
+
+// (10) The bound is a sliding window, not a lifetime budget: once K items have
+// been popped, K more fit again without a single eviction.  If capacity were
+// implemented as "count pushes and start refusing", the pops below would free
+// nothing and the second phase would report drops.
+asio::awaitable<void> capacity_is_a_sliding_window(asio::io_context &ctx) {
+  constexpr std::size_t cap = 8;
+
+  blocking_queue<int> q(ctx, 1024, cap);
+
+  for (int i = 0; i < static_cast<int>(cap); ++i) {
+    q.push(i);
+  }
+  CHECK_EQ(q.size(), cap);
+  CHECK_EQ(q.drops(), static_cast<std::size_t>(0)); // exactly full is not over
+
+  q.push(8); // one over the line: admitted, and the OLDEST pays for it
+  CHECK_EQ(q.size(), cap);
+  CHECK_EQ(q.drops(), static_cast<std::size_t>(1));
+
+  for (int i = 1; i <= 4; ++i) { // the consumer gets 1,2,3,4
+    CHECK_EQ(co_await q.pop(), i);
+  }
+  CHECK_EQ(q.size(), static_cast<std::size_t>(4));
+
+  const auto drops_before = q.drops();
+  for (int i = 9; i <= 12; ++i) { // room for four again
+    q.push(i);
+  }
+  CHECK_EQ(q.size(), cap);
+  CHECK_EQ(q.drops(), drops_before); // zero evictions: the window slid
+
+  q.push(13); // full again -> the next oldest (5) is the one that goes
+  CHECK_EQ(q.drops(), drops_before + 1);
+  for (int i = 6; i <= 13; ++i) {
+    CHECK_EQ(co_await q.pop(), i);
+  }
+  CHECK_EQ(q.size(), static_cast<std::size_t>(0));
+}
+
+// (11) cancel() drains the queue and counts what it removed (scenario 6), but
+// the tokens those items owned survive -- asio offers no way to flush a
+// buffered channel -- so the next pop() has to chew through stale tokens
+// before it parks again.  The promise under test is the one a reconnecting
+// session lives on: a waiter parked AFTER the cancel is still woken by a later
+// push, and the stale-token skip neither throws nor delivers a phantom.
+asio::awaitable<void> push_after_cancel_wakes_a_later_waiter(
+    asio::io_context &ctx) {
+  constexpr int stranded = 5;
+
+  blocking_queue<int> q(ctx, 1024, 16);
+  for (int i = 0; i < stranded; ++i) {
+    q.push(i);
+  }
+  q.cancel();
+  CHECK_EQ(q.size(), static_cast<std::size_t>(0));
+  CHECK_EQ(q.drops(), static_cast<std::size_t>(stranded));
+
+  bool woke = false;
+  bool threw = false;
+  int value = 0;
+  asio::co_spawn(
+      ctx,
+      [&]() -> asio::awaitable<void> {
+        try {
+          value = co_await q.pop();
+          woke = true;
+        } catch (const asio::system_error &) {
+          threw = true;
+        }
+      },
+      asio::detached);
+
+  // Plenty of turns to eat the five stale tokens and park; it must not come
+  // back with anything, because nothing is queued any more.
+  for (int i = 0; i < 32; ++i) {
+    co_await asio::post(ctx, asio::use_awaitable);
+  }
+  CHECK(!threw);
+  CHECK(!woke);
+
+  q.push(4321); // the first push after the drain must still reach a waiter
+  for (int spin = 0; spin < 64 && !woke && !threw; ++spin) {
+    co_await asio::post(ctx, asio::use_awaitable);
+  }
+  CHECK(!threw);
+  CHECK(woke); // a lost wakeup here is the deadlock, bounded by the watchdog
+  CHECK_EQ(value, 4321);
+  CHECK_EQ(q.size(), static_cast<std::size_t>(0));
+  // Skipping stale tokens adds no drops: 6 pushed == 1 delivered + 5 drained.
+  CHECK_EQ(q.drops(), static_cast<std::size_t>(stranded));
+  CHECK_EQ(static_cast<std::size_t>(1) + q.drops() + q.size(),
+           static_cast<std::size_t>(stranded + 1));
+
+  // cancel() on a queue that holds nothing is idempotent, not a second
+  // accounting event.
+  q.cancel();
+  CHECK_EQ(q.drops(), static_cast<std::size_t>(stranded));
+  CHECK_EQ(q.size(), static_cast<std::size_t>(0));
+}
+
+// (12) Regression guard for the OTHER caller: the injector side still builds
+// its queue with the defaulted capacity, and there the item side must keep
+// growing however hard it is fed.  `unbounded` is 0, which in this API means
+// "no bound" and emphatically not "a bound of zero" -- the trap if the check
+// in push() were ever written as `_qu.size() >= _capacity` unconditionally.
+asio::awaitable<void> default_capacity_stays_unbounded(
+    asio::io_context &ctx) {
+  constexpr int burst = 512; // far above every capacity used above
+
+  CHECK_EQ(blocking_queue<int>::unbounded, static_cast<std::size_t>(0));
+
+  {
+    blocking_queue<int> q(ctx, 8); // the pre-bc428c9 two-argument call
+    CHECK_EQ(q.capacity(), blocking_queue<int>::unbounded);
+    for (int i = 0; i < burst; ++i) {
+      q.push(i);
+    }
+    CHECK_EQ(q.size(), static_cast<std::size_t>(burst));
+    CHECK_EQ(q.drops(), static_cast<std::size_t>(0));
+    for (int i = 0; i < burst; ++i) {
+      CHECK_EQ(co_await q.pop(), i);
+    }
+    CHECK_EQ(q.size(), static_cast<std::size_t>(0));
+    CHECK_EQ(q.drops(), static_cast<std::size_t>(0));
+  }
+
+  {
+    // An explicit unbounded is the same thing as the default, not a clamp.
+    blocking_queue<int> q(ctx, 8, blocking_queue<int>::unbounded);
+    CHECK_EQ(q.capacity(), static_cast<std::size_t>(0));
+    for (int i = 0; i < 2 * burst; ++i) {
+      q.push(i);
+    }
+    CHECK_EQ(q.size(), static_cast<std::size_t>(2 * burst));
+    CHECK_EQ(q.drops(), static_cast<std::size_t>(0));
+    CHECK_EQ(co_await q.pop(), 0);
+  }
+}
+
 void test_fifo_order() {
   run_scenario("fifo_order", fifo_order);
 }
@@ -424,6 +688,30 @@ void test_concurrent_bounded_accounting() {
   run_scenario("concurrent_bounded_accounting", concurrent_bounded_accounting);
 }
 
+void test_bounded_push_drops_instead_of_blocking() {
+  run_scenario("bounded_push_drops_instead_of_blocking",
+               bounded_push_drops_instead_of_blocking);
+}
+
+void test_drop_counter_accumulates_across_bursts() {
+  run_scenario("drop_counter_accumulates_across_bursts",
+               drop_counter_accumulates_across_bursts);
+}
+
+void test_capacity_is_a_sliding_window() {
+  run_scenario("capacity_is_a_sliding_window", capacity_is_a_sliding_window);
+}
+
+void test_push_after_cancel_wakes_a_later_waiter() {
+  run_scenario("push_after_cancel_wakes_a_later_waiter",
+               push_after_cancel_wakes_a_later_waiter);
+}
+
+void test_default_capacity_stays_unbounded() {
+  run_scenario("default_capacity_stays_unbounded",
+               default_capacity_stays_unbounded);
+}
+
 } // namespace
 
 int main() {
@@ -434,5 +722,10 @@ int main() {
   RUN(test_overflow_drops_oldest_and_counts);
   RUN(test_cancel_drains_queued_items);
   RUN(test_concurrent_bounded_accounting);
+  RUN(test_bounded_push_drops_instead_of_blocking);
+  RUN(test_drop_counter_accumulates_across_bursts);
+  RUN(test_capacity_is_a_sliding_window);
+  RUN(test_push_after_cancel_wakes_a_later_waiter);
+  RUN(test_default_capacity_stays_unbounded);
   return test_failures;
 }
