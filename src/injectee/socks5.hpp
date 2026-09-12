@@ -222,23 +222,50 @@ inline size_t socks5_build_request(uint8_t atyp, const void *addr_bytes,
 // port in network order, so the octets go through unchanged and the port only
 // makes the ntohs -> re-big-endian round trip.  The bytes on the wire are
 // exactly what this overload wrote before the refactor.
+// Declared ahead of the CONNECT wrapper below, which delegates to it; the
+// definition sits past it, next to the ASSOCIATE wrapper it was written for.
+// Repeating a declaration costs nothing if that ordering ever changes.
+inline size_t socks5_build_request_from_sockaddr_cmd(uint8_t cmd,
+                                                     const sockaddr *addr,
+                                                     char *out);
+
 inline size_t socks5_build_request_from_sockaddr(const sockaddr *addr,
                                                  char *out) {
+  return socks5_build_request_from_sockaddr_cmd(SOCKS_CONNECT, addr, out);
+}
+
+// The same, for any RFC 1928 section 4 command: CONNECT (what every connect()
+// hook sends) and UDP ASSOCIATE (CMD=3) differ only in that one octet, so the
+// family switch below is written once for both.
+inline size_t socks5_build_request_from_sockaddr_cmd(uint8_t cmd,
+                                                     const sockaddr *addr,
+                                                     char *out) {
   if (addr == nullptr) {
     return 0;
   }
 
   if (addr->sa_family == AF_INET) {
     const auto *v4 = (const sockaddr_in *)addr;
-    return socks5_build_request(SOCKS_IPV4, &v4->sin_addr, ntohs(v4->sin_port),
-                                out);
+    return socks5_build_request_cmd(cmd, SOCKS_IPV4, &v4->sin_addr,
+                                    ntohs(v4->sin_port), out);
   } else if (addr->sa_family == AF_INET6) {
     const auto *v6 = (const sockaddr_in6 *)addr;
-    return socks5_build_request(SOCKS_IPV6, &v6->sin6_addr,
-                                ntohs(v6->sin6_port), out);
+    return socks5_build_request_cmd(cmd, SOCKS_IPV6, &v6->sin6_addr,
+                                    ntohs(v6->sin6_port), out);
   }
 
   return 0;  // neither AF_INET nor AF_INET6: caller reports a general failure
+}
+
+// The RFC 1928 section 4 UDP ASSOCIATE request for a live `sockaddr` bind hint
+// -- CMD=3 and nothing else changes, so the 0.0.0.0:0 hint lays down exactly
+// {05 03 00 01 00 00 00 00 00 00}: "relay, pick the address and port you want,
+// and tell me in your reply" (tests/socks5 pins both that vector and the
+// IPv6/real-port forms).
+inline size_t socks5_build_associate_from_sockaddr(const sockaddr *bind_hint,
+                                                   char *out) {
+  return socks5_build_request_from_sockaddr_cmd(SOCKS_UDP_ASSOCIATE,
+                                               bind_hint, out);
 }
 
 // Request bytes for an `IpAddr` IPC message.  By schema contract `v4_addr` and
@@ -425,6 +452,44 @@ socks5_parse_udp_header(const void *data, size_t size) {
 // NOTE: these define functions at namespace scope WITHOUT `inline`, so this
 // header may be included by exactly ONE translation unit per binary.
 
+// What a reply said, as a verdict rather than a bare REP octet.  The connect
+// path only ever asked "did it work"; the UDP path has to tell answers apart,
+// because a control connection is long-lived and a half-read reply leaves it
+// unusable.  There is deliberately no "unknown": nothing may mistake a socket
+// whose state we do not understand for one that is still good.
+//
+//   ok             granted, and the BND decoded
+//   refused_rep    the relay said no -- a refused greeting, or REP != X'00'
+//   protocol_error what came back is not a reply: a short or missing fixed
+//                  header, a VER that is not 5, an ATYP this protocol lacks,
+//                  an empty name -- or a socket that could not carry the
+//                  request at all
+//   truncated      a reply that began legally and was cut inside its own
+//                  address: fewer octets than its ATYP demands
+//   bnd_is_a_name  a legal reply whose bound address is a NAME.  The text is
+//                  kept; the verdict is still a refusal -- socks5_associate
+enum class socks5_reply : uint8_t {
+  ok,
+  refused_rep,
+  protocol_error,
+  truncated,
+  bnd_is_a_name,
+};
+
+// BND.ADDR and BND.PORT, as stated by the relay.
+struct socks5_relay_endpoint {
+  uint8_t atyp = 0;
+  uint8_t addr[16] = {};  // WIRE order; the first addr_size octets are real
+  size_t addr_size = 0;   // 4, 16, or 0 when the answer was a name
+  uint16_t port_host_order = 0;
+  char name[SOCKS_DOMAIN_MAX_LENGTH + 1] = {};  // NUL-terminated, atyp 3 only
+  size_t name_size = 0;                         // octets, no LEN octet counted
+
+  // A numeric answer also arrives ready for sendto(): AF_INET or AF_INET6,
+  // address and port already in it.  A name leaves this AF_UNSPEC.
+  sockaddr_storage bound{};
+};
+
 // The RFC 1928 greeting, plus the RFC 1929 subnegotiation when the caller has
 // credentials.  creds is REQUIRED, not defaulted: every call site has to say
 // where the login comes from, and hook.hpp passes the InjectorConfig it already
@@ -489,27 +554,133 @@ bool socks5_handshake(SOCKET s, const socks5_credentials &creds) {
   return auth_ver == SOCKS_AUTH_VERSION && auth_status == SOCKS_SUCCESS;
 }
 
-char socks5_request_send(SOCKET s, char *buf, size_t size) {
-  if (send(s, buf, size, 0) != size)
-    return SOCKS_GENERAL_FAILURE;
+// Read one reply, strictly.  Every part of fixed size is read with
+// MSG_WAITALL, so a server that trickles cannot be mistaken for a whole reply,
+// and nothing is ever indexed past the octets that actually arrived.  The two
+// ways a stream proxy gets out of step with itself are both closed here: a
+// short header (the old code read four bytes with no MSG_WAITALL, so one
+// arrived and the other three came out of the request buffer -- and a request
+// buffer that starts {05 00 00 ...} reads back as "success"), and a reply that
+// stops inside its own address (the old code tested only for SOCKET_ERROR, so a
+// five-of-six read was a fine tunnel).
+//
+// A refusal reads no further.  RFC 1928 fills a failed reply's BND with zeros,
+// but a server may close instead, and waiting for six octets that never come
+// would hang a blocking socket; leaving them in the stream is what this file
+// always did, so the rule stands: a refused control socket is dead.  The pump
+// closes its control socket on any verdict but ok anyway.
+socks5_reply socks5_read_reply(SOCKET s, uint8_t *rep_out,
+                               socks5_relay_endpoint *bnd_out) {
+  char head[4];
+  if (recv(s, head, 4, MSG_WAITALL) != 4) {
+    return socks5_reply::protocol_error;  // short, EOF, or a broken socket
+  }
+  if (head[0] != SOCKS_VERSION) {
+    return socks5_reply::protocol_error;  // whatever answers, it is not SOCKS5
+  }
 
-  if (recv(s, buf, 4, 0) == SOCKET_ERROR)
-    return SOCKS_GENERAL_FAILURE;
+  const auto rep = (uint8_t)head[1];
+  if (rep_out != nullptr) {
+    *rep_out = rep;
+  }
+  if (rep != SOCKS_SUCCESS) {
+    return socks5_reply::refused_rep;
+  }
 
-  if (buf[1] != SOCKS_SUCCESS)
-    return buf[1];
-
-  if (buf[3] == SOCKS_IPV4) {
-    if (recv(s, buf + 4, 6, MSG_WAITALL) == SOCKET_ERROR)
-      return SOCKS_GENERAL_FAILURE;
-  } else if (buf[3] == SOCKS_IPV6) {
-    if (recv(s, buf + 4, 18, MSG_WAITALL) == SOCKET_ERROR)
-      return SOCKS_GENERAL_FAILURE;
+  const auto atyp = (uint8_t)head[3];
+  bool named = false;
+  size_t field = 0;  // octets of address, not counting the two of port
+  if (atyp == SOCKS_IPV4) {
+    field = 4;
+  } else if (atyp == SOCKS_IPV6) {
+    field = 16;
+  } else if (atyp == SOCKS_DOMAINNAME) {
+    char len_octet = 0;
+    if (recv(s, &len_octet, 1, MSG_WAITALL) != 1) {
+      return socks5_reply::protocol_error;
+    }
+    if ((uint8_t)len_octet == 0) {
+      return socks5_reply::protocol_error;  // a name with no bytes, no address
+    }
+    named = true;
+    field = (size_t)(uint8_t)len_octet;  // <= 255 by construction
   } else {
+    return socks5_reply::protocol_error;  // an ATYP this protocol does not have
+  }
+
+  // The address and its port, in one read, sized by the ATYP that promised
+  // them: 257 octets is the widest legal answer and the buffer's size.
+  char addr_part[SOCKS_DOMAIN_MAX_LENGTH + 2];
+  const size_t need = field + 2;
+  if (recv(s, addr_part, (int)need, MSG_WAITALL) != (int)need) {
+    return socks5_reply::truncated;  // cut inside its own address
+  }
+
+  const uint16_t port =
+      (uint16_t)(((uint16_t)(uint8_t)addr_part[field] << 8) |
+                 (uint16_t)(uint8_t)addr_part[field + 1]);
+
+  if (bnd_out != nullptr) {
+    *bnd_out = socks5_relay_endpoint{};
+    bnd_out->atyp = atyp;
+    bnd_out->port_host_order = port;
+    if (named) {
+      bnd_out->name_size = field;
+      std::memcpy(bnd_out->name, addr_part, field);
+      bnd_out->name[field] = '\0';
+      // bound stays AF_UNSPEC: resolving a name the relay handed us would mean
+      // a synchronous lookup inside the target process, on the pump's thread,
+      // with no proxy to carry it.
+    } else {
+      bnd_out->addr_size = field;
+      std::memcpy(bnd_out->addr, addr_part, field);
+      if (atyp == SOCKS_IPV4) {
+        auto *v4 = (sockaddr_in *)&bnd_out->bound;
+        v4->sin_family = AF_INET;
+        std::memcpy(&v4->sin_addr, addr_part, 4);
+        v4->sin_port = htons(port);
+      } else {
+        auto *v6 = (sockaddr_in6 *)&bnd_out->bound;
+        v6->sin6_family = AF_INET6;
+        std::memcpy(&v6->sin6_addr, addr_part, 16);
+        v6->sin6_port = htons(port);
+      }
+    }
+  }
+
+  return named ? socks5_reply::bnd_is_a_name : socks5_reply::ok;
+}
+
+// socks5_request_send, with the reply's BND.ADDR / BND.PORT kept: hand over a
+// socks5_relay_endpoint to get the relay's address, or nullptr for exactly what
+// the connect path wants.  What goes OUT on the wire is the bytes the caller
+// built, unchanged; the difference is that the reply is now read to its end or
+// not at all, and that a DOMAINNAME BND -- which the connect path cannot use,
+// and never could -- is drained and still reported as a general failure.
+char socks5_request_ex(SOCKET s, char *buf, size_t size,
+                       socks5_relay_endpoint *bnd_out) {
+  if (buf == nullptr || size == 0) {
+    return SOCKS_GENERAL_FAILURE;
+  }
+  if (send(s, buf, (int)size, 0) != (int)size) {
     return SOCKS_GENERAL_FAILURE;
   }
 
-  return SOCKS_SUCCESS;
+  uint8_t rep = (uint8_t)SOCKS_GENERAL_FAILURE;
+  const socks5_reply verdict = socks5_read_reply(s, &rep, bnd_out);
+  if (verdict == socks5_reply::ok) {
+    return SOCKS_SUCCESS;
+  }
+  if (verdict == socks5_reply::refused_rep) {
+    return (char)rep;  // the REP octet, as this function always answered
+  }
+  return SOCKS_GENERAL_FAILURE;
+}
+
+// The four hook.hpp call sites, unchanged: a thin delegate that asks for no
+// BND, so the connect path neither sees nor pays for the new code.
+char socks5_request_send(SOCKET s, char *buf, size_t size) {
+  return socks5_request_ex(s, buf, size, nullptr);
 }
 
 char socks5_request(SOCKET s, const sockaddr *addr) {
@@ -528,6 +699,66 @@ char socks5_request(SOCKET s, const IpAddr &addr) {
     return SOCKS_GENERAL_FAILURE;
 
   return socks5_request_send(s, buf, size);
+}
+
+// UDP ASSOCIATE (RFC 1928 sections 4 and 6) on a control socket: negotiate,
+// ask for a relay, and hand back the endpoint the relay assigned.  `control`
+// is a TCP socket already connected to the proxy and used for nothing else --
+// a relay is granted per connection, so the pump keeps this one open for the
+// life of the association and closes it when the association dies.
+//
+// `creds` are used for the greeting here, exactly as the connect path uses
+// them: an authenticated proxy is authenticated before it is asked for a
+// relay, and a refused login is never downgraded to an anonymous ASSOCIATE.
+// A handshake failure is reported as refused_rep with rep GENERAL_FAILURE:
+// whether the method was refused, the login was, or the socket died, the
+// answer to "may I have a relay" is no, and the pump's move is the same.
+//
+// `app_bind_hint` is BND.DST: where the application will send from.  Pass the
+// relay socket's own bound address when it is known, or an AF_UNSPEC / zeroed
+// sockaddr for "the relay picks" -- which this turns into 0.0.0.0:0 rather
+// than failing, because a hooked process that never called bind() genuinely
+// does not know yet.
+//
+// A DOMAINNAME BND is kept as raw text in out_bnd.name and answered
+// bnd_is_a_name: it is a legal reply, and this module will not act on it.  The
+// relay is telling us to send UDP to a NAME, which in a target process means a
+// synchronous, unproxied DNS lookup from the pump thread -- the exact leak this
+// capsule exists to prevent.  The pump reports the peer once and closes the
+// control socket; it does not resolve, retry, or fall back to direct.
+socks5_reply socks5_associate(SOCKET control, const socks5_credentials &creds,
+                              const sockaddr &app_bind_hint,
+                              socks5_relay_endpoint &out_bnd,
+                              uint8_t *rep_out = nullptr) {
+  out_bnd = socks5_relay_endpoint{};
+
+  if (!socks5_handshake(control, creds)) {
+    if (rep_out != nullptr) {
+      *rep_out = (uint8_t)SOCKS_GENERAL_FAILURE;
+    }
+    return socks5_reply::refused_rep;
+  }
+
+  char buf[SOCKS_REQUEST_MAX_SIZE];
+  size_t size = socks5_build_associate_from_sockaddr(&app_bind_hint, buf);
+  if (size == 0) {
+    sockaddr_in any{};
+    any.sin_family = AF_INET;  // 0.0.0.0:0: "you pick", the RFC's own wording
+    size = socks5_build_associate_from_sockaddr((const sockaddr *)&any, buf);
+  }
+  if (size == 0 || send(control, buf, (int)size, 0) != (int)size) {
+    if (rep_out != nullptr) {
+      *rep_out = (uint8_t)SOCKS_GENERAL_FAILURE;
+    }
+    return socks5_reply::protocol_error;  // the request never reached the relay
+  }
+
+  uint8_t rep = (uint8_t)SOCKS_GENERAL_FAILURE;
+  const socks5_reply verdict = socks5_read_reply(control, &rep, &out_bnd);
+  if (rep_out != nullptr) {
+    *rep_out = rep;
+  }
+  return verdict;
 }
 
 #endif  // ENCAPSULE_INJECTEE_SOCKS5

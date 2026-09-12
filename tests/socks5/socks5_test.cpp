@@ -771,6 +771,549 @@ void handshake_offer_tracks_the_credential_state() {
   CHECK(handshake_greeting_for(socks5_credentials{}) == kGreetingNoAuth);
 }
 
+// --------------------------------------------------- reply parsing on sockets
+//
+// A connected loopback pair, and nothing else: app is the socket handed to the
+// code under test and relay is the fake server.  They are real sockets so that
+// recv() really runs -- but no thread is needed, because TCP on loopback
+// buffers whatever either side writes.  A canned reply can be parked in front
+// of the reader before it is called, and what the client sent can be read back
+// afterwards.  That keeps every case here deterministic: no timing, no ports to
+// guess, nothing to join.
+
+struct loop_pair {
+  SOCKET app = INVALID_SOCKET;
+  SOCKET relay = INVALID_SOCKET;
+};
+
+loop_pair make_loop_pair() {
+  loop_pair p;
+  SOCKET listener = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (listener == INVALID_SOCKET) {
+    return p;
+  }
+
+  sockaddr_in sa{};
+  sa.sin_family = AF_INET;
+  sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  sa.sin_port = 0;  // ephemeral: nothing here may collide with a fixed port
+  if (::bind(listener, (sockaddr *)&sa, sizeof(sa)) == SOCKET_ERROR ||
+      ::listen(listener, 1) == SOCKET_ERROR) {
+    ::closesocket(listener);
+    return p;
+  }
+
+  int namelen = sizeof(sa);
+  ::getsockname(listener, (sockaddr *)&sa, &namelen);
+
+  p.app = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (p.app == INVALID_SOCKET ||
+      ::connect(p.app, (sockaddr *)&sa, sizeof(sa)) == SOCKET_ERROR) {
+    ::closesocket(listener);
+    return p;
+  }
+  p.relay = ::accept(listener, nullptr, nullptr);
+  ::closesocket(listener);
+  if (p.relay == INVALID_SOCKET) {
+    ::closesocket(p.app);
+    p.app = INVALID_SOCKET;
+  }
+  return p;
+}
+
+void close_loop_pair(loop_pair &p) {
+  if (p.app != INVALID_SOCKET) {
+    ::closesocket(p.app);
+  }
+  if (p.relay != INVALID_SOCKET) {
+    ::closesocket(p.relay);
+  }
+  p.app = INVALID_SOCKET;
+  p.relay = INVALID_SOCKET;
+}
+
+// Writes a whole canned reply onto the relay side of a pair, so the answer is
+// sitting in the socket buffer before the app side is asked to read it.
+size_t park(SOCKET relay, const bytes &v) {
+  return (size_t)::send(relay, (const char *)v.data(), (int)v.size(), 0);
+}
+
+// {VER, REP, RSV, ATYP, BND.ADDR, BND.PORT} in the two shapes the cases below
+// park: a numeric relay endpoint, and a relay that answers with a NAME.
+bytes reply_v4(std::uint8_t rep, std::uint32_t host_order, std::uint16_t port) {
+  return bytes{static_cast<std::uint8_t>(SOCKS_VERSION), rep, 0x00,
+               static_cast<std::uint8_t>(SOCKS_IPV4),
+               static_cast<std::uint8_t>(host_order >> 24),
+               static_cast<std::uint8_t>(host_order >> 16),
+               static_cast<std::uint8_t>(host_order >> 8),
+               static_cast<std::uint8_t>(host_order),
+               static_cast<std::uint8_t>(port >> 8),
+               static_cast<std::uint8_t>(port & 0xFF)};
+}
+
+bytes reply_domain(std::uint8_t rep, const char *name, std::uint16_t port) {
+  const std::string text(name);
+  bytes v{static_cast<std::uint8_t>(SOCKS_VERSION), rep, 0x00,
+          static_cast<std::uint8_t>(SOCKS_DOMAINNAME),
+          static_cast<std::uint8_t>(text.size())};
+  for (const char c : text) {
+    v.push_back(static_cast<std::uint8_t>(c));
+  }
+  v.push_back(static_cast<std::uint8_t>(port >> 8));
+  v.push_back(static_cast<std::uint8_t>(port & 0xFF));
+  return v;
+}
+
+// Park a canned reply in front of a fresh pair, read exactly one reply, and
+// report the verdict.  Every failure verdict leaves octets unread in the
+// stream, so each case needs its own pair -- which is also why no case reuses a
+// socket after a bad reply.
+socks5_reply verdict_for(const char *bytes, size_t size) {
+  auto p = make_loop_pair();
+  if (p.app == INVALID_SOCKET) {
+    return socks5_reply::protocol_error;
+  }
+  if (size > 0) {
+    CHECK_EQ(::send(p.relay, bytes, (int)size, 0), (int)size);
+  }
+  // Half-close the relay side.  A canned reply that deliberately stops short
+  // has to arrive as an EOF, or MSG_WAITALL sits on a socket nobody will ever
+  // finish -- a hung test is worse than a failing one, and it is the reason
+  // every case here ends with a shutdown before it asserts.
+  ::shutdown(p.relay, SD_SEND);
+  const socks5_reply verdict = socks5_read_reply(p.app, nullptr, nullptr);
+  close_loop_pair(p);
+  return verdict;
+}
+
+int octets_waiting(SOCKET s) {
+  u_long n = 0;
+  ::ioctlsocket(s, FIONREAD, &n);
+  return (int)n;
+}
+
+size_t recv_all(SOCKET s, char *out, size_t want) {
+  size_t got = 0;
+  while (got < want) {
+    const int r = ::recv(s, out + got, (int)(want - got), 0);
+    if (r <= 0) {
+      break;
+    }
+    got += (size_t)r;
+  }
+  return got;
+}
+
+void associate_request_differs_from_connect_only_in_cmd() {
+  const auto any = make_v4(0, 0);
+  char assoc[SOCKS_REQUEST_MAX_SIZE] = {};
+  char conn[SOCKS_REQUEST_MAX_SIZE] = {};
+
+  CHECK_EQ(socks5_build_associate_from_sockaddr((const sockaddr *)&any, assoc),
+           10u);
+  CHECK_BYTES(assoc, 10, kUdpAssociateAny);
+  CHECK_EQ(socks5_build_request_from_sockaddr((const sockaddr *)&any, conn),
+           10u);
+  // Everything from RSV on is the same encoding; only CMD moves.  That is the
+  // whole reason the request builder could be reused instead of forked.
+  CHECK_EQ((int)assoc[1], (int)SOCKS_UDP_ASSOCIATE);
+  CHECK_EQ((int)conn[1], (int)SOCKS_CONNECT);
+  CHECK(std::memcmp(assoc + 2, conn + 2, 8) == 0);
+
+  // A socket that DID bind says so: the relay is told the real address and
+  // port, in network order, so it can pin who may send to it.
+  const auto bound = make_v4(0x7F000001u, 40000);
+  std::memset(assoc, 0, sizeof(assoc));
+  CHECK_EQ(socks5_build_associate_from_sockaddr((const sockaddr *)&bound,
+                                                assoc),
+           10u);
+  CHECK_EQ((int)(uint8_t)assoc[4], 127);
+  CHECK_EQ((int)(uint8_t)assoc[7], 1);
+  CHECK_EQ((int)(uint8_t)assoc[8], 0x9C);  // 40000 = 0x9C40, big-endian
+  CHECK_EQ((int)(uint8_t)assoc[9], 0x40);
+
+  const auto v6 = make_v6(k2001db8_1_wire, 4433);
+  std::memset(assoc, 0, sizeof(assoc));
+  CHECK_EQ(
+      socks5_build_associate_from_sockaddr((const sockaddr *)&v6, assoc), 22u);
+  CHECK_EQ((int)assoc[3], (int)SOCKS_IPV6);
+}
+
+void an_ipv4_bnd_reply_becomes_a_usable_endpoint() {
+  auto p = make_loop_pair();
+  CHECK(p.app != INVALID_SOCKET);
+  const char reply[] = {0x05, 0x00, 0x00, 0x01,
+                        (char)203, 0,   113, 7,   0x1F, (char)0x90};
+  CHECK_EQ(::send(p.relay, reply, sizeof(reply), 0), (int)sizeof(reply));
+
+  char req[SOCKS_REQUEST_MAX_SIZE] = {};
+  const uint8_t dst[4] = {198, 51, 100, 9};
+  const size_t n = socks5_build_request(SOCKS_IPV4, dst, 80, req);
+
+  socks5_relay_endpoint bnd{};
+  CHECK_EQ(socks5_request_ex(p.app, req, n, &bnd), SOCKS_SUCCESS);
+  const uint8_t want[4] = {203, 0, 113, 7};
+  CHECK_EQ((int)bnd.atyp, (int)SOCKS_IPV4);
+  CHECK_EQ(bnd.addr_size, (size_t)4);
+  CHECK(std::memcmp(bnd.addr, want, 4) == 0);
+  CHECK_EQ((int)bnd.port_host_order, 8080);
+
+  // The part the pump needs: a sockaddr it can sendto() without re-encoding.
+  CHECK_EQ((int)bnd.bound.ss_family, AF_INET);
+  const auto *sa = (const sockaddr_in *)&bnd.bound;
+  CHECK_EQ((int)ntohl(sa->sin_addr.s_addr), (int)k203_0_113_7_host_order);
+  CHECK_EQ((int)ntohs(sa->sin_port), 8080);
+  close_loop_pair(p);
+}
+
+void an_ipv6_bnd_reply_is_decoded_wide_enough() {
+  auto p = make_loop_pair();
+  CHECK(p.app != INVALID_SOCKET);
+  char reply[22] = {};
+  reply[0] = 0x05;
+  reply[3] = 0x04;  // ATYP IPv6
+  std::memcpy(reply + 4, k2001db8_1_wire.data(), 16);
+  reply[20] = 0x1F;
+  reply[21] = 0x90;
+  CHECK_EQ(::send(p.relay, reply, sizeof(reply), 0), (int)sizeof(reply));
+
+  char req[SOCKS_REQUEST_MAX_SIZE] = {};
+  const uint8_t dst[4] = {198, 51, 100, 9};
+  const size_t n = socks5_build_request(SOCKS_IPV4, dst, 80, req);
+  socks5_relay_endpoint bnd{};
+  CHECK_EQ(socks5_request_ex(p.app, req, n, &bnd), SOCKS_SUCCESS);
+  CHECK_EQ((int)bnd.atyp, (int)SOCKS_IPV6);
+  CHECK_EQ(bnd.addr_size, (size_t)16);
+  CHECK(std::memcmp(bnd.addr, k2001db8_1_wire.data(), 16) == 0);
+  CHECK_EQ((int)bnd.bound.ss_family, AF_INET6);
+  close_loop_pair(p);
+}
+
+void a_domain_bnd_is_kept_raw_and_refused() {
+  const char reply[] = {0x05, 0x00, 0x00, 0x03, 11, 'e', 'x', 'a',
+                        'm',  'p',  'l',  'e',  '.', 'c', 'o', 'm',
+                        0x1F, (char)0x90};
+  auto p = make_loop_pair();
+  CHECK(p.app != INVALID_SOCKET);
+  CHECK_EQ(::send(p.relay, reply, sizeof(reply), 0), (int)sizeof(reply));
+
+  socks5_relay_endpoint bnd{};
+  uint8_t rep = 0xFF;
+  CHECK_EQ((int)socks5_read_reply(p.app, &rep, &bnd),
+           (int)socks5_reply::bnd_is_a_name);
+  CHECK_EQ((int)rep, 0);  // the relay granted it; the NAME is the problem
+  CHECK_EQ(bnd.name_size, (size_t)11);
+  CHECK(std::memcmp(bnd.name, "example.com", 11) == 0);
+  CHECK_EQ((int)bnd.name[11], 0);  // NUL-terminated, for the report
+  CHECK_EQ(bnd.addr_size, (size_t)0);
+  // Refused visibly: no half-resolved address is handed back.
+  CHECK_EQ((int)bnd.bound.ss_family, AF_UNSPEC);
+  close_loop_pair(p);
+
+  // The connect path is unchanged by any of this: a name it cannot use still
+  // answers the general failure it always answered.  What differs is that the
+  // octets are now read to their end instead of left in the stream.
+  auto q = make_loop_pair();
+  CHECK(q.app != INVALID_SOCKET);
+  CHECK_EQ(::send(q.relay, reply, sizeof(reply), 0), (int)sizeof(reply));
+  char req[SOCKS_REQUEST_MAX_SIZE] = {};
+  const uint8_t dst[4] = {198, 51, 100, 9};
+  const size_t n = socks5_build_request(SOCKS_IPV4, dst, 80, req);
+  CHECK_EQ(socks5_request_send(q.app, req, n), SOCKS_GENERAL_FAILURE);
+  CHECK_EQ(octets_waiting(q.app), 0);
+  close_loop_pair(q);
+}
+
+void two_octets_then_close_is_a_protocol_error() {
+  // The pin the reviews asked for: a reply that stops after two bytes.  The
+  // pre-refactor reader called recv() with NO MSG_WAITALL, took what came, and
+  // then judged buf[1] and buf[3] -- octets of its OWN request.  A CONNECT to
+  // 0.0.0.0:0 is {05 00 00 01 00 ...}, so buf[1] reads back as X'00'
+  // ("success") and buf[3] as X'01' ("IPv4"); the follow-up read on a closed
+  // socket returns 0, which is not SOCKET_ERROR.  That phantom tunnel is what
+  // these two bytes used to buy.
+  const char two[] = {0x05, 0x00};
+  CHECK_EQ((int)verdict_for(two, sizeof(two)),
+           (int)socks5_reply::protocol_error);
+
+  auto p = make_loop_pair();
+  CHECK(p.app != INVALID_SOCKET);
+  CHECK_EQ(::send(p.relay, two, 2, 0), 2);
+  ::closesocket(p.relay);
+  p.relay = INVALID_SOCKET;
+  char req[SOCKS_REQUEST_MAX_SIZE] = {};
+  const uint8_t dst[4] = {0, 0, 0, 0};
+  const size_t n = socks5_build_request(SOCKS_IPV4, dst, 0, req);
+  socks5_relay_endpoint bnd{};
+  CHECK_EQ(socks5_request_ex(p.app, req, n, &bnd), SOCKS_GENERAL_FAILURE);
+  CHECK_EQ((int)bnd.atyp, 0);  // nothing decoded, nothing invented
+  CHECK_EQ(bnd.addr_size, (size_t)0);
+  close_loop_pair(p);
+
+  // An immediate close -- not even two bytes -- is the same verdict.
+  CHECK_EQ((int)verdict_for(nullptr, 0), (int)socks5_reply::protocol_error);
+}
+
+void a_reply_cut_inside_its_address_is_truncated() {
+  // Four legal octets promising an IPv4 BND, then only three of the six.  The
+  // old code tested this read against SOCKET_ERROR alone, so three was a fine
+  // tunnel; the pump would have sent datagrams to a half-arrived address.
+  const char cut[] = {0x05, 0x00, 0x00, 0x01, (char)203, 0, 113};
+  CHECK_EQ((int)verdict_for(cut, sizeof(cut)), (int)socks5_reply::truncated);
+
+  // The same for the wide form: 4 + 15 of 18.
+  char wide[19] = {};
+  wide[0] = 0x05;
+  wide[3] = 0x04;
+  std::memcpy(wide + 4, k2001db8_1_wire.data(), 15);
+  CHECK_EQ((int)verdict_for(wide, sizeof(wide)), (int)socks5_reply::truncated);
+
+  // And for a name: the LEN promises 11, the reply carries 5 and a port.
+  const char short_name[] = {0x05, 0x00, 0x00, 0x03, 11,
+                             'e',  'x',  'a',  'm',  'p', 0x1F, (char)0x90};
+  CHECK_EQ((int)verdict_for(short_name, sizeof(short_name)),
+           (int)socks5_reply::truncated);
+}
+
+void a_refusal_reports_its_rep_and_reads_no_further() {
+  // {VER, REP=X'02' (network unreachable), RSV, ATYP} then the zeros a server
+  // pads with.  The refusal is answered without waiting for that padding: a
+  // server that closes instead of padding must not be able to hang us.
+  const char refused[] = {0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0x1F, (char)0x90};
+  auto p = make_loop_pair();
+  CHECK(p.app != INVALID_SOCKET);
+  CHECK_EQ(::send(p.relay, refused, sizeof(refused), 0), (int)sizeof(refused));
+
+  socks5_relay_endpoint bnd{};
+  uint8_t rep = 0xFF;
+  CHECK_EQ((int)socks5_read_reply(p.app, &rep, &bnd),
+           (int)socks5_reply::refused_rep);
+  CHECK_EQ((int)rep, 2);
+  CHECK_EQ(octets_waiting(p.app), 6);  // the padding is still in the stream
+  close_loop_pair(p);
+
+  // The char shape the hooks use reports the same REP octet.
+  auto q = make_loop_pair();
+  CHECK(q.app != INVALID_SOCKET);
+  CHECK_EQ(::send(q.relay, refused, sizeof(refused), 0), (int)sizeof(refused));
+  char req[SOCKS_REQUEST_MAX_SIZE] = {};
+  const uint8_t dst[4] = {198, 51, 100, 9};
+  const size_t n = socks5_build_request(SOCKS_IPV4, dst, 80, req);
+  CHECK_EQ(socks5_request_send(q.app, req, n), 2);
+  close_loop_pair(q);
+}
+
+void an_unparseable_reply_is_a_protocol_error_not_a_relay() {
+  const char wrong_version[] = {0x04, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
+  CHECK_EQ((int)verdict_for(wrong_version, sizeof(wrong_version)),
+           (int)socks5_reply::protocol_error);
+
+  const char unknown_atyp[] = {0x05, 0x00, 0x00, 0x77, 0, 0, 0, 0, 0, 0};
+  CHECK_EQ((int)verdict_for(unknown_atyp, sizeof(unknown_atyp)),
+           (int)socks5_reply::protocol_error);
+
+  const char empty_name[] = {0x05, 0x00, 0x00, 0x03, 0x00, 0x1F, (char)0x90};
+  CHECK_EQ((int)verdict_for(empty_name, sizeof(empty_name)),
+           (int)socks5_reply::protocol_error);
+}
+
+void associate_runs_the_whole_exchange_on_one_socket() {
+  // No credentials: greeting, ASSOCIATE with the zeros hint (the caller does
+  // not know its port yet), and the relay's endpoint back.
+  auto p = make_loop_pair();
+  CHECK(p.app != INVALID_SOCKET);
+  const char park[] = {0x05, 0x00,                      // greeting: method 0
+                       0x05, 0x00, 0x00, 0x01,          // granted
+                       (char)203, 0, 113, 7, 0x1F, (char)0x90};  // BND, port 8080
+  CHECK_EQ(::send(p.relay, park, sizeof(park), 0), (int)sizeof(park));
+
+  const sockaddr unspec_hint{};  // AF_UNSPEC: "the relay picks"
+  socks5_relay_endpoint bnd{};
+  uint8_t rep = 0xFF;
+  CHECK_EQ((int)socks5_associate(p.app, socks5_credentials{}, unspec_hint, bnd,
+                                &rep),
+           (int)socks5_reply::ok);
+  CHECK_EQ((int)rep, 0);
+  CHECK_EQ((int)bnd.bound.ss_family, AF_INET);
+  CHECK_EQ((int)bnd.port_host_order, 8080);
+
+  char greeting[3] = {};
+  CHECK_EQ(recv_all(p.relay, greeting, 3), (size_t)3);
+  CHECK_BYTES(greeting, 3, kGreetingNoAuth);
+  char request[10] = {};
+  CHECK_EQ(recv_all(p.relay, request, 10), (size_t)10);
+  CHECK_BYTES(request, 10, kUdpAssociateAny);  // the hint fell back to zeros
+  close_loop_pair(p);
+
+  // With credentials, the login is written before a single relay is asked for.
+  const socks5_credentials creds{"alice", "s3cr3t!"};
+  auto q = make_loop_pair();
+  CHECK(q.app != INVALID_SOCKET);
+  const char park2[] = {0x05, 0x02,                              // method 2
+                        0x01, 0x00,                              // login ok
+                        0x05, 0x00, 0x00, 0x01,                  // granted
+                        (char)203, 0, 113, 7, 0x27, 0x0F};       // BND 9999
+  CHECK_EQ(::send(q.relay, park2, sizeof(park2), 0), (int)sizeof(park2));
+
+  const auto hint = make_v4(0x7F000001u, 40000);
+  socks5_relay_endpoint got{};
+  CHECK_EQ((int)socks5_associate(q.app, creds, (const sockaddr &)hint, got,
+                                &rep),
+           (int)socks5_reply::ok);
+  CHECK_EQ((int)got.port_host_order, 9999);
+  char offered[4] = {};
+  CHECK_EQ(recv_all(q.relay, offered, 4), (size_t)4);
+  CHECK_BYTES(offered, 4, kGreetingUserpassFirst);
+  char auth[15] = {};  // VER + ULEN + alice + PLEN + s3cr3t!
+  CHECK_EQ(recv_all(q.relay, auth, sizeof(auth)), sizeof(auth));
+  CHECK_EQ((int)(uint8_t)auth[0], 1);  // RFC 1929 VER
+  CHECK_EQ((int)(uint8_t)auth[1], 5);  // ULEN
+  CHECK(std::memcmp(auth + 2, "alice", 5) == 0);
+  CHECK_EQ((int)(uint8_t)auth[7], 7);  // PLEN -- "s3cr3t!" is seven octets
+  CHECK(std::memcmp(auth + 8, "s3cr3t!", 7) == 0);
+  char assoc_req[10] = {};
+  CHECK_EQ(recv_all(q.relay, assoc_req, 10), (size_t)10);
+  CHECK_EQ((int)assoc_req[1], (int)SOCKS_UDP_ASSOCIATE);
+  CHECK_EQ((int)(uint8_t)assoc_req[8], 0x9C);  // the bound hint, spelled out
+  close_loop_pair(q);
+}
+
+void a_refused_login_never_asks_for_a_relay() {
+  const socks5_credentials bad{"alice", "nope"};
+  auto p = make_loop_pair();
+  CHECK(p.app != INVALID_SOCKET);
+  const char park[] = {0x05, 0x02,        // "use username/password"
+                       0x01, (char)0xFF};  // ... and that login is wrong
+  CHECK_EQ(::send(p.relay, park, sizeof(park), 0), (int)sizeof(park));
+
+  const auto hint = make_v4(0x7F000001u, 40000);
+  socks5_relay_endpoint bnd{};
+  uint8_t rep = 0xFF;
+  CHECK_EQ((int)socks5_associate(p.app, bad, (const sockaddr &)hint, bnd, &rep),
+           (int)socks5_reply::refused_rep);
+  // What the relay saw is a greeting and a login -- and no ASSOCIATE.  The
+  // refused path may not spend a relay request on a socket it cannot use.
+  char seen[64] = {};
+  const int have = ::recv(p.relay, seen, (int)sizeof(seen), 0);
+  CHECK(have >= 4);
+  bool asked_for_a_relay = false;
+  for (int i = 0; i + 1 < have; ++i) {
+    if (seen[i] == 5 && seen[i + 1] == 3) {
+      asked_for_a_relay = true;
+    }
+  }
+  CHECK(!asked_for_a_relay);
+  CHECK_EQ((int)bnd.atyp, 0);  // and no endpoint was pretended
+  close_loop_pair(p);
+}
+
+
+
+// --------------------------------------------- the delegate chain, on the wire
+//
+// The connect() hooks now reach the socket layer through socks5_request_ex.
+// What matters to them is that nothing else changed: the same ten octets go
+// out, the same REP comes back -- and a reply that is not a reply can no longer
+// be read out of the request buffer's leftovers, which the pre-P7 code did.
+// Each case parks its canned answer first, then witnesses what left the app
+// side, so the wire is asserted rather than assumed.
+
+void connect_from_sockaddr_puts_the_pinned_bytes_on_the_wire() {
+  auto p = make_loop_pair();
+  CHECK(p.app != INVALID_SOCKET);
+  const bytes ok_reply = reply_v4(SOCKS_SUCCESS, 0, 0);
+  CHECK_EQ(park(p.relay, ok_reply), ok_reply.size());
+
+  const auto sa = make_v4(k203_0_113_7_host_order, 8080);
+  CHECK_EQ(socks5_request(p.app, as_sockaddr(&sa)), SOCKS_SUCCESS);
+  char seen[10] = {};
+  CHECK_EQ(recv_all(p.relay, seen, sizeof(seen)), sizeof(seen));
+  CHECK_BYTES(seen, sizeof(seen), kRequestV4);
+  close_loop_pair(p);
+}
+
+void connect_from_ip_addr_puts_the_same_bytes_on_the_wire() {
+  auto p = make_loop_pair();
+  CHECK(p.app != INVALID_SOCKET);
+  const bytes ok_reply = reply_v4(SOCKS_SUCCESS, 0, 0);
+  CHECK_EQ(park(p.relay, ok_reply), ok_reply.size());
+
+  const IpAddr msg = from_asio(ip::make_address("203.0.113.7"), 8080);
+  CHECK_EQ(socks5_request(p.app, msg), SOCKS_SUCCESS);
+  char seen[10] = {};
+  CHECK_EQ(recv_all(p.relay, seen, sizeof(seen)), sizeof(seen));
+  CHECK_BYTES(seen, sizeof(seen), kRequestV4);  // byte for byte with sockaddr
+  close_loop_pair(p);
+}
+
+void request_ex_keeps_the_relay_endpoint_the_delegates_throw_away() {
+  // 203.0.113.7:8080 as the ANSWER this time: the same decode the associate
+  // path uses, on a CONNECT, handed to the caller that asked for it.
+  auto p = make_loop_pair();
+  CHECK(p.app != INVALID_SOCKET);
+  const bytes granted = reply_v4(SOCKS_SUCCESS, k203_0_113_7_host_order, 8080);
+  CHECK_EQ(park(p.relay, granted), granted.size());
+
+  const uint8_t octets[] = {203, 0, 113, 7};
+  char buf[SOCKS_REQUEST_MAX_SIZE] = {};
+  const size_t n = socks5_build_request(SOCKS_IPV4, octets, 8080, buf);
+  CHECK_EQ(n, 10u);
+
+  socks5_relay_endpoint bnd{};
+  CHECK_EQ(socks5_request_ex(p.app, buf, n, &bnd), SOCKS_SUCCESS);
+  CHECK_EQ((int)bnd.atyp, (int)SOCKS_IPV4);
+  CHECK_EQ((int)bnd.addr_size, 4);
+  CHECK_EQ((int)bnd.port_host_order, 8080);
+  CHECK_EQ((int)bnd.bound.ss_family, AF_INET);
+  const auto *v4 = (const sockaddr_in *)&bnd.bound;
+  CHECK_EQ(v4->sin_addr.s_addr, htonl(k203_0_113_7_host_order));
+  CHECK_EQ(v4->sin_port, htons(8080));
+  close_loop_pair(p);
+}
+
+void a_cut_reply_fails_the_hook_instead_of_passing_as_a_tunnel() {
+  // The regression, spelled out at the level the hooks use: a whole header,
+  // then three of the six octets its ATYP=1 promised.  Before P7 that read as
+  // SOCKS_SUCCESS with a half-garbage buffer; it must now be a general failure.
+  auto p = make_loop_pair();
+  CHECK(p.app != INVALID_SOCKET);
+  const char cut[] = {0x05, 0x00, 0x00, 0x01, 0x7F, 0x00, 0x00};
+  CHECK_EQ(::send(p.relay, cut, sizeof(cut), 0), (int)sizeof(cut));
+  ::shutdown(p.relay, SD_SEND);  // the three missing octets arrive as an EOF
+
+  const auto sa = make_v4(k203_0_113_7_host_order, 8080);
+  CHECK_EQ(socks5_request(p.app, as_sockaddr(&sa)), SOCKS_GENERAL_FAILURE);
+  close_loop_pair(p);
+}
+
+void a_named_bnd_is_drained_so_the_stream_stays_aligned() {
+  // The framing property the stale-bytes review is really about: a reply the
+  // module will not act on was still read to its end, so the NEXT request on
+  // the same socket gets its own answer.  (A refusal is the documented
+  // opposite -- it kills the control socket, so nothing follows it.)
+  auto p = make_loop_pair();
+  CHECK(p.app != INVALID_SOCKET);
+  const bytes named = reply_domain(SOCKS_SUCCESS, "relay.example.com", 1080);
+  const bytes then = reply_v4(SOCKS_SUCCESS, k203_0_113_7_host_order, 41080);
+  CHECK_EQ(park(p.relay, named), named.size());
+  CHECK_EQ(park(p.relay, then), then.size());
+
+  const uint8_t octets[] = {203, 0, 113, 7};
+  char buf[SOCKS_REQUEST_MAX_SIZE] = {};
+  const size_t n = socks5_build_request(SOCKS_IPV4, octets, 8080, buf);
+
+  socks5_relay_endpoint bnd{};
+  CHECK_EQ(socks5_request_ex(p.app, buf, n, &bnd), SOCKS_GENERAL_FAILURE);
+  CHECK_EQ((int)bnd.atyp, (int)SOCKS_DOMAINNAME);
+  CHECK(std::strcmp(bnd.name, "relay.example.com") == 0);
+
+  bnd = socks5_relay_endpoint{};
+  CHECK_EQ(socks5_request_ex(p.app, buf, n, &bnd), SOCKS_SUCCESS);
+  CHECK_EQ((int)bnd.atyp, (int)SOCKS_IPV4);
+  CHECK_EQ((int)bnd.port_host_order, 41080);
+  close_loop_pair(p);
+}
+
 // ------------------------------------------------------------------- output
 
 void print_pinned_vectors() {
@@ -830,6 +1373,21 @@ int main() {
   RUN(build_udp_header_rejects_bad_input);
   RUN(parse_udp_header_round_trips_every_form);
   RUN(parse_udp_header_rejects_hostile_bytes);
+  RUN(connect_from_sockaddr_puts_the_pinned_bytes_on_the_wire);
+  RUN(connect_from_ip_addr_puts_the_same_bytes_on_the_wire);
+  RUN(request_ex_keeps_the_relay_endpoint_the_delegates_throw_away);
+  RUN(a_cut_reply_fails_the_hook_instead_of_passing_as_a_tunnel);
+  RUN(a_named_bnd_is_drained_so_the_stream_stays_aligned);
+  RUN(associate_request_differs_from_connect_only_in_cmd);
+  RUN(an_ipv4_bnd_reply_becomes_a_usable_endpoint);
+  RUN(an_ipv6_bnd_reply_is_decoded_wide_enough);
+  RUN(a_domain_bnd_is_kept_raw_and_refused);
+  RUN(two_octets_then_close_is_a_protocol_error);
+  RUN(a_reply_cut_inside_its_address_is_truncated);
+  RUN(a_refusal_reports_its_rep_and_reads_no_further);
+  RUN(an_unparseable_reply_is_a_protocol_error_not_a_relay);
+  RUN(associate_runs_the_whole_exchange_on_one_socket);
+  RUN(a_refused_login_never_asks_for_a_relay);
 
   print_pinned_vectors();
 
