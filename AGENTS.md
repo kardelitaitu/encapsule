@@ -228,11 +228,12 @@ Re-index: `mcp cbm index_repository(repo_path="C:\dev\encapsule", mode="moderate
 
 ## 6. Conventions (observed in src/)
 
-- 2-space indent, no tabs in `src/`; ~80-column style, held by hand — there is **no**
-  `.clang-format` at the repo root (only inside vendored deps under the build trees), so
-  no formatter enforces it — re-measured on the current
-  tree, exactly **1** line of `src/` runs past 80 columns (`injector.hpp:191`, 82 chars); the
-  longest line in `injector_gui.hpp` and `fakeip.hpp` is 80. `CMakeLists.txt`/`build.ps1` use tabs.
+- 2-space indent, no tabs in `src/`; ~80-column style, held by hand — there is
+  **no** `.clang-format` at the repo root (the only ones live inside vendored
+  deps under the build trees), so nothing enforces the column.
+  Re-measured on the current tree, exactly **1** line of `src/` runs past 80
+  columns (`injector.hpp:191`, 82 chars); the longest line in `injector_gui.hpp`
+  and `fakeip.hpp` is 80. `CMakeLists.txt`/`build.ps1` use tabs.
 - Includes: `"quoted"` for same-package headers, `<angle>` for stdlib, third-party and `src/common`
   (on the include path, so `<utils.hpp>` and `"utils.hpp"` both appear).
 - Header guards `ENCAPSULE_<PKG>_<NAME>` — all **19** `.hpp` headers under `src/` (now including
