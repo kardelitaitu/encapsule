@@ -316,6 +316,27 @@ Also read before changing things (ROADMAP §2): the exact detour signatures
 surprising IPv6 byte order in `src/injectee/winnet.hpp`, and the IPC mapping
 contract below.
 
+### Witnessing a direct leak — `tests/e2e`
+
+- **The in-repo relay is the wrong witness for a leak.** `handle_session` in
+  `socks5_test_server.hpp` reads the two-byte greeting and returns as soon as
+  its version byte is not SOCKS 5 — before any record is written — and the
+  relay counts nothing but `requests()`, `auth_records()` and `datagrams()`.
+  A plain connect straight to the proxy port is invisible, so the relay proves
+  what the capsule sent *through* the proxy and never what got around it.
+- **TEST-NET-3 dials have nowhere to leak to.** The targets are `203.0.113.7`
+  (`injection_case`, `e2e_test.cpp`), documentation space and unroutable on
+  purpose, so a connect that escapes the capsule reaches no observable peer.
+- **Loopback is exempt from routing by policy.** Every detour gates on
+  `is_inet(name) && bound && !is_localhost(name)` (`hook.hpp`, symbols only),
+  so a witness listener on `127.0.0.1` cannot show a non-leak: that address is
+  left alone whether or not the capsule works.
+- **So bind a non-loopback interface and count the accepts yourself, and
+  assert ordering plus a hard zero** — the first relay record is the first dial
+  target, and direct accepts are exactly zero. A `count >= N` assertion is not
+  a leak proof: a child that leaked first and behaved afterwards satisfies it.
+
+
 ### The IPC mapping: name, payload and DACL
 
 - The mapping name is `ENCAPSULE_PORT_IPC_<pid>` (`src/common/utils.hpp:300-304`).
