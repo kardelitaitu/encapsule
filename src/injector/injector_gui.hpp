@@ -24,6 +24,7 @@
 #include "utils.hpp"
 #include "version.hpp"
 #include <elements.hpp>
+#include <optional>
 #include <sstream>
 
 namespace ce = cycfi::elements;
@@ -236,15 +237,31 @@ auto make_controls(injector_server &server, ce::view &view,
 
   auto [addr_input, addr_input_ptr] = input_box("IP address");
   auto [port_input, port_input_ptr] = input_box("port");
+  auto [user_input, user_input_ptr] = input_box("username");
+  auto [pass_input, pass_input_ptr] = input_box("password");
 
   auto proxy_toggle = share(toggle_icon_button(icons::power, 1.2, brblue));
   proxy_toggle->on_click = [&server, proxy_toggle, addr_input_ptr,
-                            port_input_ptr](bool on) {
+                            port_input_ptr, user_input_ptr,
+                            pass_input_ptr](bool on) {
     if (on) {
       auto addr = trim_copy(addr_input_ptr->get_text());
       auto port = trim_copy(port_input_ptr->get_text());
       if (all_of_digit(port) && !addr.empty() && !port.empty()) {
         server.set_proxy(ip::address::from_string(addr), std::stoul(port));
+
+        // Credentials follow the same apply path as the address. A password
+        // without a username is ignored, matching the CLI; an empty field
+        // means "unset", never an empty string.
+        auto user = trim_copy(user_input_ptr->get_text());
+        auto pass = trim_copy(pass_input_ptr->get_text());
+        if (user.empty()) {
+          server.clear_proxy_credentials();
+        } else if (pass.empty()) {
+          server.set_proxy_credentials(std::move(user), std::nullopt);
+        } else {
+          server.set_proxy_credentials(std::move(user), std::move(pass));
+        }
       } else {
         proxy_toggle->value(false);
       }
@@ -297,6 +314,12 @@ auto make_controls(injector_server &server, ce::view &view,
                 htile(
                   hmin_size(100, addr_input),
                   left_margin(5, hsize(100, port_input)),
+                  left_margin(5, hmin_size(100, user_input)),
+                  left_margin(5, make_tip_below_r(hmin_size(100, pass_input),
+                    "proxy password - NOT masked (elements has no"
+                    " password box): it stays visible on screen,"
+                    " beware of shoulder-surfing; credentials are"
+                    " held in memory only, never logged")),
                   left_margin(10, make_tip_below_r(hold(proxy_toggle), "enable/disable proxy injection")),
                   left_margin(5, make_tip_below_r(log_toggle, "enable/disable connection log")),
                   left_margin(5, make_tip_below_r(subprocess_toggle, "enable/disable subprocess injection")),
