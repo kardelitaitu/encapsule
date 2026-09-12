@@ -68,6 +68,30 @@ port_mapping_payload get_ipc_payload_waiting() {
   return {};
 }
 
+// The report queue's token bound: how many completions its channel buffers
+// before a send has to wait for a receiver.  queue.hpp calls this knob "max",
+// and says plainly that it is not a bound on what the queue holds.
+inline constexpr std::size_t kReportQueueTokens = 1024;
+
+// The report queue needs a real item bound too (M5).  This DLL stays resident
+// in somebody else's process for as long as they live, the hooks push one
+// report per connect, and once the client gives up (client.hpp give_up())
+// nothing pops any more -- so an unbounded queue charged the victim for every
+// connection the injector stopped listening to.  Overflow drops the OLDEST
+// report and counts it in drops(); a dropped report is a lost log line, never
+// a lost packet, because nothing on this path carries data.
+//
+// The cap is the token bound itself, and that is the reason rather than a
+// coincidence: push() posts one token per accepted item, and the channel
+// buffers only "max" of them, so every item above the token bound is one
+// detached async_send parked forever once this io_context stops running --
+// the stranded-send half of what M5 exists to close.  M5's review proposed
+// 4096, a reasonable log depth, and it is not taken here for that reason
+// alone: going to 4096 reports means going to 4096 tokens, so the cap is
+// defined from kReportQueueTokens above rather than written out twice -- one
+// edit, both knobs, no chance for them to disagree.
+inline constexpr std::size_t kReportQueueCap = kReportQueueTokens;
+
 void do_client(HINSTANCE dll_handle, port_mapping_payload ipc) {
   // C2: nothing in this file ever unmaps the module, and this is where it
   // used to happen.  By the time this thread runs, DllMain has already
@@ -108,8 +132,8 @@ void do_client(HINSTANCE dll_handle, port_mapping_payload ipc) {
   {
     asio::io_context io_context(1);
 
-    auto qu =
-        std::make_unique<blocking_queue<InjecteeMessage>>(io_context, 1024);
+    auto qu = std::make_unique<blocking_queue<InjecteeMessage>>(
+        io_context, kReportQueueTokens, kReportQueueCap);
     auto cfg = std::make_unique<injectee_config>();
     auto sock_map = std::make_unique<std::map<SOCKET, bool>>();
 
