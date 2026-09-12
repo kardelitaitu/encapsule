@@ -142,8 +142,10 @@ UI data-race fixes (`view.post`).
       41369fd reverse-order hook unroll + DllMain never live half-initialized + WSA refcount guard.)
 
 ### P5 — Feature: proxy username + password (owner-approved; RFC 1929)
-- [ ] Extend `InjectorConfig` (`src/common/schema.hpp`) with credential fields; both
-      sides move together to keep the protopuf wire format compatible.
+- [x] Extend `InjectorConfig` (`src/common/schema.hpp`) with credential fields; both
+      sides move together to keep the protopuf wire format compatible. (e7ff326:
+      username=4/password=5 optional+separate; credential-free config pinned
+      byte-identical to pre-P5 wire; report messages pinned credential-free.)
 - [ ] Injectee: offer methods `{5, 2, 0}` (no-auth + userpass) instead of the
       hardcoded `{5,1,0}` in `src/injectee/socks5.hpp`.
 - [ ] Injectee: implement the RFC 1929 user/pass subnegotiation and apply configured
