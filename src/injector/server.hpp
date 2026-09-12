@@ -20,10 +20,13 @@
 #include "injector.hpp"
 #include "schema.hpp"
 #include <asio.hpp>
+#include <atomic>
 #include <cstdio>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <vector>
 
 using tcp = asio::ip::tcp;
 
@@ -37,8 +40,96 @@ struct injectee_client {
 
 using injectee_client_ptr = std::shared_ptr<injectee_client>;
 
-struct injector_server {
+// The pid -> session table, with its own lock inside it.
+//
+// C1: this map really is touched from two threads at once.  Sessions register
+// and unregister on the io_context thread - injectee_session::process() calls
+// open() and injectee_session::stop() calls remove() - while the front end
+// reads the very same map from its own thread: the CLI runs io_context::run()
+// on a jthread in do_inject() and then calls enable_log()/set_proxy()/inject()
+// from main, and the GUI detaches do_server() on a thread of its own while the
+// elements app thread calls inject()/close()/set_proxy()/enable_log() out of
+// the button and toggle handlers.  An emplace or erase that rebalances
+// the red-black tree underneath an in-flight broadcast_config() loop is
+// undefined behavior; in a Release build it is a wild pointer, in a debug
+// iterator build it is a "map/set iterator not incrementable" abort.
+//
+// A lock was chosen over "post every mutation to the io executor" because
+// inject() has to answer "is this pid already injected?" synchronously on the
+// caller's thread, and it is also called *from* the io_context thread, by
+// process()'s subprocess enumeration and its subpid reply - a post-and-wait
+// there self-deadlocks.  The
+// io_context also is not a member of injector_server, so it could not be
+// posted to from here at all.
+//
+// The mutex lives in the table rather than next to it on purpose: `clients`
+// has to stay reachable as a public member - injectee_session_cli::
+// process_close() reads server_.clients.size() to decide whether any client is
+// left - and a lock that sits beside a public map is a lock that public code
+// can
+// walk past.  Every operation here is short, non-blocking and returns a copy
+// (a bool, a size, or a shared_ptr), so no caller can hold the lock while it
+// calls into asio, and nothing here co_awaits at all.
+//
+// Lock order: config_mutex -> this lock, never the reverse.  Every config_*()
+// setter on injector_server holds config_mutex and then walks the table (via
+// broadcast_config()), so this lock is by design the inner one; nothing that
+// holds it ever touches config_ or config_mutex, which keeps the reverse edge
+// out of the file.
+class injector_clients {
+public:
+  // Registers a session; false when the pid is already in (the old emplace
+  // contract, kept because open()'s result decides stop()'s unhook path).
+  bool insert(DWORD pid, injectee_client_ptr ptr) {
+    std::lock_guard guard(mtx);
+    return clients.emplace(pid, std::move(ptr)).second;
+  }
+
+  bool contains(DWORD pid) const {
+    std::lock_guard guard(mtx);
+    return clients.contains(pid);
+  }
+
+  // A copy of one entry, or null.  The caller uses the pointer after the lock
+  // is gone - close() must not call stop() under it, because stop() comes
+  // straight back into erase().
+  injectee_client_ptr find(DWORD pid) const {
+    std::lock_guard guard(mtx);
+    if (auto iter = clients.find(pid); iter != clients.end()) {
+      return iter->second;
+    }
+    return nullptr;
+  }
+
+  bool erase(DWORD pid) {
+    std::lock_guard guard(mtx);
+    return clients.erase(pid) != 0;
+  }
+
+  // The snapshot broadcast_config() sends to: shared_ptr copies taken under
+  // the lock, co_spawn done outside it.
+  std::vector<injectee_client_ptr> snapshot() const {
+    std::vector<injectee_client_ptr> out;
+    std::lock_guard guard(mtx);
+    out.reserve(clients.size());
+    for (const auto &[_, client] : clients) {
+      out.push_back(client);
+    }
+    return out;
+  }
+
+  std::size_t size() const {
+    std::lock_guard guard(mtx);
+    return clients.size();
+  }
+
+private:
+  mutable std::mutex mtx;
   std::map<DWORD, injectee_client_ptr> clients;
+};
+
+struct injector_server {
+  injector_clients clients;
   InjectorConfig config_;
   std::mutex config_mutex;
 
@@ -46,6 +137,13 @@ struct injector_server {
 
   void set_port(std::uint16_t port) { port_ = port; }
 
+  // Note the check and the injection are not one atomic step: two threads
+  // that race to inject the same pid can both get past contains().  That is
+  // pre-existing and deliberate - the callers are a user clicking a button or
+  // a wildcard sweep over a snapshot of the process list, and closing the
+  // window would mean holding this lock across VirtualAllocEx/
+  // CreateRemoteThread, i.e. into the kernel, which is exactly what the lock
+  // discipline above forbids.
   bool inject(DWORD pid) {
     if (port_ == -1) {
       return false;
@@ -58,14 +156,19 @@ struct injector_server {
   }
 
   bool open(DWORD pid, injectee_client_ptr ptr) {
-    return clients.emplace(pid, ptr).second;
+    return clients.insert(pid, std::move(ptr));
   }
 
+  // Called with config_mutex held (every config_*() setter does), which is why
+  // the order is config_mutex -> clients' lock.  The config is copied once and
+  // the sessions are copied out as a snapshot, so the table's lock is already
+  // dropped by the time asio is entered.
   void broadcast_config() {
-    for (const auto &[_, client] : clients) {
+    InjectorConfig cfg = config_;
+    for (const injectee_client_ptr &client : clients.snapshot()) {
       asio::co_spawn(
           client->get_context(),
-          [cfg = config_, client] { return client->config(cfg); },
+          [cfg, client] { return client->config(cfg); },
           asio::detached);
     }
   }
@@ -144,21 +247,19 @@ struct injector_server {
     // The injection is over, so its token is no longer worth keeping.
     injector::forget_token(pid);
 
-    if (auto iter = clients.find(pid); iter != clients.end()) {
-      clients.erase(iter);
-      return true;
-    }
-
-    return false;
+    return clients.erase(pid);
   }
 
   bool close(DWORD pid) {
-    if (auto iter = clients.find(pid); iter != clients.end()) {
-      iter->second->stop();
-      return true;
+    injectee_client_ptr client = clients.find(pid);
+    if (!client) {
+      return false;
     }
 
-    return false;
+    // Unlocked: stop() closes the socket and re-enters the table through
+    // remove(), so doing it under the table's lock would be a self-deadlock.
+    client->stop();
+    return true;
   }
 };
 
@@ -168,7 +269,13 @@ struct injectee_session : injectee_client,
   asio::steady_timer timer_;
   injector_server &server_;
   DWORD pid_;
-  bool opened_ = false; // registered with the server, so it owns a client
+  // Registered with the server, so it owns a client and owes an unhook.
+  // Atomic because stop() runs on whichever thread noticed the loss: the
+  // io_context thread (reader() failing, process() refusing the token) or,
+  // since C1, the front-end thread that called close().  Release/acquire on
+  // the one thread that wins the exchange is also what makes pid_ visible to
+  // it, so exactly one thread runs the teardown once.
+  std::atomic<bool> opened_ = false;
 
   injectee_session(tcp::socket socket, injector_server &server)
       : socket_(std::move(socket)), timer_(socket_.get_executor()),
@@ -250,12 +357,14 @@ struct injectee_session : injectee_client,
     // A session that was never registered - typically one refused above -
     // has nothing to unhook, and must not reach process_close(): that hook
     // ends the whole injector once its last client is gone, so an
-    // unverified connection could otherwise switch the tool off.
-    if (!opened_) {
+    // unverified connection could otherwise switch the tool off.  The
+    // exchange covers the second case too, a close() from the front end
+    // racing the reader() of the same session: only the winner removes and
+    // only the winner runs the hook.
+    if (!opened_.exchange(false)) {
       return;
     }
 
-    opened_ = false;
     server_.remove(pid_);
     process_close();
   }
