@@ -53,9 +53,9 @@ Script parameters (`build.ps1`):
 
 | File | Purpose |
 |---|---|
-| `encapsule.exe` | GUI front end (target `encapsule`, `CMakeLists.txt:123`). |
-| `encapsule-cli.exe` | CLI front end (target `encapsule-cli`, `CMakeLists.txt:141`). |
-| `encapsule-injectee.dll` | 64-bit injectee (target `encapsule-injectee`, `CMakeLists.txt:110`), loaded into 64-bit target processes. |
+| `encapsule.exe` | GUI front end (target `encapsule`, declared by `include(ElementsConfigApp)`, `CMakeLists.txt:118-130`). |
+| `encapsule-cli.exe` | CLI front end (target `encapsule-cli`, `CMakeLists.txt:136-139`). |
+| `encapsule-injectee.dll` | 64-bit injectee (target `encapsule-injectee`, `CMakeLists.txt:105-108`), loaded into 64-bit target processes. |
 | `encapsule-injectee32.dll` | 32-bit injectee — the Win32 pass's DLL renamed by `build.ps1:41`, for 32-bit/WoW64 targets. |
 | `wow64-address-dumper.exe` | Win32 helper (name unchanged) that reports the 32-bit `LoadLibraryW` address as its **process exit code** — the WoW64 pivot used by the 64-bit injector. |
 | `resources/`, `LICENSE` | App assets and license, staged for packaging. |
@@ -77,10 +77,10 @@ Optional installer (see `setup.nsi`):
 makensis /DVERSION=$(git describe --tags) setup.nsi
 ```
 
-> ⚠️ Packaging straggler: `setup.nsi:10-11` still defines the pre-rebrand
-> product name and the old GUI exe name, so the installer currently points at
-> a binary this build no longer produces. Tracked as a ROADMAP P3 packaging
-> item; fix it before shipping an installer.
+> The old packaging straggler is gone: `setup.nsi:10-11` now define
+> `NAME "encapsule"` / `APPFILE "encapsule.exe"`, i.e. exactly what `build.ps1`
+> puts in `./release`, and the script installs `release\*.*` (:56) as
+> `encapsuleSetup.exe` (:18).
 
 CI (`.github/workflows/build.yml`) runs the same script on `windows-2022`
 with a `{Debug, Release} × {Win32, x64}` matrix, then a blocking `ctest` step
@@ -160,6 +160,8 @@ to confirm that redirection actually happened:
 ```powershell
 # smoke test against a local socks5 server
 ./release/encapsule-cli.exe -p 127.0.0.1:1080 -i <pid> -l
+# same, on a proxy that demands an RFC 1929 login
+./release/encapsule-cli.exe -p user:pass@127.0.0.1:1080 -i <pid> -l
 ```
 
 If a connection is *not* logged: hooks only act on AF_INET non-localhost
@@ -167,6 +169,33 @@ destinations, and only after the injectee has received its config from the
 injector. `connect`, `WSAConnect`, `WSAConnectByList`, `ConnectEx` and the
 async-select paths are hooked separately — the log line names which hook
 fired.
+
+### socks5 authentication (RFC 1929)
+
+Both front ends take an optional proxy login: the CLI inside `-p`
+(`[user[:pass]@]host:port`, e.g. `user:pass@127.0.0.1:1080`), the GUI as
+separate username/password boxes. `parse_proxy_url` (`src/common/utils.hpp`)
+— shared and pure — splits the userinfo at the LAST `@` and the password at
+the FIRST `:` after it, so a password containing `@` or `:` needs no
+escaping; an IPv6 host must arrive bracketed (`[2001:db8::1]:1080`). The pair
+then rides to the injectee as `InjectorConfig` fields 4/5
+(`src/common/schema.hpp:90-94`): optional and separate, and an unset field
+adds no bytes, which is what keeps a credential-free config byte-identical
+to the pre-P5 wire.
+
+In the target, `socks5_handshake` (`src/injectee/socks5.hpp:268-324`) offers
+methods `{2, 0}` when credentials are configured — username/password first,
+no-auth still selectable — and `{0}` when they are not; a server that picks
+method 2 gets the `{1, ULEN, user, PLEN, pass}` subnegotiation. Any refusal
+(the usual `{1, 0xFF}`, a short read, an unexpected version) fails the
+handshake and `fail_proxied_connect` in `src/injectee/hook.hpp` surfaces it
+as `WSAECONNREFUSED`: never a silent retry without authentication, never a
+direct leak. And nothing stores or echoes a secret — the CLI logs the user
+name plus the password *length* once at start-up
+(`src/injector/injector_cli.cpp:201-206`), connection reports carry no
+credential field (`src/common/schema.hpp:58-67`), and the GUI keeps
+credentials in memory only (they are visible on screen: elements has no
+masked password box, `src/injector/injector_gui.hpp:319-322`).
 
 ### Fragile areas worth knowing when debugging
 
@@ -209,15 +238,16 @@ contract below.
 
 ### The IPC mapping: name, payload and DACL
 
-- The mapping name is `ENCAPSULE_PORT_IPC_<pid>` (`src/common/utils.hpp:161-165`).
+- The mapping name is `ENCAPSULE_PORT_IPC_<pid>` (`src/common/utils.hpp:300-304`).
   Both sides must agree on it — renaming it is a two-sided change.
 - The payload is not just the port: `port_mapping_payload` carries the control
-  port plus an 8-byte per-injection random token (`src/common/utils.hpp:175-190`),
-  and the injectee re-presents that token in every message it sends
-  (`src/injectee/client.hpp:113-121`). The control server refuses any session
-  whose token does not match (`src/injector/server.hpp:183-188`). No RNG, no
-  token, no injection (`src/injector/injector.hpp:114`).
+  port plus an 8-byte per-injection random token (`src/common/utils.hpp:306-329`,
+  built by `get_port_mapping_payload`, :334-351), and the injectee re-presents
+  that token in every message it sends (`src/injectee/client.hpp:113-123`). The
+  control server refuses any session whose token does not match
+  (`src/injector/server.hpp:217-229`). No RNG, no token, no injection
+  (`src/injector/injector.hpp:114`).
 - The mapping is created with an explicit user+SYSTEM DACL
   (`D:P(A;;GA;;;SY)(A;;GA;;;<current-user-SID>)`) and **fails closed**: if the
   descriptor cannot be built, the mapping is not created at all — never
-  silently left world-accessible (`create_mapping`, `src/common/winraii.hpp:143-195`).
+  silently left world-accessible (`create_mapping`, `src/common/winraii.hpp:150-200`).

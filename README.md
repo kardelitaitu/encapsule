@@ -55,6 +55,9 @@ flowchart LR
 - 🖥️ **GUI & CLI** — point-and-click with a native GUI, or script it with the CLI
 - 🧩 **x64 & x86** — a single x64 build injects both 64-bit and 32-bit (WoW64) targets
 - 🕳️ **Any socks5 endpoint** — point the capsule at the proxy of your choice (`-p`)
+- 🔐 **Proxy login** — authenticate to that proxy with RFC 1929 username/password, spelled
+  inline in the address (`-p user:pass@127.0.0.1:1080`) or typed into the GUI; a refused login
+  fails the connection instead of leaking it direct, and your password is never logged or reported
 
 ## Preview
 
@@ -81,7 +84,7 @@ Optional arguments:
 -R --path-regexp                regular expression for full filename of a process to inject proxy (string, with directory and file extension, e.g. `C:/programs/python.exe`, `C:/programs/(a|b).*\.exe`) [default: {}]
 -e --exec                       command line started with an executable to create a new process and inject proxy (string, e.g. `python` or `C:\Program Files\a.exe --some-option`) [default: {}]
 -l --enable-log                 enable logging for network connections [default: false]
--p --set-proxy                  set a proxy address for network connections (string, e.g. `127.0.0.1:1080`) [default: ""]
+-p --set-proxy                  set a proxy address for network connections (string, `[user[:pass]@]host:port`, e.g. `127.0.0.1:1080`, `[2001:db8::1]:1080` or `user:pass@127.0.0.1:1080`) [default: ""]
 -w --new-console-window         create a new console window while a new console process is executed in `-e` [default: false]
 -s --subprocess                 inject subprocesses created by these already injected processes [default: false]
 ```
