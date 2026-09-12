@@ -16,6 +16,7 @@
 #ifndef ENCAPSULE_COMMON_UTILS
 #define ENCAPSULE_COMMON_UTILS
 
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -296,6 +297,108 @@ inline std::optional<proxy_endpoint> parse_proxy_url(std::string_view url) {
 
   return endpoint;
 }
+
+// ----------------------------------------------------- credential redaction --
+
+// argparse quotes the offending command-line token in its parse failures
+// (`"Unknown argument: " + current_argument`, see `parse_args_internal`),
+// so a proxy URL glued onto a flag spelling -- `-palice:pw@host`, legal-
+// looking -- hands `what()` a string holding the password, and a frontend
+// that prints the exception prints the secret: into the console scrollback,
+// a terminal log, a CI transcript.  The three helpers below are the scrubber
+// that stands between the two, and they are here rather than `static` in one
+// frontend because a secret leaving the process is a security failure, not a
+// style one, and a security failure has to be assertable.  Header-only and
+// inline like the rest of this file: <utils.hpp> is compiled into the
+// injectee too, so nothing here may pull a frontend dependency behind it.
+
+namespace encapsule::utils {
+
+namespace detail {
+
+// The option a token names: the text after any leading dashes, cut at the
+// first `:` or `=`, which is where a glued-on value starts.
+inline std::string_view option_part(std::string_view token) {
+  std::size_t first = 0;
+  while (first < token.size() && token[first] == '-')
+    ++first;
+  std::size_t last = first;
+  while (last < token.size() && token[last] != ':' && token[last] != '=')
+    ++last;
+  return token.substr(first, last - first);
+}
+
+} // namespace detail
+
+// True for a proxy flag with a value stuck to it -- `-p...`, `-p=...`,
+// `--set-proxy=...` -- as opposed to a bare flag name, which carries no
+// secret and must stay printable.  Case-sensitive on purpose: lowercase `p`
+// is the proxy option, while uppercase `-P`/`--path` names files.  `path`
+// is excluded so that `--path=...` is never mistaken for `-p...`.
+inline bool is_proxy_flag_token(std::string_view token) {
+  if (token.empty() || token.front() != '-')
+    return false;
+  const auto option = detail::option_part(token);
+  const auto separator = token.find_first_of(":=");
+  if (separator == std::string_view::npos || separator + 1 >= token.size())
+    return false; // no glued value
+  const auto proxy =
+      (option.starts_with('p') && !option.starts_with("path")) ||
+      option.find("proxy") != std::string_view::npos;
+  return !option.empty() && proxy;
+}
+
+// One whitespace-separated run of the message -> printable text, or nullopt
+// when none of it may be shown.
+inline std::optional<std::string> scrub_token(std::string_view token) {
+  // Everything up to and including the LAST '@' is userinfo, the secret,
+  // which is how `parse_proxy_url` above splits it, and how the CLI's own
+  // `-p` diagnostics name the value they reject.  Stripping that prefix keeps
+  // the authority: naming host:port is what makes the rejection actionable.
+  if (auto at = token.rfind('@'); at != std::string_view::npos)
+    return std::string{token.substr(at + 1)};
+  // No '@' left to strip, so a proxy-flag token is `user:pass` with nothing
+  // but the secret in it -- there is no safe remainder to print.
+  if (is_proxy_flag_token(token))
+    return std::nullopt;
+  return std::string{token};
+}
+
+// Rebuilds the message token by token, preserving its whitespace, so the
+// wording survives and only the userinfo does not.
+//
+// NOTE for the argparse bump: the message form v3 adds, "Invalid argument
+// <x>", is deliberately neither scrubbed nor tested today, because v2.9
+// cannot produce it.  The gap, and the order to close it in when the bump
+// lands, is written down in `tests/utils/utils_test.cpp` -- "the argparse v3
+// gap: NO test yet".
+inline std::string sanitize_parse_error(std::string_view message) {
+  const auto is_space = [](char c) {
+    return std::isspace(static_cast<unsigned char>(c)) != 0;
+  };
+  std::string result;
+  result.reserve(message.size());
+  for (std::size_t pos = 0; pos < message.size();) {
+    if (is_space(message[pos])) {
+      result += message[pos++];
+      continue;
+    }
+    std::size_t next = pos;
+    while (next < message.size() && !is_space(message[next]))
+      ++next;
+    if (auto token = scrub_token(message.substr(pos, next - pos)))
+      result += *token;
+    pos = next;
+  }
+  // Dropping an offending token can leave a dangling "Unknown argument: ".
+  while (!result.empty() && is_space(result.back()))
+    result.pop_back();
+  return result.empty()
+             ? std::string{"Invalid argument (value redacted)"}
+             : result;
+}
+
+} // namespace encapsule::utils
 
 inline const std::wstring port_mapping_name = L"ENCAPSULE_PORT_IPC_";
 

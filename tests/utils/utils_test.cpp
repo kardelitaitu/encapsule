@@ -26,6 +26,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdint>
+#include <optional>
 #include <regex>
 #include <set>
 #include <string>
@@ -406,6 +407,186 @@ void endpoint_rejects_garbage() {
   check_rejected("@");
 }
 
+// ------------------------------------------------- credential redaction --
+
+// What `encapsule-cli` writes to stderr when a command line fails to parse
+// must not carry the socks5 password: argv is readable by every same-user
+// process (and by Sysmon EID 1), and argparse quotes the offending token
+// verbatim into its message.  The cases below pin that property on the
+// OUTPUT of `sanitize_parse_error` -- the string the CLI prints -- rather
+// than on how the scrubber reaches it, so the redactor may be rewritten
+// under them as long as no secret travels.
+
+namespace redact = encapsule::utils;
+
+namespace {
+
+// The composition argparse produces for an unrecognised option: a fixed
+// prefix plus the offending token, straight from argv.
+std::string unknown_argument(const std::string &token) {
+  return redact::sanitize_parse_error("Unknown argument: " + token);
+}
+
+// Reports which output leaked which value: a bare CHECK on a shared line
+// would name none of the spellings below.
+bool hides(const std::string &out, const std::string &secret) {
+  if (out.find(secret) == std::string::npos) {
+    return true;
+  }
+  ++test_failures;
+  std::printf("FAIL redaction: output \"%s\" still holds \"%s\"\n",
+              out.c_str(), secret.c_str());
+  return false;
+}
+
+} // namespace
+
+struct redacted_case {
+  const char *token; // what argv held
+  const char *secret; // what stderr must not hold
+  const char *output; // what stderr must hold, exactly
+};
+
+void a_glued_proxy_url_keeps_the_authority_and_loses_the_login() {
+  const redacted_case cases[] = {
+      {"-palice:hunter2@1.2.3.4:1080", "hunter2",
+       "Unknown argument: 1.2.3.4:1080"},
+      {"-p=alice:hunter2@1.2.3.4:1080", "hunter2",
+       "Unknown argument: 1.2.3.4:1080"},
+      {"--alice:hunter2@1.2.3.4", "hunter2", "Unknown argument: 1.2.3.4"},
+      {"--set-proxy=alice:hunter2@1.2.3.4:1080", "hunter2",
+       "Unknown argument: 1.2.3.4:1080"},
+      // A password holding its own '@': the LAST one is the separator, so
+      // the whole of `p@ssw0rd' is userinfo and none of it is printed.
+      {"-palice:p@ssw0rd@1.2.3.4:1080", "ssw0rd",
+       "Unknown argument: 1.2.3.4:1080"},
+  };
+
+  for (const auto &c : cases) {
+    const std::string out = unknown_argument(c.token);
+    // The security property, stated three ways so a rewrite cannot pass by
+    // accident: no password, no username, and no '@' left to show that a
+    // login was ever there.
+    CHECK(hides(out, c.secret));
+    CHECK(hides(out, "alice"));
+    CHECK(out.find('@') == std::string::npos);
+    // Then the actionable half, whole: the host:port the user can fix and
+    // the fixed words that say which argument was wrong.  Without this, a
+    // redactor that deleted the entire message would pass every check
+    // above.
+    CHECK_EQ(out, c.output);
+  }
+}
+
+void an_authority_with_no_userinfo_keeps_every_byte() {
+  // Nothing to strip, so nothing changes: the redaction removes the
+  // userinfo and never the address the rejection is about.
+  CHECK_EQ(unknown_argument("1.2.3.4:1080"),
+           "Unknown argument: 1.2.3.4:1080");
+  CHECK_EQ(unknown_argument("[2001:db8::1]:1080"),
+           "Unknown argument: [2001:db8::1]:1080");
+  CHECK_EQ(redact::scrub_token("1.2.3.4:1080").value_or("<dropped>"),
+           "1.2.3.4:1080");
+  // A username with no password is still userinfo, and goes with it.
+  CHECK_EQ(unknown_argument("-palice@1.2.3.4:1080"),
+           "Unknown argument: 1.2.3.4:1080");
+}
+
+void a_token_holding_nothing_but_a_secret_collapses_to_the_prefix() {
+  // The empty-authority case: `-p<user:pass>` with no '@' has no host to
+  // name, so there is NO printable remainder and the token is dropped
+  // WHOLE, leaving only the fixed prefix.  The bug this pins is the echo of
+  // a bare password, which is what printing the remainder would be.
+  const char *secret_only[] = {"-palice:hunter2", "-p=alice:hunter2",
+                               "-p:hunter2", "--set-proxy=alice:hunter2"};
+  for (const char *t : secret_only) {
+    CHECK(!redact::scrub_token(t).has_value());
+    const std::string out = unknown_argument(t);
+    CHECK(hides(out, "hunter2"));
+    CHECK_EQ(out, "Unknown argument:");
+  }
+
+  // Take the fixed prefix away too and nothing printable is left at all:
+  // the message becomes text that names no value.
+  CHECK_EQ(redact::sanitize_parse_error("-p:alice:hunter2"),
+           "Invalid argument (value redacted)");
+}
+
+void a_non_proxy_unknown_argument_passes_through_unchanged() {
+  // The redactor is targeted, not a global mangler: every token below is an
+  // unknown argument that holds no proxy credential, and each has to come
+  // back byte-for-byte.  If these were scrubbed too, no parse message
+  // could be trusted to say what the user typed.
+  const char *plain[] = {"--bogus-token", "-z", "--name", "42",
+                         "-Ppython.exe", "--path=C:/x/y.exe",
+                         "-rpy.*|exp.*"};
+  for (const char *t : plain) {
+    CHECK_EQ(redact::scrub_token(t).value_or("<dropped>"), std::string(t));
+    CHECK_EQ(unknown_argument(t), std::string("Unknown argument: ") + t);
+  }
+
+  // And the same for the fixed-worded messages on this path, which quote
+  // no value at all: sanitizing them is a no-op.
+  const char *fixed[] = {"Too few arguments",
+                         "Maximum number of arguments exceeded",
+                         "Expected at least one of `-i`, `-n` or `-e`",
+                         "Argument `-i` expected an argument, but got none"};
+  for (const char *m : fixed) {
+    CHECK_EQ(redact::sanitize_parse_error(m), std::string(m));
+  }
+}
+
+void only_a_proxy_flag_spelling_reads_as_a_proxy_flag() {
+  // What makes the redactor targeted is this predicate, so it is pinned on
+  // its own: true only for a proxy flag carrying a glued-on value.
+  CHECK(redact::is_proxy_flag_token("-palice:pw"));
+  CHECK(redact::is_proxy_flag_token("-p=alice:pw"));
+  CHECK(redact::is_proxy_flag_token("--set-proxy=alice:pw"));
+  CHECK(redact::is_proxy_flag_token("-puser:pw@1.2.3.4:1080"));
+  // A bare flag carries no value, so it stays printable...
+  CHECK(!redact::is_proxy_flag_token("-p"));
+  CHECK(!redact::is_proxy_flag_token("--set-proxy"));
+  // ... and the file-name flags -- uppercase `-P`, spelled `path` -- are
+  // never treated as if they held a login.
+  CHECK(!redact::is_proxy_flag_token("-Puser:pw"));
+  CHECK(!redact::is_proxy_flag_token("--path=C:/x/y.exe"));
+  CHECK(!redact::is_proxy_flag_token("alice:pw")); // not a flag at all
+  CHECK(!redact::is_proxy_flag_token(""));
+}
+
+// --------------------------------------- the argparse v3 gap: NO test yet --
+//
+// DELIBERATELY NOT ADDED, and no scrub implemented either.  Reading it as
+// an oversight would be the wrong response.
+//
+// The pinned dependency is argparse v2.9, and every failure it can throw
+// out of `parse_args` puts the offending value in its own
+// whitespace-separated run: "Unknown argument: " + token
+// (argparse.hpp:1522 and :1526), "Too few arguments for '<x>'", the
+// "expected an argument" family.  That is what `sanitize_parse_error`
+// tokenises on, and what the cases above pin.
+//
+// The dependency dossier reports that argparse v3 adds a further form,
+// "Invalid argument <x>", which is NOT scrubbed for today.  Two reasons
+// keep it untested here:
+//
+//   * v2.9 cannot produce that string, so a case written now would assert
+//     the shape of a message we invent, not one the CLI can emit -- it
+//     could only pass or fail on the invention. Untestable speculation.
+//   * inventing it would also put a second "Invalid argument"-prefixed
+//     message on this path, right beside the scrubber's own fixed
+//     fallback text, "Invalid argument (value redacted)".  A test that
+//     greps for one would quietly be watching the other.
+//
+// When the bump lands, in this order: (1) re-run the measured CLI cases
+// whose stderr the tests above mirror, plus the new form, against the real
+// binary; (2) add the "Invalid argument <x>" case then, fed the string the
+// bumped parser actually throws; and (3) if in that form the value is no
+// longer a whitespace-separated run of its own -- glued into the fixed
+// text, or wrapped in brackets that survive the split -- extend the
+// redactor to that shape before the case is written, because a scrub for a
+// message that still cannot be produced is worth nothing.
+
 // ------------------------------------------------------------ watch diff --
 
 // process_watch_diff is the pure half of auto-inject: no syscalls and no
@@ -707,6 +888,11 @@ int main() {
   RUN(endpoint_without_a_username_has_no_credentials);
   RUN(endpoint_credential_length_caps);
   RUN(endpoint_rejects_garbage);
+  RUN(a_glued_proxy_url_keeps_the_authority_and_loses_the_login);
+  RUN(an_authority_with_no_userinfo_keeps_every_byte);
+  RUN(a_token_holding_nothing_but_a_secret_collapses_to_the_prefix);
+  RUN(a_non_proxy_unknown_argument_passes_through_unchanged);
+  RUN(only_a_proxy_flag_spelling_reads_as_a_proxy_flag);
   RUN(an_empty_previous_snapshot_reports_everything);
   RUN(an_unchanged_snapshot_reports_nothing);
   RUN(a_reappearing_pid_is_reported_again);
