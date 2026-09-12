@@ -78,4 +78,29 @@ if(ENCAPSULE_E2E_INJECT AND CMAKE_SIZEOF_VOID_P EQUAL 8)
 
 	set_tests_properties(e2e.inject_auth
 		PROPERTIES ${ENCAPSULE_E2E_TEST_PROPERTIES})
+
+	# FORENSIC PROBE, REGISTERED DISABLED.  '-e' creates its child RUNNING and
+	# injects it afterwards -- no CREATE_SUSPENDED on that path -- while the
+	# injectee binds its proxy config only after the IPC hello, so a brand-new
+	# process's earliest connects go direct.  This is the case that says so: it
+	# dials a non-loopback port of this host (hook.hpp exempts 127/8, so
+	# loopback could never be the witness) through encapsule-cli -e, with the
+	# relay pointed at as -p, and asserts the sink accepted NOTHING while the
+	# relay's FIRST record is that dial.
+	#
+	# It is RED today, for exactly that reason, and turns GREEN when the
+	# A-chain lands: create suspended, resume on the verified-pid hello, and a
+	# bounded pre-config park that reports itself instead of leaking.  Until
+	# then it must not hold the gate, so DISABLED keeps it out of the run while
+	# the scenario still compiles and links on every build.  Same gate, same
+	# properties, same 120s ceiling; its own watch window is 6s.
+	add_test(NAME e2e.inject_exec
+		COMMAND ${ENCAPSULE_E2E_TEST_TARGET}
+			--inject-exec
+			--cli $<TARGET_FILE:${ENCAPSULE_E2E_INJECTOR_TARGET}>
+			--dummy $<TARGET_FILE:${ENCAPSULE_E2E_DUMMY_TARGET}>)
+
+	set_tests_properties(e2e.inject_exec
+		PROPERTIES ${ENCAPSULE_E2E_TEST_PROPERTIES})
+	set_tests_properties(e2e.inject_exec PROPERTIES DISABLED TRUE)
 endif()

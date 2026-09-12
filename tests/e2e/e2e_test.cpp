@@ -918,6 +918,252 @@ void inject_ipv6_decoy() {
               "byte-order assertion is made (P4-1)\n");
 }
 
+// ------------------------------------------------ -e boot-window probe ------
+//
+// A DISABLED probe (registered in tests/e2e/CMakeLists.txt), because '-e'
+// creates its child RUNNING and injects it afterwards: the CLI builds
+// creation_flags from -w alone and winraii's create_process() defaults to 0, so
+// CREATE_SUSPENDED is nowhere on that path, while the injectee only learns its
+// proxy after the IPC hello.  Any connect() the child makes inside that window
+// leaves direct -- which is exactly what the README hedges with "from the first
+// connection after its proxy config lands".  Nothing in this harness can see
+// such a connect today, for three independent reasons:
+//
+//   * the relay records only sessions whose first byte is 0x05; a raw connect
+//     to it is dropped before anything is recorded (handle_session in
+//     socks5_test_server.hpp), so the proxy-side observer is blind to it;
+//   * with -e the CLI owns the child: the harness has neither its handle nor
+//     its stdout, so the decoy's own "attempt 1: connect failed" line, and its
+//     exit code, are unreachable (compare injection_case, which spawns or
+//     adopts the decoy itself and therefore can wait on it);
+//   * hook.hpp exempts loopback on purpose -- "is_inet(name) && bound &&
+//     !is_localhost(name)", with is_localhost() answering for 127/8 -- so a
+//     sink bound to 127.0.0.1 cannot work: every dial there is direct BY
+//     POLICY, and a leak reported on it would not be a leak.
+//
+// So the probe dials an address this host owns that is NOT loopback (its own
+// first non-loopback IPv4) on a plain listener of ours, and points -p at the
+// relay.  Per attempt exactly one observer can wake up:
+//
+//   sink accepted  -> the connect reached the destination unhooked: the gap
+//   relay recorded -> the injectee wrapped it: CONNECT <dial addr>:<sink port>
+//
+// which makes the assertion about ORDER, not about counts: the relay's FIRST
+// record must be the child's FIRST dial, and the sink must have accepted
+// NOTHING.  "count >= N" would be the wrong shape -- it is satisfied by a child
+// that leaked three connects and then behaved, and on a loaded box N depends on
+// how many attempts squeeze into the window.  After the A-chain (suspend at
+// create, resume on the verified-pid hello, with a bounded pre-config park that
+// reports itself) sink == 0 holds by construction rather than by timing, so the
+// case cannot flake either way; until then it is red for that one reason.
+//
+// Wall time is one fixed window: no 21.3s unroutable-connect block (the sink
+// answers immediately, hooked or not) and the child's own deadline is short
+// enough that an orphaned -e child is gone before this process returns.
+
+// The window to watch, and the decoy's own patience.  Deliberately the same
+// order of magnitude: kInjectRecordWaitMs proves a hooked CONNECT arrives well
+// inside 25s on this host, so 6s of watching covers a real injection -- raise
+// these two together if a slower CI leg ever needs it.
+constexpr int kExecWindowMs = 6000;
+constexpr int kExecPollMs = 50;
+constexpr int kExecDecoyDeadlineMs = 7000;
+
+bool g_exec_skipped = false;  // no usable dial address -> report 77, not green
+
+// The first non-loopback IPv4 this host answers on, or "" for none.  Needed
+// because loopback is the one destination hook.hpp never routes.
+std::string local_non_loopback_v4() {
+  char name[256] = {};
+  if (gethostname(name, static_cast<int>(sizeof(name)) - 1) != 0) {
+    return {};
+  }
+  addrinfo hints = {};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  addrinfo *res = nullptr;
+  if (getaddrinfo(name, nullptr, &hints, &res) != 0) {
+    return {};
+  }
+  std::string out;
+  for (addrinfo *p = res; p != nullptr; p = p->ai_next) {
+    const auto *sa = reinterpret_cast<const sockaddr_in *>(p->ai_addr);
+    if (sa->sin_addr.s_net == 0x7f) {
+      continue;  // 127/8: exempt in hook.hpp, useless as a leak witness
+    }
+    char text[INET_ADDRSTRLEN] = {};
+    if (inet_ntop(AF_INET, &sa->sin_addr, text, sizeof(text)) != nullptr) {
+      out = text;
+      break;
+    }
+  }
+  freeaddrinfo(res);
+  return out;
+}
+
+// A plain TCP listener whose only job is to notice that something reached it.
+// No worker thread: the test polls it, so nothing here can outlive a CHECK
+// failure or hang a destructor.
+class direct_leak_sink {
+public:
+  direct_leak_sink() = default;
+  direct_leak_sink(const direct_leak_sink &) = delete;
+  direct_leak_sink &operator=(const direct_leak_sink &) = delete;
+  ~direct_leak_sink() {
+    if (sock_ != INVALID_SOCKET) {
+      closesocket(sock_);
+    }
+  }
+
+  bool open(const std::string &addr) {
+    sock_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock_ == INVALID_SOCKET) {
+      return false;
+    }
+    sockaddr_in bound = {};
+    bound.sin_family = AF_INET;
+    if (InetPtonA(AF_INET, addr.c_str(), &bound.sin_addr) != 1) {
+      return false;
+    }
+    if (::bind(sock_, reinterpret_cast<sockaddr *>(&bound), sizeof(bound)) ==
+        SOCKET_ERROR) {
+      return false;
+    }
+    if (::listen(sock_, 64) == SOCKET_ERROR) {
+      return false;
+    }
+    int len = sizeof(bound);
+    if (getsockname(sock_, reinterpret_cast<sockaddr *>(&bound), &len) ==
+        SOCKET_ERROR) {
+      return false;
+    }
+    port_ = ntohs(bound.sin_port);
+    u_long off = 1;
+    ioctlsocket(sock_, FIONBIO, &off);  // so poll() can drain and return
+    return true;
+  }
+
+  // Takes every pending accept and counts it.  A connection that is merely
+  // sitting in the backlog still counts: poll() may be a few ms late, never
+  // blind.
+  std::size_t poll() {
+    for (;;) {
+      const SOCKET s = ::accept(sock_, nullptr, nullptr);
+      if (s == INVALID_SOCKET) {
+        break;
+      }
+      closesocket(s);
+      ++leaks_;
+    }
+    return leaks_;
+  }
+
+  std::uint16_t port() const { return port_; }
+  std::size_t leaks() const { return leaks_; }
+
+private:
+  SOCKET sock_ = INVALID_SOCKET;
+  std::uint16_t port_ = 0;
+  std::size_t leaks_ = 0;
+};
+
+// One round of Windows argv escaping: wrap the whole decoy command line in
+// quotes and protect the quotes inside it, so what the CLI's argv token holds
+// is still a command line CreateProcess can parse the second time around.
+std::string embed_argv(const std::string &text) {
+  std::string out;
+  out.reserve(text.size() + 8);
+  out.push_back('"');
+  for (const char c : text) {
+    if (c == '"') {
+      out += '\\';  // escape it for the argv parse
+    }
+    out.push_back(c);
+  }
+  out.push_back('"');
+  return out;
+}
+
+void inject_exec_boot_window() {
+  const std::string dial_addr = local_non_loopback_v4();
+  if (dial_addr.empty()) {
+    std::printf("  SKIP(exec): this host has no non-loopback IPv4, and "
+                "hook.hpp routes nothing to 127/8, so there is no address "
+                "whose direct use would prove the boot-window gap\n");
+    g_exec_skipped = true;
+    return;
+  }
+
+  e2e::socks5_test_server server;  // the proxy -p points at
+  direct_leak_sink sink;           // what the child dials
+  const bool opened = sink.open(dial_addr);
+  CHECK(opened);
+  if (!opened) {
+    return;
+  }
+  std::printf("  [exec] proxy %s:%u, decoy dials %s:%u\n",
+              server.address().c_str(), static_cast<unsigned>(server.port()),
+              dial_addr.c_str(), static_cast<unsigned>(sink.port()));
+
+  // No --socks5: wrapping is the injectee's job, and the whole question is
+  // whether it got there first.
+  const std::string decoy_cmd =
+      dummy_command(dummy_path(), dial_addr, sink.port(), kExecDecoyDeadlineMs,
+                    "E2E-EXEC-SENTINEL", false);
+  const std::string cli_cmd = quote_arg(g_cli_path) + " -e " +
+                              embed_argv(decoy_cmd) + " -p " +
+                              server.address() + ":" +
+                              std::to_string(server.port()) + " -l";
+
+  // The CLI is the only child this harness owns; the decoy is the CLI's.
+  child_process injector;
+  const bool spawned = injector.spawn(cli_cmd, true);
+  CHECK(spawned);
+  if (!spawned) {
+    return;
+  }
+  std::printf("  [exec] cli pid %lu created the decoy\n", injector.pid());
+
+  const auto start = clock_type::now();
+  const auto until = start + std::chrono::milliseconds(kExecWindowMs);
+  while (clock_type::now() < until) {
+    sink.poll();
+    if (server.request_count() > 0 && sink.leaks() > 0) {
+      break;  // both verdicts are in: the gap is open AND the hook is live
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(kExecPollMs));
+  }
+  sink.poll();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           clock_type::now() - start)
+                           .count();
+  const auto records = server.requests();
+  std::printf("  [exec] %lldms: relay %zu CONNECT(s), sink %zu direct "
+              "accept(s)\n",
+              static_cast<long long>(elapsed), records.size(), sink.leaks());
+
+  // First the precondition, so a zero on the sink can never be read as a pass
+  // on its own: the child really was hooked and really did reach the proxy.
+  CHECK(!records.empty());
+  if (!records.empty()) {
+    const auto &first = records.front();
+    CHECK_EQ(first.addr, dial_addr);
+    CHECK_EQ(static_cast<int>(first.port), static_cast<int>(sink.port()));
+    std::printf("  [exec] first CONNECT %s(%s):%u\n",
+                e2e::atyp_name(first.atyp).c_str(), first.addr.c_str(),
+                static_cast<unsigned>(first.port));
+  }
+  // Then the promise: nothing at all reached the destination direct.
+  CHECK_EQ(sink.leaks(), std::size_t(0));
+
+  injector.finish();
+  if (!injector.output().empty() && sink.leaks() > 0) {
+    std::printf("  ---- encapsule-cli output ----\n%s"
+                "  ---- end of encapsule-cli output ----\n",
+                injector.output().c_str());
+  }
+}
+
 // Both auth sub-cases, sequentially, in one process.  Each brings its own
 // relay and decoy, so the wall clock is roughly 20s + 20s -- well inside the
 // 120s the CTest registration allows.
@@ -932,6 +1178,21 @@ int run_inject_auth() {
   RUN(inject_auth_accepted);
   RUN(inject_auth_refused);
   return test_failures;
+}
+
+// The -e boot-window probe on its own: one child, one window, one fixed wait.
+int run_inject_exec() {
+  if (g_cli_path.empty() || g_dummy_override.empty()) {
+    std::printf("usage: e2e_test --inject-exec --cli <encapsule-cli> "
+                "--dummy <dummy_target>\n");
+    return 2;
+  }
+  std::printf("  cli   = %s\n  dummy = %s\n", g_cli_path.c_str(),
+              g_dummy_override.c_str());
+  RUN(inject_exec_boot_window);
+  // 77 is the SKIP_RETURN_CODE every e2e test carries: a host with no
+  // non-loopback IPv4 has nothing to assert here, which is not a pass.
+  return g_exec_skipped ? 77 : test_failures;
 }
 
 int run_inject() {
@@ -972,6 +1233,8 @@ int main(int argc, char **argv) {
       mode = "inject";
     } else if (flag == "--inject-auth") {
       mode = "inject_auth";
+    } else if (flag == "--inject-exec") {
+      mode = "inject_exec";
     } else if (flag == "--cli") {
       if (!take(g_cli_path)) {
         std::printf("--cli needs a value\n");
@@ -985,7 +1248,7 @@ int main(int argc, char **argv) {
     } else {
       std::printf("unknown argument %s\n", flag.c_str());
       std::printf("usage: e2e_test --selfcheck | --inject | --inject-auth"
-                  " --cli X --dummy Y\n");
+                  " | --inject-exec --cli X --dummy Y\n");
       return 2;
     }
   }
@@ -1005,11 +1268,13 @@ int main(int argc, char **argv) {
     result = test_failures;
   } else if (mode == "inject_auth") {
     result = run_inject_auth();
+  } else if (mode == "inject_exec") {
+    result = run_inject_exec();
   } else if (mode == "inject") {
     result = run_inject();
   } else {
     std::printf("usage: e2e_test --selfcheck | --inject | --inject-auth"
-                " --cli X --dummy Y\n");
+                " | --inject-exec --cli X --dummy Y\n");
     result = 2;
   }
 
