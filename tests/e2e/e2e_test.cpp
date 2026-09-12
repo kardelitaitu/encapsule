@@ -696,9 +696,23 @@ struct inject_creds {
   const char *accept_pass = nullptr;
   bool refused = false;  // the login is expected to be turned down
   int decoy_deadline_ms = kDecoyDeadlineMs;
+  // The two windows a case waits in: for the first record to land, and for the
+  // decoy to exit on its own.  Defaults keep the credential-free case exactly
+  // as it was; the auth cases need longer ones, see kAuthDecoyDeadlineMs.
+  int record_wait_ms = kInjectRecordWaitMs;
+  int decoy_wait_ms = kInjectDecoyWaitMs;
 };
 
-constexpr int kAuthDecoyDeadlineMs = 18000;  // bounds the fail-closed sub-case
+// A decoy that is not hooked yet blocks in its FIRST connect() for ~21.3s here
+// (the TCP retry timeout on an unroutable address).  A deadline under that
+// never reaches a second attempt, and only a second attempt is hooked: the
+// case then reports 0 logins and looks like a proxy that was never dialled.
+// The 21.3s is a host measurement, not a contract, so the auth cases sit well
+// above it -- the wait for the first record clears it too, and the decoy's own
+// window stays long enough to see the exit it produces.
+constexpr int kAuthRecordWaitMs = 30000;
+constexpr int kAuthDecoyDeadlineMs = 40000;
+constexpr int kAuthDecoyWaitMs = 45000;
 
 // One inject-and-connect scenario against a fresh relay: the decoy hammers an
 // unroutable address, encapsule-cli injects encapsule-injectee.dll into it and
@@ -769,12 +783,12 @@ void injection_case(const char *label, const std::string &decoy_host,
   const bool refused_login = creds_in_play && creds.refused;
   if (creds_in_play) {
     const bool saw_login = server.wait_for_auth_count(
-        1, std::chrono::milliseconds(kInjectRecordWaitMs));
+        1, std::chrono::milliseconds(creds.record_wait_ms));
     CHECK(saw_login);
     const auto auth = server.auth_records();
-    CHECK_EQ(auth.size(), std::size_t(1));
+    CHECK(!auth.empty());
     if (!auth.empty()) {
-      const auto &rec = auth.back();
+      const auto &rec = auth.front();
       const std::vector<std::uint8_t> offered{SOCKS_USERNAME_PASSWORD,
                                               SOCKS_NO_AUTHENTICATION};
       CHECK(rec.offered == offered);  // the DLL really offered method 2
@@ -783,6 +797,13 @@ void injection_case(const char *label, const std::string &decoy_host,
       CHECK_EQ(rec.username, std::string(creds.user));  // exact bytes on both
       CHECK_EQ(rec.password, std::string(creds.pass));
       CHECK_EQ(rec.ok, !refused_login);
+      // The decoy retries while it is unhappy, so there is one record per
+      // attempt: every one of them has to carry the same login and verdict.
+      for (const auto &r : auth) {
+        CHECK_EQ(r.username, std::string(creds.user));
+        CHECK_EQ(r.password, std::string(creds.pass));
+        CHECK_EQ(r.ok, !refused_login);
+      }
       std::printf("  [%s] 1929 %s: offered [%s] user=%zu pass=%zu\n", label,
                   rec.ok ? "accepted" : "refused",
                   e2e::method_list_text(rec.offered).c_str(),
@@ -796,7 +817,7 @@ void injection_case(const char *label, const std::string &decoy_host,
       refused_login
           ? true
           : server.wait_for_request_count(
-                1, std::chrono::milliseconds(kInjectRecordWaitMs));
+                1, std::chrono::milliseconds(creds.record_wait_ms));
   CHECK(saw_connect);
   const auto records = server.requests();
   if (!records.empty()) {
@@ -812,7 +833,7 @@ void injection_case(const char *label, const std::string &decoy_host,
   // The sentinel surviving the tunnel is the round-trip proof: the decoy exits
   // 0 as soon as one comes back, 3 if none ever does.
   const bool reported =
-      decoy.wait(std::chrono::milliseconds(kInjectDecoyWaitMs));
+      decoy.wait(std::chrono::milliseconds(creds.decoy_wait_ms));
   CHECK(reported);
   if (refused_login) {
     // Fail closed, which is the whole point of this sub-case: the proxy turned
@@ -877,7 +898,8 @@ void inject_ipv4_decoy() {
 void inject_auth_accepted() {
   injection_case("auth-pass", "203.0.113.7", 8080, SOCKS_IPV4,
                  inject_creds{"alice", "s3cr3t!", "alice", "s3cr3t!", false,
-                              kAuthDecoyDeadlineMs});
+                              kAuthDecoyDeadlineMs, kAuthRecordWaitMs,
+                              kAuthDecoyWaitMs});
 }
 
 // Same login from the same code path; only the relay's expectation differs, so
@@ -886,7 +908,8 @@ void inject_auth_refused() {
   injection_case("auth-refused", "203.0.113.7", 8080, SOCKS_IPV4,
                  inject_creds{"alice", "s3cr3t!", "alice",
                               "not-the-real-secret", true,
-                              kAuthDecoyDeadlineMs});
+                              kAuthDecoyDeadlineMs, kAuthRecordWaitMs,
+                              kAuthDecoyWaitMs});
 }
 
 void inject_ipv6_decoy() {
