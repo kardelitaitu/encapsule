@@ -367,3 +367,22 @@ the same reason — silence looks like a click that was lost.
 
 Write new handlers this way: validate with the same rules the CLI applies to
 `-p`, `report` the refusal in fixed text, and let `guarded` catch the rest.
+
+## 5. Code style and conventions
+
+The rule list is maintained in **AGENTS.md §6**, and is deliberately not
+repeated here. In one breath: 2-space indent and no tabs in `src/`, ~80-column
+wrapping (there is no `.clang-format` at the repo root, so the column is held
+by hand), `ENCAPSULE_<PKG>_<NAME>` header guards, the Apache-2.0
+`// Copyright 2022 PragmaTwice` block at the top of every file, snake_case for
+functions, variables and `struct` names, and `hook_<winapi>` for the CRTP hook
+types.
+
+One of those rules costs the most to break, so it is repeated on purpose:
+`src/common/` is compiled into **both** the injectee and the injector, so a
+change to `schema.hpp`, to the mapping name and payload, or to the
+`encapsule-injectee*.dll` lookup names is a two-sided change — AGENTS.md §5
+says which three files to check together.
+
+What this guide adds to that baseline is project-specific rather than stylistic:
+the fragile-areas list and the front-end click-handler convention in §4.

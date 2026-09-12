@@ -1,6 +1,10 @@
 # AGENTS.md — encapsule
 
-Facts here were read from the cited sources (`master@a6c23c4`). Re-verify after refactors.
+Facts here were read from the cited sources on the live tree during the P6/P7
+remediation wave. No commit stamp is claimed — HEAD moved repeatedly while this
+file was being edited, so an SHA here would be unverifiable the day it was
+written; the one SHA below (`a6c23c4`, §3) marks where a measurement was taken,
+not how current these facts are. Re-verify after refactors.
 Line numbers are deliberately omitted for files other workers are editing right now (`hook.hpp`,
 `injectee.cpp`, `udp_state.hpp`, `injector_cli.cpp`, `injector_gui.hpp`) — read those by symbol.
 
@@ -224,7 +228,9 @@ Re-index: `mcp cbm index_repository(repo_path="C:\dev\encapsule", mode="moderate
 
 ## 6. Conventions (observed in src/)
 
-- 2-space indent, no tabs in `src/`; ~80-column clang-format style — re-measured on the current
+- 2-space indent, no tabs in `src/`; ~80-column style, held by hand — there is **no**
+  `.clang-format` at the repo root (only inside vendored deps under the build trees), so
+  no formatter enforces it — re-measured on the current
   tree, exactly **1** line of `src/` runs past 80 columns (`injector.hpp:191`, 82 chars); the
   longest line in `injector_gui.hpp` and `fakeip.hpp` is 80. `CMakeLists.txt`/`build.ps1` use tabs.
 - Includes: `"quoted"` for same-package headers, `<angle>` for stdlib, third-party and `src/common`
