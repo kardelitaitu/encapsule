@@ -556,6 +556,121 @@ void relay_picks_no_auth_when_auth_is_not_required() {
   CHECK(server.echoed_round_trips() >= 1);
 }
 
+// A demanding proxy has to survive a client that sends a broken RFC 1929 body:
+// answer {01, FF}, drop that session, and stay perfectly usable afterwards.
+// Three shapes of wrong, then ONE good alice/s3cr3t! session on the same relay
+// -- the good one is the proof nothing got contaminated.
+//
+// The client here is hand-rolled on purpose: socks5_handshake() only ever
+// produces well-formed requests, so a bad body has to be typed out byte by
+// byte.  The greeting in front of it still comes from the real builder.
+void malformed_subnegotiation_is_refused_without_crash() {
+  e2e::socks5_test_server server;
+  server.require_auth(true);
+  server.set_auth_hook([](const std::string &user, const std::string &pass) {
+    return user == "alice" && pass == "s3cr3t!";
+  });
+
+  uint8_t methods[2] = {SOCKS_USERNAME_PASSWORD, SOCKS_NO_AUTHENTICATION};
+  char greet[SOCKS_GREETING_MAX_SIZE] = {};
+  const std::size_t greet_len = socks5_build_greeting(methods, 2, greet);
+  CHECK_EQ(greet_len, std::size_t(4));  // 05 02 02 00
+
+  const std::vector<std::pair<const char *, std::vector<char>>> broken = {
+      {"wrong ver", {0x05, 0x05, 0x00, 0x00}},  // VER must be 1, not 5
+      {"ulen overruns", {0x01, static_cast<char>(0xFF), 'a', 'l', 'i'}},
+      {"truncated", {0x01, 0x05, 'a', 'l', 'i'}},  // stops mid-username
+  };
+
+  for (const auto &[label, body] : broken) {
+    const SOCKET s = loopback_connect(server.address(), server.port());
+    CHECK(s != INVALID_SOCKET);
+    if (s == INVALID_SOCKET) {
+      return;
+    }
+    // Belt and braces: the relay's own idle bound is 5s, so a stalled read is
+    // slow but never hangs this test.
+    DWORD rcv_ms = 10000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char *>(&rcv_ms), sizeof(rcv_ms));
+
+    bool refused = false;
+    do {
+      if (send(s, greet, static_cast<int>(greet_len), 0) !=
+          static_cast<int>(greet_len)) {
+        break;
+      }
+      char choice[2] = {};
+      if (recv(s, choice, 2, 0) != 2) {
+        break;
+      }
+      if (static_cast<std::uint8_t>(choice[0]) != SOCKS_VERSION ||
+          static_cast<std::uint8_t>(choice[1]) != SOCKS_USERNAME_PASSWORD) {
+        break;  // the relay did not pick method 2
+      }
+      if (send(s, body.data(), static_cast<int>(body.size()), 0) !=
+          static_cast<int>(body.size())) {
+        break;
+      }
+      // Nothing after the partial body: the relay must see a short read.
+      shutdown(s, SD_SEND);
+      char verdict[2] = {};
+      if (recv(s, verdict, 2, 0) != 2) {
+        break;
+      }
+      refused = static_cast<std::uint8_t>(verdict[0]) == SOCKS_AUTH_VERSION &&
+                static_cast<std::uint8_t>(verdict[1]) == SOCKS_AUTH_FAILURE;
+      std::printf("  [%s] %s + %s -> relay %02x %02x\n", label,
+                  hex_dump(greet, greet_len).c_str(),
+                  hex_dump(body.data(), body.size()).c_str(),
+                  static_cast<unsigned char>(verdict[0]),
+                  static_cast<unsigned char>(verdict[1]));
+    } while (false);
+    closesocket(s);
+    CHECK(refused);
+  }
+
+  // Three greetings, all seen, none of them parsed or accepted.
+  CHECK(server.wait_for_auth_count(broken.size(),
+                                   std::chrono::milliseconds(10000)));
+  const auto auth = server.auth_records();
+  CHECK_EQ(auth.size(), broken.size());
+  const std::vector<std::uint8_t> offered{SOCKS_USERNAME_PASSWORD,
+                                          SOCKS_NO_AUTHENTICATION};
+  for (const auto &rec : auth) {
+    CHECK(rec.offered == offered);  // the greeting itself was read fine
+    CHECK(rec.chose_auth);          // and answered {05, 02}
+    CHECK(!rec.parsed);             // the body never validated
+    CHECK(!rec.ok);                 // so it was refused
+    CHECK(rec.password.empty());    // nothing complete was ever stored
+  }
+  // Not one of them got to ask for a CONNECT.
+  CHECK_EQ(server.request_count(), std::size_t(0));
+  CHECK_EQ(server.echoed_round_trips(), std::size_t(0));
+
+  // The relay is still alive: a well-formed login on the SAME instance works
+  // end to end, right after three malformed ones.
+  const socks5_credentials creds{"alice", "s3cr3t!"};
+  const SOCKET good = loopback_connect(server.address(), server.port());
+  CHECK(good != INVALID_SOCKET);
+  if (good != INVALID_SOCKET) {
+    CHECK(tunnel_round_trip(good, creds, "E2E-AFTER-MALFORMED"));
+    closesocket(good);
+  }
+  CHECK(server.wait_for_auth_count(broken.size() + 1,
+                                   std::chrono::milliseconds(10000)));
+  const auto after = server.auth_records();
+  CHECK_EQ(after.size(), broken.size() + 1);
+  if (after.size() == broken.size() + 1) {
+    CHECK(after.back().parsed);        // the good body did parse
+    CHECK(after.back().ok);
+    CHECK_EQ(after.back().username, std::string("alice"));
+    CHECK_EQ(after.back().password, std::string("s3cr3t!"));
+  }
+  CHECK_EQ(server.request_count(), std::size_t(1));  // its CONNECT landed
+  CHECK(server.echoed_round_trips() >= 1);
+}
+
 void run_selfcheck() {
   RUN(relay_records_connect_and_echoes);
   RUN(on_connect_hook_can_refuse);
@@ -564,6 +679,7 @@ void run_selfcheck() {
   RUN(handshake_refuses_wrong_password);
   RUN(handshake_without_credentials_is_refused);
   RUN(relay_picks_no_auth_when_auth_is_not_required);
+  RUN(malformed_subnegotiation_is_refused_without_crash);
 }
 
 // ------------------------------------------------------------------ inject --
