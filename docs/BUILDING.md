@@ -192,10 +192,28 @@ handshake and `fail_proxied_connect` in `src/injectee/hook.hpp` surfaces it
 as `WSAECONNREFUSED`: never a silent retry without authentication, never a
 direct leak. And nothing stores or echoes a secret — the CLI logs the user
 name plus the password *length* once at start-up
-(`src/injector/injector_cli.cpp:201-206`), connection reports carry no
-credential field (`src/common/schema.hpp:58-67`), and the GUI keeps
-credentials in memory only (they are visible on screen: elements has no
-masked password box, `src/injector/injector_gui.hpp:319-322`).
+(`src/injector/injector_cli.cpp`), connection reports carry no credential
+field (`src/common/schema.hpp:58-67`), and the GUI keeps credentials in memory
+only (they are visible on screen: elements has no masked password box, see
+`src/injector/injector_gui.hpp`).
+
+Two front-end details are worth knowing before you rely on any of the above.
+The CLI takes the endpoint as an argument, so the whole
+`[user[:pass]@]host:port` string — password included — sits in the process
+command line, where any same-user process and any process-audit provider
+(Sysmon EID 1 logs it verbatim) can read it; the GUI's separate
+username/password boxes keep it out of argv. Nothing else about the CLI is
+loose, though: a rejected `-p` names only the authority after the last `@`,
+never the userinfo, so the error path cannot echo the secret either.
+
+The other detail is whitespace. Nothing unescapes or percent-decodes the
+password: `parse_proxy_url` (`src/common/utils.hpp:162-298`) treats every
+character as literal, and the CLI hands it the `-p` value UNTRIMMED on purpose
+— trimming there would authenticate with a different secret than the one that
+was typed, so a stray space around the host or the port is a hard parse error
+instead of a quiet downgrade. The GUI is not symmetric yet: it trims every box
+it reads — host, username and password alike — so a password with meaningful
+leading or trailing whitespace can only be entered from the CLI.
 
 ### Fragile areas worth knowing when debugging
 

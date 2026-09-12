@@ -46,8 +46,8 @@ flowchart LR
   process list in the GUI
 - 🔍 **Flexible matching** — short names with wildcards (`py*`, `py??on`), full paths with
   wildcards, or regular expressions for both
-- 🚀 **Launch & inject** — start a brand-new process that is encapsulated from its very
-  first connection (`-e`)
+- 🚀 **Launch & inject** — start a brand-new process that is encapsulated from the first
+  connection after its proxy config lands (`-e`)
 - 👶 **Subprocess inheritance** — children spawned by injected processes get encapsulated
   too (`-s`)
 - 🧾 **Live connection log** — watch every connection an injected process makes, in real
@@ -55,9 +55,11 @@ flowchart LR
 - 🖥️ **GUI & CLI** — point-and-click with a native GUI, or script it with the CLI
 - 🧩 **x64 & x86** — a single x64 build injects both 64-bit and 32-bit (WoW64) targets
 - 🕳️ **Any socks5 endpoint** — point the capsule at the proxy of your choice (`-p`)
-- 🔐 **Proxy login** — authenticate to that proxy with RFC 1929 username/password, spelled
-  inline in the address (`-p user:pass@127.0.0.1:1080`) or typed into the GUI; a refused login
-  fails the connection instead of leaking it direct, and your password is never logged or reported
+- 🔐 **Proxy login** — authenticate to that proxy with RFC 1929 username/password, spelled inline
+  in the address (`-p user:pass@127.0.0.1:1080`) or typed into the GUI; a refused login fails the
+  connection instead of leaking it direct, and encapsule itself never logs or reports the password —
+  but on the CLI the login is part of the **command line**, which same-user processes (and Sysmon
+  EID 1) can read, so prefer the GUI's credential boxes when that matters
 
 ## Preview
 
