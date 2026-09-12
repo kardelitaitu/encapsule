@@ -65,4 +65,17 @@ if(ENCAPSULE_E2E_INJECT AND CMAKE_SIZEOF_VOID_P EQUAL 8)
 
 	set_tests_properties(e2e.inject_connect
 		PROPERTIES ${ENCAPSULE_E2E_TEST_PROPERTIES})
+
+	# P5 S6b: the same real injection path, but the proxy demands RFC 1929
+	# credentials.  One sub-case where the login is accepted, one where it
+	# is refused and the target has to fail closed.  Same gate as above
+	# (injection enabled + 64-bit) and the same properties.
+	add_test(NAME e2e.inject_auth
+		COMMAND ${ENCAPSULE_E2E_TEST_TARGET}
+			--inject-auth
+			--cli $<TARGET_FILE:${ENCAPSULE_E2E_INJECTOR_TARGET}>
+			--dummy $<TARGET_FILE:${ENCAPSULE_E2E_DUMMY_TARGET}>)
+
+	set_tests_properties(e2e.inject_auth
+		PROPERTIES ${ENCAPSULE_E2E_TEST_PROPERTIES})
 endif()

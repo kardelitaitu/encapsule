@@ -684,26 +684,56 @@ void run_selfcheck() {
 
 // ------------------------------------------------------------------ inject --
 
+// Optional RFC 1929 login for an injection case.  The default is exactly the
+// pre-P5 shape: no credentials, a bare host:port on -p, and the relay left
+// without any demand for authentication.  user/pass is what the CLI hands the
+// injectee; accept_user/accept_pass is what the RELAY's hook will agree to --
+// the fail-closed case runs the two apart on purpose.
+struct inject_creds {
+  const char *user = nullptr;
+  const char *pass = nullptr;
+  const char *accept_user = nullptr;
+  const char *accept_pass = nullptr;
+  bool refused = false;  // the login is expected to be turned down
+  int decoy_deadline_ms = kDecoyDeadlineMs;
+};
+
+constexpr int kAuthDecoyDeadlineMs = 18000;  // bounds the fail-closed sub-case
+
 // One inject-and-connect scenario against a fresh relay: the decoy hammers an
 // unroutable address, encapsule-cli injects encapsule-injectee.dll into it and
 // points it at this relay, and the relay asserts on the CONNECT the injectee
 // actually put on the wire.  A fresh relay per case matters, because it serves
 // one session at a time, and so does a fresh decoy pid.
 void injection_case(const char *label, const std::string &decoy_host,
-                    std::uint16_t decoy_port, char expect_atyp) {
+                    std::uint16_t decoy_port, char expect_atyp,
+                    const inject_creds &creds = inject_creds{}) {
   const int failures_before = test_failures;
   const std::string sentinel = std::string("E2E-INJECT-") + label;
+  const bool creds_in_play = creds.user != nullptr;
 
   e2e::socks5_test_server server;
   CHECK(server.port() != 0);
+  if (creds_in_play) {
+    server.require_auth(true);
+    const std::string want_user = creds.accept_user ? creds.accept_user : "";
+    const std::string want_pass =
+        creds.accept_pass ? creds.accept_pass : "";
+    // The judge lives here, not in the injectee: what the login IS never gets
+    // printed, only whether it passed and how long each field was.
+    server.set_auth_hook([want_user, want_pass](const std::string &user,
+                                                const std::string &pass) {
+      return user == want_user && pass == want_pass;
+    });
+  }
   std::printf("  [%s] relay %s:%u, decoy %s:%u\n", label,
               server.address().c_str(), static_cast<unsigned>(server.port()),
               decoy_host.c_str(), decoy_port);
 
   // No --socks5 here: the injectee is what has to add the wrapping.
   const std::string decoy_cmd =
-      dummy_command(dummy_path(), decoy_host, decoy_port, kDecoyDeadlineMs,
-                    sentinel, false);
+      dummy_command(dummy_path(), decoy_host, decoy_port,
+                    creds.decoy_deadline_ms, sentinel, false);
   const std::optional<PROCESS_INFORMATION> launched =
       create_process(decoy_cmd, CREATE_NO_WINDOW);
   CHECK(launched.has_value());
@@ -716,9 +746,16 @@ void injection_case(const char *label, const std::string &decoy_host,
 
   // -l so the captured log names the address the injectee reported.
   child_process injector;
+  // -p takes [user[:pass]@]host:port; the address stays numeric, so the
+  // brackets the grammar allows for IPv6 are not needed here.
+  std::string proxy_arg =
+      server.address() + ":" + std::to_string(server.port());
+  if (creds_in_play) {
+    proxy_arg = std::string(creds.user) + ":" + creds.pass + "@" + proxy_arg;
+  }
   const std::string injector_cmd =
       quote_arg(g_cli_path) + " -i " + std::to_string(decoy.pid()) + " -p " +
-      server.address() + ":" + std::to_string(server.port()) + " -l";
+      proxy_arg + " -l";
   const bool spawned_cli = injector.spawn(injector_cmd, true);
   CHECK(spawned_cli);
   if (!spawned_cli) {
@@ -727,8 +764,39 @@ void injection_case(const char *label, const std::string &decoy_host,
   }
   std::printf("  [%s] cli pid %lu\n", label, injector.pid());
 
-  const bool saw_connect = server.wait_for_request_count(
-      1, std::chrono::milliseconds(kInjectRecordWaitMs));
+  // On the wire the login comes first, so the auth record is read before the
+  // CONNECT is waited for.  Bytes are asserted, lengths are printed.
+  const bool refused_login = creds_in_play && creds.refused;
+  if (creds_in_play) {
+    const bool saw_login = server.wait_for_auth_count(
+        1, std::chrono::milliseconds(kInjectRecordWaitMs));
+    CHECK(saw_login);
+    const auto auth = server.auth_records();
+    CHECK_EQ(auth.size(), std::size_t(1));
+    if (!auth.empty()) {
+      const auto &rec = auth.back();
+      const std::vector<std::uint8_t> offered{SOCKS_USERNAME_PASSWORD,
+                                              SOCKS_NO_AUTHENTICATION};
+      CHECK(rec.offered == offered);  // the DLL really offered method 2
+      CHECK(rec.chose_auth);          // the relay picked it
+      CHECK(rec.parsed);              // a complete 1929 request arrived
+      CHECK_EQ(rec.username, std::string(creds.user));  // exact bytes on both
+      CHECK_EQ(rec.password, std::string(creds.pass));
+      CHECK_EQ(rec.ok, !refused_login);
+      std::printf("  [%s] 1929 %s: offered [%s] user=%zu pass=%zu\n", label,
+                  rec.ok ? "accepted" : "refused",
+                  e2e::method_list_text(rec.offered).c_str(),
+                  rec.username.size(), rec.password.size());
+    }
+  }
+
+  // A refused login must never become a CONNECT: the caller waits out the whole
+  // decoy window below and the CONNECT count still has to read zero.
+  const bool saw_connect =
+      refused_login
+          ? true
+          : server.wait_for_request_count(
+                1, std::chrono::milliseconds(kInjectRecordWaitMs));
   CHECK(saw_connect);
   const auto records = server.requests();
   if (!records.empty()) {
@@ -746,8 +814,23 @@ void injection_case(const char *label, const std::string &decoy_host,
   const bool reported =
       decoy.wait(std::chrono::milliseconds(kInjectDecoyWaitMs));
   CHECK(reported);
-  CHECK_EQ(static_cast<int>(decoy.exit_code()), 0);
-  CHECK(server.echoed_round_trips() >= 1);
+  if (refused_login) {
+    // Fail closed, which is the whole point of this sub-case: the proxy turned
+    // the login down, so the target got WSAECONNREFUSED and never reached its
+    // destination directly.  Exit 3 alone does not prove that (an un-injected
+    // decoy exits 3 as well) -- the refused 1929 record above does, because
+    // only the injectee can put it on this relay.
+    CHECK_EQ(static_cast<int>(decoy.exit_code()), kExitNoRoundTrip);
+    CHECK_EQ(server.request_count(), std::size_t(0));
+    CHECK_EQ(server.echoed_round_trips(), std::size_t(0));
+  } else {
+    CHECK_EQ(static_cast<int>(decoy.exit_code()), 0);
+    CHECK(server.echoed_round_trips() >= 1);
+  }
+
+  // Read before the handles go away: after finish() the exit code cannot be
+  // asked for anymore, and an unreadable one prints as this helper's sentinel.
+  const unsigned long decoy_exit = decoy.exit_code();
 
   // Both children are killed and closed here, on every path; the injected DLL
   // is never unloaded (the injectee unloads itself, that is its business).
@@ -755,8 +838,12 @@ void injection_case(const char *label, const std::string &decoy_host,
   decoy.finish();
 
   if (test_failures > failures_before) {
-    std::printf("  [%s] FAILED after %zu CONNECT(s), %zu echo(s)\n", label,
-                records.size(), server.echoed_round_trips());
+    std::printf("  [%s] FAILED after %zu CONNECT(s), %zu echo(s), %zu login(s)\n",
+                label, records.size(), server.echoed_round_trips(),
+                server.auth_count());
+    // The exit code tells an unhooked decoy (3, it ran out its deadline) from
+    // one that died inside the injected code (an exception code).
+    std::printf("  [%s] decoy exit 0x%08lx\n", label, decoy_exit);
     for (std::size_t i = 0; i < records.size(); ++i) {
       const auto &rec = records[i];
       std::printf("    #%zu %s(%s):%u\n", i, e2e::atyp_name(rec.atyp).c_str(),
@@ -784,10 +871,44 @@ void inject_ipv4_decoy() {
 // means editing the decoy, which is outside this file's fence, so it reports
 // itself as skipped rather than passed or failed.  Once the decoy can dial v6,
 // assert the CURRENT byte order that the S1c winnet tests locked down here.
+// P5 S6b: credentials through the real injection path -- the CLI parses
+// -p user:pass@host:port, the server ships them in InjectorConfig fields 4/5,
+// the injected DLL negotiates RFC 1929, and this relay judges the login.
+void inject_auth_accepted() {
+  injection_case("auth-pass", "203.0.113.7", 8080, SOCKS_IPV4,
+                 inject_creds{"alice", "s3cr3t!", "alice", "s3cr3t!", false,
+                              kAuthDecoyDeadlineMs});
+}
+
+// Same login from the same code path; only the relay's expectation differs, so
+// what is under test is the response to a refusal.
+void inject_auth_refused() {
+  injection_case("auth-refused", "203.0.113.7", 8080, SOCKS_IPV4,
+                 inject_creds{"alice", "s3cr3t!", "alice",
+                              "not-the-real-secret", true,
+                              kAuthDecoyDeadlineMs});
+}
+
 void inject_ipv6_decoy() {
   std::printf("  SKIP(ipv6): the decoy is AF_INET-only, so the injected "
               "[2001:db8::1]:9090 case cannot reach the relay yet; no IPv6 "
               "byte-order assertion is made (P4-1)\n");
+}
+
+// Both auth sub-cases, sequentially, in one process.  Each brings its own
+// relay and decoy, so the wall clock is roughly 20s + 20s -- well inside the
+// 120s the CTest registration allows.
+int run_inject_auth() {
+  if (g_cli_path.empty() || g_dummy_override.empty()) {
+    std::printf("usage: e2e_test --inject-auth --cli <encapsule-cli> "
+                "--dummy <dummy_target>\n");
+    return 2;
+  }
+  std::printf("  cli   = %s\n  dummy = %s\n", g_cli_path.c_str(),
+              g_dummy_override.c_str());
+  RUN(inject_auth_accepted);
+  RUN(inject_auth_refused);
+  return test_failures;
 }
 
 int run_inject() {
@@ -826,6 +947,8 @@ int main(int argc, char **argv) {
       mode = "selfcheck";
     } else if (flag == "--inject") {
       mode = "inject";
+    } else if (flag == "--inject-auth") {
+      mode = "inject_auth";
     } else if (flag == "--cli") {
       if (!take(g_cli_path)) {
         std::printf("--cli needs a value\n");
@@ -838,7 +961,8 @@ int main(int argc, char **argv) {
       }
     } else {
       std::printf("unknown argument %s\n", flag.c_str());
-      std::printf("usage: e2e_test --selfcheck | --inject --cli X --dummy Y\n");
+      std::printf("usage: e2e_test --selfcheck | --inject | --inject-auth"
+                  " --cli X --dummy Y\n");
       return 2;
     }
   }
@@ -856,10 +980,13 @@ int main(int argc, char **argv) {
   if (mode == "selfcheck") {
     run_selfcheck();
     result = test_failures;
+  } else if (mode == "inject_auth") {
+    result = run_inject_auth();
   } else if (mode == "inject") {
     result = run_inject();
   } else {
-    std::printf("usage: e2e_test --selfcheck | --inject --cli X --dummy Y\n");
+    std::printf("usage: e2e_test --selfcheck | --inject | --inject-auth"
+                " --cli X --dummy Y\n");
     result = 2;
   }
 
