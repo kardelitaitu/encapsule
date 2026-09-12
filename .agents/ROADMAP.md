@@ -146,10 +146,14 @@ UI data-race fixes (`view.post`).
       sides move together to keep the protopuf wire format compatible. (e7ff326:
       username=4/password=5 optional+separate; credential-free config pinned
       byte-identical to pre-P5 wire; report messages pinned credential-free.)
-- [ ] Injectee: offer methods `{5, 2, 0}` (no-auth + userpass) when credentials are
-      configured — `{5,1,0}` unchanged otherwise. (S3 in flight.)
-- [ ] Injectee: implement the RFC 1929 user/pass subnegotiation and apply configured
-      credentials during `socks5_handshake`. (S3 in flight.)
+- [x] Injectee: offer methods `{5, 2, 0}` (no-auth + userpass, method 2 preferred)
+      when credentials are configured — `{5,1,0}` byte-identical otherwise
+      (a76f052: offer tracks credential state; `enabled()` is OR, blank password ok).
+- [x] Injectee: implement the RFC 1929 user/pass subnegotiation and apply configured
+      credentials during `socks5_handshake` (a76f052: socks5_build_auth pinned bytes,
+      required creds param at all 4 hook sites — compiler-enforced, no dangling-view
+      trap via socks5_credentials_from(cfg), fail-closed on 0xFF/short/bad-status,
+      no silent unauthenticated fallback).
 - [ ] Server side: validate and forward credentials from the frontends into the
       config message.
 - [ ] CLI: accept credentials via `-p user:pass@host:port` and/or dedicated
@@ -157,7 +161,8 @@ UI data-race fixes (`view.post`).
 - [x] GUI: accept credentials in the proxy input (41de274: dedicated username/password
       boxes + no-mask tooltip; CI-compiled — local elements/MSVC exception).
 - [ ] Unit tests: handshake byte-level tests covering auth success and auth failure.
-      (S3 in flight — builder + handshake cases are in its brief.)
+      (builders+offer pinned by a76f052 — 25 cases; live accept/refuse walk -> S6a
+      relay selfcheck, in flight.)
 - [ ] E2E: verify against a socks5 server that requires authentication.
 
 ### P6 — Feature: DNS resolution hooking
