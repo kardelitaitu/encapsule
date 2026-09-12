@@ -106,18 +106,34 @@ injected process is undone. What the victim then experiences:
    (`injectee_config::drop()` only marks the session down). If that proxy is
    gone too, connects simply fail — the honest outcome. Quietly reverting
    to a direct route is precisely the leak the tool exists to prevent.
-3. **The client reconnects, briefly.** The lost IPC channel is retried with
+3. **The client reconnects, briefly — to the same injector only.** The lost
+   IPC channel is retried against the port and token it already holds, with
    bounded exponential backoff on the existing `asio::steady_timer`: 1s, 2s,
    4s, 8s, capped at 10s, for a total budget of 60s per disconnect. Every
    attempt sends a fresh `pid` hello that **re-presents the per-injection
    token** from the mapping payload, so a reconnect is authenticated exactly
    like a first session (P4 #3): a process that merely guessed the mapping
-   name cannot take the channel over.
-4. **After the budget expires, nothing changes.** The client stops trying
-   but undoes nothing — the thread parks on an unexpiring timer so the
-   globals the hooks read (`queue`, `config`, `nbio_map`) stay bound and
-   the module stays mapped. Restarting the injector and re-injecting the
-   process gives it a new session, a new token and a new config.
+   name cannot take the channel over. That recovery only ever works while the
+   injector that minted the token is still alive — see the next item.
+4. **After the budget expires, nothing changes — and nothing can be
+   revived.** The client stops trying but undoes nothing: the thread parks
+   on an unexpiring timer so the globals the hooks read (`queue`, `config`,
+   `nbio_map`) stay bound and the module stays mapped. **Reconnecting to a
+   restarted injector is not possible today** — the practical recovery is to
+   restart the target process and inject that. Re-injecting instead makes it
+   worse: the control port is ephemeral per injector run (`auto_endpoint`,
+   `src/common/async_io.hpp`), the mapping that carried port + token is a
+   function-local on both sides — `injector::inject()` on the injector,
+   `get_ipc_payload()` in the target — so the named section is gone once the
+   first read returned, and `DllMain` never runs again for a resident module
+   (a second `LoadLibraryW` is a refcount bump, so no new port or token is
+   ever picked up). Meanwhile the server has dropped the token the session
+   was using (`injector_server::remove` → `injector::forget_token`) while that
+   second inject mints a fresh one for the same pid: the resident injectee
+   keeps presenting a secret nobody holds anymore, and every hello is
+   refused. Re-provisioning an already-injected process is tracked in the
+   roadmap as the M1 remediation ladder — a durable mapping the client
+   re-reads on each attempt is the accepted fix.
 
 Pre-session failures are unchanged and still release the DLL, because at
 that point no detour is live in another thread: a missing or zero IPC port
