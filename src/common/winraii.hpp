@@ -20,8 +20,11 @@
 #include "utils.hpp"
 #include <Windows.h>
 #include <sddl.h>
+#include <cctype>
 #include <memory>
 #include <optional>
+#include <set>
+#include <vector>
 
 template <auto f> struct static_function {
   template <typename T> decltype(auto) operator()(T &&x) const {
@@ -273,6 +276,66 @@ template <typename F> void enumerate_child_pids(DWORD pid, F &&f) {
       std::forward<F>(f)(entry.th32ProcessID);
     }
   });
+}
+
+// Every pid alive right now, in Toolhelp32 snapshot order. Walks the same
+// snapshot as match_process, so there is exactly one enumeration to keep
+// correct; an empty result means the snapshot itself could not be taken.
+inline std::vector<DWORD> enumerate_pids() {
+  std::vector<DWORD> pids;
+  match_process([&pids](const PROCESSENTRY32W &entry) {
+    pids.push_back(entry.th32ProcessID);
+  });
+
+  return pids;
+}
+
+// The pure half of watch mode: which pids appeared since the previous poll.
+// No syscalls here -- the caller owns the snapshots -- so the rule itself is
+// host-testable.  The result is ascending and duplicate-free: a pid listed
+// twice in `now` is one process, and anything already in `prev` is not new.
+// A pid that exited and shows up again later IS reported again: the caller
+// stores the poll that proved the exit, so the number is no longer in `prev`.
+inline std::vector<DWORD> process_watch_diff(const std::set<DWORD> &prev,
+                                             const std::vector<DWORD> &now) {
+  const std::set<DWORD> current(now.begin(), now.end()); // sorts and dedups
+
+  std::vector<DWORD> added;
+  for (DWORD pid : current) {
+    if (!prev.contains(pid)) {
+      added.push_back(pid);
+    }
+  }
+
+  return added;
+}
+
+// The short name of a live process -- image basename, lowercased, without the
+// ".exe" -- or std::nullopt when the process has already exited or cannot be
+// opened.  Races are the norm for a watcher: callers MUST tolerate nullopt and
+// just skip that pid, never treat it as a match.  Matching a name against a
+// pattern is left to match_process_by_name / filename_wildcard_match, so no
+// second copy of that rule lives here.
+inline std::optional<std::string> process_short_name(DWORD pid) {
+  auto wpath = get_process_filepath(pid);
+  if (!wpath) {
+    return std::nullopt;
+  }
+
+  auto filename = wpath->substr(wpath->find_last_of(L"\\/") + 1);
+  auto name = utf8_encode(filename);
+
+  // ASCII folding only: bytes >= 0x80 are UTF-8 tails and pass through, so a
+  // non-ASCII image name survives unchanged apart from its ASCII letters.
+  for (char &c : name) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+
+  if (name.ends_with(".exe")) {
+    name = name.substr(0, name.size() - 4);
+  }
+
+  return name;
 }
 
 inline std::optional<PROCESS_INFORMATION>

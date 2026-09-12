@@ -25,11 +25,17 @@
 #include <algorithm>
 #include <cctype>
 #include <regex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include <utils.hpp>
+
+// The watch-mode primitives under test live in winraii.hpp, which carries
+// non-inline helpers -- safe here because this is the only translation unit of
+// this binary (same reason the e2e binary includes it).
+#include <winraii.hpp>
 
 // ---------------------------------------------------------------- wildcard --
 
@@ -397,6 +403,129 @@ void endpoint_rejects_garbage() {
   check_rejected("@");
 }
 
+// ------------------------------------------------------------ watch diff --
+
+// process_watch_diff is the pure half of auto-inject: no syscalls and no
+// snapshot to blame, so the rule a watcher will live by can be pinned right
+// here.  Each case is the same three lists: what the caller had already seen,
+// what the next poll found, and the pids a watcher may act on.
+
+std::vector<DWORD> diff_of(const std::set<DWORD> &prev,
+                           const std::vector<DWORD> &now) {
+  return process_watch_diff(prev, now);
+}
+
+void an_empty_previous_snapshot_reports_everything() {
+  // nothing seen yet, so everything is an appearance -- and the order the
+  // snapshot came in is not the order the watcher is handed
+  CHECK_EQ(diff_of({}, {30, 10, 20}), (std::vector<DWORD>{10, 20, 30}));
+  CHECK(diff_of({}, {}).empty()); // an empty world is still an empty answer
+}
+
+void an_unchanged_snapshot_reports_nothing() {
+  const std::set<DWORD> prev{10, 20, 30};
+
+  // the same three processes, spelled however you like: none of them is new
+  CHECK(diff_of(prev, {10, 20, 30}).empty());
+  CHECK(diff_of(prev, {30, 10, 20}).empty()); // order carries no information
+  CHECK(diff_of(prev, {20, 20, 10, 30, 30}).empty());
+
+  // processes are allowed to have EXITED between polls, which is not an
+  // appearance either: the diff reports arrivals only
+  CHECK(diff_of(prev, {10, 30}).empty());
+  CHECK(diff_of(prev, {}).empty());
+}
+
+void a_reappearing_pid_is_reported_again() {
+  // three polls of one pid: new, gone, and back.  The middle one stores a prev
+  // without 40, so the last one must report 40 again -- a watcher that
+  // remembered 40 forever would never re-inject a program it restarted, which
+  // is the whole point of auto-inject.
+  CHECK_EQ(diff_of({}, {40}), std::vector<DWORD>{40});
+  CHECK(diff_of(std::set<DWORD>{40}, {}).empty());
+  CHECK_EQ(diff_of(std::set<DWORD>{}, {40}), std::vector<DWORD>{40});
+
+  // and a known pid sitting next to a new one is still not news
+  CHECK_EQ(diff_of(std::set<DWORD>{40}, {40, 41}), std::vector<DWORD>{41});
+}
+
+void results_are_ascending_and_duplicate_free() {
+  const std::set<DWORD> prev{7, 50, 50, 1000};
+  const std::vector<DWORD> now{1000, 3, 50, 99, 3, 7};
+
+  // 7, 50 and 1000 were already known; 3 and 99 are new; 3 was listed twice
+  // but it is one process, so it is one report
+  CHECK_EQ(diff_of(prev, now), (std::vector<DWORD>{3, 99}));
+
+  // ascending is the contract, not luck of the input
+  CHECK_EQ(diff_of({}, {4000, 1, 2000, 300, 3}),
+           (std::vector<DWORD>{1, 3, 300, 2000, 4000}));
+  CHECK_EQ(diff_of({}, {1, 1, 1}), std::vector<DWORD>{1});
+}
+
+// --------------------------------------------------------- live processes --
+
+// What a real snapshot guarantees, as opposed to what it happens to hold:
+// other processes come and go while this runs, so the only process that may be
+// asserted to exist is this one -- the process we are standing in.  Anything
+// spawned is probed optionally, because losing the race is normal.
+
+void the_snapshot_contains_this_process() {
+  const DWORD self = GetCurrentProcessId();
+
+  const auto pids = enumerate_pids();
+  CHECK(!pids.empty());
+  CHECK(std::find(pids.begin(), pids.end(), self) != pids.end());
+
+  // the invariant that keeps a watcher from re-injecting the world: a poll
+  // that is fed back as prev, unchanged, produces no work
+  const std::set<DWORD> as_set(pids.begin(), pids.end());
+  CHECK(diff_of(as_set, pids).empty());
+  // and one poll later, whatever else started in the meantime: we are in prev,
+  // we are still alive, so we must not come back as an appearance
+  const auto later = diff_of(as_set, enumerate_pids());
+  CHECK(std::find(later.begin(), later.end(), self) == later.end());
+}
+
+void the_short_name_of_this_process_is_its_stem() {
+  // our own image is alive and openable, so this cannot race.  The spelling
+  // below is the CMake target of this binary (tests/utils/CMakeLists.txt:1):
+  // a basename, folded to lower case, with the extension dropped -- exactly
+  // the shape a name pattern is matched against.
+  const std::string name =
+      process_short_name(GetCurrentProcessId()).value_or("");
+  CHECK_EQ(name, "encapsule_test_utils");
+  CHECK(name.find_first_of("\\/") == std::string::npos); // no directory left
+  CHECK(!name.ends_with(".exe"));                        // no extension left
+
+  // value_or above also covers the contract that a name is returned at all
+  CHECK(process_short_name(GetCurrentProcessId()).has_value());
+}
+
+void a_pid_that_cannot_be_opened_has_no_name() {
+  // pid 0 is the reserved System Idle Process and pid (DWORD)-1 is not a pid:
+  // both answers are "no such process", which a watcher must skip rather than
+  // treat as a match.  This is the nullopt documented on the helper.
+  CHECK(!process_short_name(0).has_value());
+  CHECK(!process_short_name(static_cast<DWORD>(-1)).has_value());
+}
+
+void a_spawned_child_is_named_while_it_survives() {
+  // cmd.exe /c exit is on its way out before CreateProcess even returns, so
+  // the probe stays optional: no assertion is made about catching it, and the
+  // one that is made only runs when the name really was readable.
+  auto proc = create_process("cmd.exe /c exit");
+  if (!proc) {
+    return; // nothing to probe, which is still not a failure
+  }
+  handle process = proc->hProcess; // winraii's own RAII closes both handles
+  handle thread = proc->hThread;
+
+  if (auto name = process_short_name(proc->dwProcessId)) {
+    CHECK_EQ(*name, "cmd"); // the image we asked for, folded to its stem
+  }
+}
+
 int main() {
   RUN(wildcard_star);
   RUN(wildcard_question);
@@ -416,5 +545,13 @@ int main() {
   RUN(endpoint_without_a_username_has_no_credentials);
   RUN(endpoint_credential_length_caps);
   RUN(endpoint_rejects_garbage);
+  RUN(an_empty_previous_snapshot_reports_everything);
+  RUN(an_unchanged_snapshot_reports_nothing);
+  RUN(a_reappearing_pid_is_reported_again);
+  RUN(results_are_ascending_and_duplicate_free);
+  RUN(the_snapshot_contains_this_process);
+  RUN(the_short_name_of_this_process_is_its_stem);
+  RUN(a_pid_that_cannot_be_opened_has_no_name);
+  RUN(a_spawned_child_is_named_while_it_survives);
   return test_failures;
 }
