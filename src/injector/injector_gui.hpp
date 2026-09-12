@@ -40,6 +40,15 @@ constexpr auto bcblue = ce::colors::cornflower_blue.opacity(0.4);
 
 using process_vector = std::vector<std::pair<DWORD, std::string>>;
 
+// Every field of a report message is optional on the wire: protopuf keeps an
+// absent one as std::nullopt, and "absent" is a different answer from "empty"
+// (the P5 contract, pinned by tests/schema).  So a field is looked at before
+// it is used, and the two fixed strings below are what comes out instead -- a
+// report that cannot be printed is still a report, and neither it nor the
+// memory printing needs may end the tool from the io thread.
+constexpr const char *unset_field = "<unset>";
+constexpr const char *dropped_report = "a connection report was not printed";
+
 struct injectee_session_ui : injectee_session {
   injectee_session_ui(tcp::socket socket, injector_server &server,
                       ce::view &view_, process_vector &vec_, auto &list_,
@@ -53,44 +62,88 @@ struct injectee_session_ui : injectee_session {
   ce::dynamic_list_s &list_;
   ce::selectable_text_box &log_;
 
+  // One fixed line, appended from the io thread through the same post the
+  // normal path uses, and guarded inside: every caller is a catch, and a throw
+  // on the way out of one ends the process exactly like a throw that was never
+  // caught -- there is nobody to rethrow into, these coroutines run detached.
+  void report_failure() {
+    try {
+      const std::string str = std::string("[report] ") + dropped_report + "\n";
+      view_.post([&log = log_, str] { log.set_text(log.get_text() + str); });
+      view_.refresh();
+    } catch (...) {
+    }
+  }
+
   asio::awaitable<void> process_connect(const InjecteeConnect &msg) override {
-    auto curr_time = std::chrono::system_clock::now();
-    auto curr_sec = std::chrono::system_clock::to_time_t(curr_time);
-    auto curr_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        curr_time.time_since_epoch());
-    auto curr_milli_part = curr_ms.count() % 1000;
+    try {
+      auto curr_time = std::chrono::system_clock::now();
+      auto curr_sec = std::chrono::system_clock::to_time_t(curr_time);
+      auto curr_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          curr_time.time_since_epoch());
+      auto curr_milli_part = curr_ms.count() % 1000;
 
-    std::stringstream stream;
-    stream << "["
-           << std::put_time(std::localtime(&curr_sec), "%Y-%m-%d %H:%M:%S")
-           << "." << std::setfill('0') << std::setw(3) << curr_milli_part
-           << "] ";
-    stream << (int)pid_ << ": " << *msg["syscall"_f] << " " << *msg["addr"_f];
-    if (auto v = msg["proxy"_f])
-      stream << " via " << *v;
-    stream << "\n";
+      std::stringstream stream;
+      stream << "["
+             << std::put_time(std::localtime(&curr_sec), "%Y-%m-%d %H:%M:%S")
+             << "." << std::setfill('0') << std::setw(3) << curr_milli_part
+             << "] ";
+      stream << (int)pid_ << ": ";
+      // The rest of the line is the victim process talking back, field by
+      // field: a truncated or forged report gets the placeholder in the place
+      // of the value it did not send, never a dereference of an empty
+      // optional.  Nothing dynamic is ever printed for a missing field.
+      if (auto syscall = msg["syscall"_f]) {
+        stream << *syscall;
+      } else {
+        stream << unset_field;
+      }
+      stream << " ";
+      if (auto addr = msg["addr"_f]) {
+        stream << *addr;
+      } else {
+        stream << unset_field;
+      }
+      if (auto proxy = msg["proxy"_f]) {
+        stream << " via " << *proxy;
+      }
+      stream << "\n";
 
-    view_.post([&log = log_, str = stream.str()] {
-      log.set_text(log.get_text() + str);
-    });
-    view_.refresh();
+      view_.post([&log = log_, str = stream.str()] {
+        log.set_text(log.get_text() + str);
+      });
+      view_.refresh();
+    } catch (...) {
+      // Including the std::bad_alloc of a log that has outgrown memory: the
+      // report is dropped, the session and the tool are not.
+      report_failure();
+    }
 
     co_return;
   }
 
   asio::awaitable<void> process_pid() override {
-    vec_.emplace_back(pid_, get_process_name(pid_));
-    refresh();
+    try {
+      vec_.emplace_back(pid_, get_process_name(pid_));
+      refresh();
+    } catch (...) {
+      report_failure();
+    }
+
     co_return;
   }
 
   void process_close() override {
-    auto iter = std::find_if(vec_.begin(), vec_.end(), [this](auto &&pair) {
-      return pair.first == pid_;
-    });
-    if (iter != vec_.end()) {
-      vec_.erase(iter);
-      refresh();
+    try {
+      auto iter = std::find_if(vec_.begin(), vec_.end(), [this](auto &&pair) {
+        return pair.first == pid_;
+      });
+      if (iter != vec_.end()) {
+        vec_.erase(iter);
+        refresh();
+      }
+    } catch (...) {
+      report_failure();
     }
   }
 
@@ -166,6 +219,19 @@ constexpr std::size_t process_id_max_digits = 10;
 // click handler, on the thread that owns the window.  Returns null and fills
 // `out`, or returns fixed text naming the refusal; what was typed is never in
 // it, because a paste gone wrong belongs in nobody's log.
+// The hint text of one input option, taken through `find` rather than `at`.
+// The key is there today because the menu and this table are built from the
+// same list, but an absent hint is a box with no hint -- not a reason for a
+// throw to reach the process before its window has even been drawn.
+inline std::string input_tip_text(std::string_view option) {
+  auto tip = input_tip_texts.find(option);
+  if (tip == input_tip_texts.end()) {
+    return std::string();
+  }
+
+  return std::string(tip->second);
+}
+
 inline const char *parse_process_id(const std::string &text, DWORD &out) {
   constexpr const char *bad_id =
       "the process id must be a number from 1 to 4294967295";
@@ -234,22 +300,27 @@ auto make_controls(injector_server &server, ce::view &view,
     }
   };
 
-  auto [process_input, process_input_ptr] =
-      input_box(std::string(input_tip_texts.at("pid")));
+  auto [process_input, process_input_ptr] = input_box(input_tip_text("pid"));
 
   auto [input_select, input_select_ptr] = selection_menu(
-      [process_input_ptr, report](auto str) {
+      [process_input_ptr, report, guarded](auto str) {
         // Picking from this menu is a click, and this was a throwing map
         // lookup inside one.  `str` comes back from the widget rather than
         // from here, so the key is nobody's promise: `input_tip_texts` and the
         // menu are built from the same table today, but a lookup that cannot
-        // fail should not be one that ends the process if it ever can.
-        auto tip = input_tip_texts.find(str);
-        if (tip != input_tip_texts.end()) {
-          process_input_ptr->_placeholder = tip->second;
-        } else {
-          report("[process]", "that process selector is not known");
-        }
+        // fail should not be one that ends the process if it ever can.  And
+        // the assignment below copies into the widget, so the whole thing now
+        // sits behind the same backstop every other click in this window uses.
+        guarded(
+            [&] {
+              auto tip = input_tip_texts.find(str);
+              if (tip != input_tip_texts.end()) {
+                process_input_ptr->_placeholder = tip->second;
+              } else {
+                report("[process]", "that process selector is not known");
+              }
+            },
+            "[process]", "the input hint was not updated");
       },
       input_tip_options);
 
