@@ -160,9 +160,10 @@ UI data-race fixes (`view.post`).
       `--proxy-user/--proxy-pass` flags.
 - [x] GUI: accept credentials in the proxy input (41de274: dedicated username/password
       boxes + no-mask tooltip; CI-compiled — local elements/MSVC exception).
-- [ ] Unit tests: handshake byte-level tests covering auth success and auth failure.
-      (builders+offer pinned by a76f052 — 25 cases; live accept/refuse walk -> S6a
-      relay selfcheck, in flight.)
+- [x] Unit tests: handshake byte-level tests covering auth success and auth failure
+      (a76f052 builders/offer 25 cases + 18ef7c4 live-socket relay walk: accept, bad
+      pass refused, demanded-without-creds -> {5,FF}, not-required -> {5,00} as
+      today; tunnel proven post-negotiation; creds never logged).
 - [ ] E2E: verify against a socks5 server that requires authentication.
 
 ### P6 — Feature: DNS resolution hooking
