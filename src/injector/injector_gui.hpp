@@ -248,21 +248,40 @@ auto make_controls(injector_server &server, ce::view &view,
   auto [user_input, user_input_ptr] = input_box("username");
   auto [pass_input, pass_input_ptr] = input_box("password");
 
+  // Created before the proxy toggle because that handler reports rejected
+  // input here: this log is the only text the proxy panel can make the user
+  // see, and a credential that cannot be sent has to say so out loud.
+  auto log_box = share(selectable_text_box(""));
+
   auto proxy_toggle = share(toggle_icon_button(icons::power, 1.2, brblue));
-  proxy_toggle->on_click = [&server, proxy_toggle, addr_input_ptr,
-                            port_input_ptr, user_input_ptr,
+  proxy_toggle->on_click = [&server, &view, proxy_toggle, log_box,
+                            addr_input_ptr, port_input_ptr, user_input_ptr,
                             pass_input_ptr](bool on) {
     if (on) {
       auto addr = trim_copy(addr_input_ptr->get_text());
       auto port = trim_copy(port_input_ptr->get_text());
-      if (all_of_digit(port) && !addr.empty() && !port.empty()) {
+      // A username gets trimmed: a space around a name is a slip of the
+      // keyboard.  A password does not: credentials are raw strings whose
+      // every character counts, and trimming one would authenticate with a
+      // secret nobody typed -- worse than any typo this could hide.
+      auto user = trim_copy(user_input_ptr->get_text());
+      auto pass = pass_input_ptr->get_text();
+
+      // schema.hpp:88-89 assigns the length caps to the frontends, so this
+      // panel is where they belong.  Both lengths travel in a single octet, so
+      // an over-long credential can never reach a server: accepting it here
+      // would leave the injectee building no auth request at all, every
+      // connect of the process refused, and not one word said anywhere -- a
+      // silent self-inflicted outage.  Refuse it, and say why.
+      bool oversize = user.size() > proxy_credential_max_length ||
+                      pass.size() > proxy_credential_max_length;
+
+      if (!oversize && all_of_digit(port) && !addr.empty() && !port.empty()) {
         server.set_proxy(ip::address::from_string(addr), std::stoul(port));
 
         // Credentials follow the same apply path as the address. A password
         // without a username is ignored, matching the CLI; an empty field
         // means "unset", never an empty string.
-        auto user = trim_copy(user_input_ptr->get_text());
-        auto pass = trim_copy(pass_input_ptr->get_text());
         if (user.empty()) {
           server.clear_proxy_credentials();
         } else if (pass.empty()) {
@@ -272,6 +291,14 @@ auto make_controls(injector_server &server, ce::view &view,
         }
       } else {
         proxy_toggle->value(false);
+        if (oversize) {
+          log_box->set_text(log_box->get_text() +
+                            "[proxy] username and password must each be at "
+                            "most " +
+                            std::to_string(proxy_credential_max_length) +
+                            " characters\n");
+          view.refresh();
+        }
       }
     } else {
       server.clear_proxy();
@@ -285,8 +312,6 @@ auto make_controls(injector_server &server, ce::view &view,
   subprocess_toggle.on_click = [&server](bool on) {
     server.enable_subprocess(on);
   };
-
-  auto log_box = share(selectable_text_box(""));
 
   auto clean_button = icon_button(icons::trash, 1.2, bcblue);
   clean_button.on_click = [log_box](bool) { log_box->set_text(""); };

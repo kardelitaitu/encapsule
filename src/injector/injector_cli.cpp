@@ -139,10 +139,26 @@ int main(int argc, char *argv[]) {
   // on an accept loop that never ends.
   std::optional<proxy_endpoint> proxy;
   std::optional<ip::address> proxy_addr;
-  if (auto proxy_str = trim_copy(parser.get<string>("-p"));
-      !proxy_str.empty()) {
+  // No trim here on purpose: `-p` carries the password, credentials are raw
+  // strings by contract and `parse_proxy_url` treats every character as
+  // literal, so trimming would quietly authenticate with a DIFFERENT secret
+  // than the one that was typed.  A stray space around the host or the port
+  // is now a parse error -- loud, and the honest outcome for a literal field.
+  if (auto proxy_str = parser.get<string>("-p"); !proxy_str.empty()) {
+    // Everything up to and including the LAST '@' is userinfo, i.e. the
+    // secret.  Echoing the raw argument would put the password on stderr --
+    // and into whatever console scrollback, terminal log or CI transcript
+    // captured it -- on every rejection, which is precisely the failure mode
+    // this diagnostic exists to report.  Name only the authority, the part
+    // the parser itself splits the credentials off from.
+    const auto at = proxy_str.rfind('@');
+    const string shown =
+        at == string::npos ? proxy_str : proxy_str.substr(at + 1);
+    // The `why` strings below are either fixed text or quote
+    // `endpoint->host`, which is by construction taken from that authority
+    // (the parser splits at the last '@', so a host can never hold userinfo).
     auto fail = [&](const string &why) {
-      cerr << "Invalid proxy address `" + proxy_str + "`: " + why << endl;
+      cerr << "Invalid proxy address `" + shown + "`: " + why << endl;
       cerr << parser;
       return 2;
     };
