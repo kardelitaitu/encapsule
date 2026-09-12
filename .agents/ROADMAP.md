@@ -170,10 +170,12 @@ UI data-race fixes (`view.post`).
       pass refused, demanded-without-creds -> {5,FF}, not-required -> {5,00} as
       today; + malformed 1929 refusals, relay stays live (7235543); tunnel proven
       post-negotiation; creds never logged).
-- [ ] E2E: verify against a socks5 server that requires authentication.
-      (harness + e2e.inject_auth landed ea12f75; RED pending the fix of a REAL
-      fail-open bug it caught: creds-bearing InjectorConfig never applies, traffic
-      goes direct. Push held until green.)
+- [x] E2E: verify against a socks5 server that requires authentication.
+      (ea12f75 + 91d4d2c; e2e.inject_auth green: accepted login reaches CONNECT,
+      refused login leaves 0 CONNECTs / 0 echoes / nonzero exit. The earlier red was
+      the test's own 18s decoy deadline expiring inside the ~21.3s pre-injection
+      connect — NO config-apply defect, nothing leaked direct. Retracts the false
+      'fail-open' annotation of dfc82f4.)
 
 ### P6 — Feature: DNS resolution hooking
 - [ ] Decide the strategy: fake-IP domain mapping vs. pass-through resolution with
