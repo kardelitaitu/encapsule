@@ -171,6 +171,9 @@ UI data-race fixes (`view.post`).
       today; + malformed 1929 refusals, relay stays live (7235543); tunnel proven
       post-negotiation; creds never logged).
 - [ ] E2E: verify against a socks5 server that requires authentication.
+      (harness + e2e.inject_auth landed ea12f75; RED pending the fix of a REAL
+      fail-open bug it caught: creds-bearing InjectorConfig never applies, traffic
+      goes direct. Push held until green.)
 
 ### P6 — Feature: DNS resolution hooking
 - [ ] Decide the strategy: fake-IP domain mapping vs. pass-through resolution with
