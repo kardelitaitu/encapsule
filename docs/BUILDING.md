@@ -218,18 +218,27 @@ The CLI takes the endpoint as an argument, so the whole
 `[user[:pass]@]host:port` string — password included — sits in the process
 command line, where any same-user process and any process-audit provider
 (Sysmon EID 1 logs it verbatim) can read it; the GUI's separate
-username/password boxes keep it out of argv. Nothing else about the CLI is
-loose, though: a rejected `-p` names only the authority after the last `@`,
-never the userinfo, so the error path cannot echo the secret either.
+username/password boxes keep it out of argv. encapsule's own rejection path
+is redacted — a `-p` it cannot parse names only the authority after the last
+`@`, never the userinfo. That is NOT the whole error surface: the argument
+parser throws `Unknown argument: <token>` for anything it does not recognise
+and the CLI prints that message verbatim, so a mistyped
+`-palice:hunter2@1.2.3.4:1080`, a `-p=...` form, or a bare
+`--alice:hunter2@1.2.3.4:1080` echoes the secret to stderr exactly the way
+argv does — and any console capture, terminal log or CI transcript inherits
+it. Until that parser message is scrubbed, treat a credential typed onto the
+command line as already exposed.
 
-The other detail is whitespace. Nothing unescapes or percent-decodes the
-password: `parse_proxy_url` (`src/common/utils.hpp:162-298`) treats every
-character as literal, and the CLI hands it the `-p` value UNTRIMMED on purpose
-— trimming there would authenticate with a different secret than the one that
-was typed, so a stray space around the host or the port is a hard parse error
-instead of a quiet downgrade. The GUI is not symmetric yet: it trims every box
-it reads — host, username and password alike — so a password with meaningful
-leading or trailing whitespace can only be entered from the CLI.
+The other detail is whitespace. Nothing unescapes or percent-decodes either
+credential: `parse_proxy_url` (`src/common/utils.hpp:162-298`) treats every
+character as literal, and **neither front end trims the password** — the CLI
+hands the `-p` value over untrimmed and the GUI reads its password box raw,
+because trimming a secret would authenticate with something nobody typed. The
+asymmetry that does remain is on the *username*: the GUI trims it, the CLI
+takes it literally, so ` alice` signs in from the GUI and goes on the wire as
+`" alice"` from the CLI, where a server expecting `alice` refuses it. The CLI
+is also stricter at the edges for the same reason — a stray space around the
+host or the port is a hard parse error (exit 2), not a quiet downgrade.
 
 ### Fragile areas worth knowing when debugging
 

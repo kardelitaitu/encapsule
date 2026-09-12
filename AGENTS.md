@@ -1,6 +1,8 @@
 # AGENTS.md — encapsule
 
-Facts here were read from the cited sources (`master@8c0c6ed`). Re-verify after refactors.
+Facts here were read from the cited sources (`master@a6c23c4`). Re-verify after refactors.
+Line numbers are deliberately omitted for files other workers are editing right now (`hook.hpp`,
+`injectee.cpp`, `udp_state.hpp`, `injector_cli.cpp`, `injector_gui.hpp`) — read those by symbol.
 
 ## 1. Project overview
 
@@ -32,33 +34,58 @@ CMake >= 3.20, driven by `build.ps1`. Third-party deps are FetchContent-pinned a
 - `docs/` — `BUILDING.md` (contributor build/debug guide) + logo and screenshot images.
 - `.agents/ROADMAP.md` — roadmap + "fragile areas" notes (file:line references).
 - `src/common/` — `encapsule_common`, header-only INTERFACE lib: `schema.hpp` protopuf IPC messages
-  (`InjectorConfig` username=4 / password=5, the frozen P5 contract, :69-94) · `utils.hpp`
-  process/wildcard/regex matching, `proxy_endpoint` + `parse_proxy_url` (:162-298) and the mapping
-  name/token payload (:300-351) · `winraii.hpp` RAII handles, `virtual_memory`, `create_mapping` with
-  explicit DACL (:142-200) · `async_io.hpp` length-prefixed message
-  read/write · `queue.hpp` `blocking_queue<T>` · `minhook.hpp` CRTP MinHook
-  wrapper · `version.hpp.in` → generated `version.hpp` (`:95`).
+  (`InjectorConfig` username=4 / password=5, the frozen P5 contract, :69-94; the 255-char credential
+  caps are left to the front ends on purpose, :88-89) · `utils.hpp` process/wildcard/regex matching,
+  `proxy_endpoint` + `parse_proxy_url` (:162-298; cap constant `proxy_credential_max_length` :206)
+  and the mapping name/token payload (:300-351) · `winraii.hpp` RAII handles, `virtual_memory`,
+  `create_mapping` with explicit DACL (:145-203), the tool-side helpers `enumerate_pids` /
+  `process_watch_diff` / `process_short_name` (:284-339) and `create_process` (:341+) · `async_io.hpp`
+  length-prefixed message read/write + `localhost` / `auto_endpoint` (:54 — port 0, so the control
+  port is ephemeral per run) · `queue.hpp` `blocking_queue<T>` · `minhook.hpp` CRTP MinHook wrapper ·
+  `version.hpp.in` → generated `version.hpp` (`:95`).
 - `src/injectee/` — `encapsule-injectee.dll`, code that runs **inside the target process**:
-  `injectee.cpp` (`DllMain` :88; detached client thread) · `hook.hpp` (winsock detours; it
-  `#include`s `services.inc` from the service-name lookup — uncited on purpose, this file is being
-  edited) · `services.inc` (service-name table, no guard) · `client.hpp` (IPC client,
-  `injectee_config` :34-60, token hello :113-123) · `socks5.hpp` (pure builders :87-255 incl.
-  `socks5_build_auth` :237-255; socket layer `socks5_handshake` :268-324 does the RFC 1929
-  subnegotiation; single-TU include, see :257-261) · `winnet.hpp` (address helpers).
+  `injectee.cpp` (`DllMain`, the detached client thread, `get_ipc_payload()`; no line cites, in
+  flight) · `hook.hpp` (winsock detours; `#include`s `services.inc` from the service-name lookup;
+  no line cites, in flight) · `services.inc` (service-name table, no guard) · `client.hpp` (IPC
+  client, `injectee_config` :34-60, token hello :113-123) · `socks5.hpp` — cited by symbol because the
+  P7 UDP work is extending it right now: `socks5_credentials` + `socks5_credentials_from` borrow the
+  login out of an `InjectorConfig`, the pure byte builders (`socks5_build_greeting`,
+  `socks5_build_auth`, the two `socks5_request` shapes) sit above the socket layer, and
+  `socks5_handshake` runs the greeting → method-choice → RFC 1929 state machine. Only the socket layer
+  defines non-`inline` functions, so the header belongs in exactly one TU per binary ·
+  `winnet.hpp` (address helpers).
+  Two **pure, socket-free, host-testable** modules sit beside those and are **not** wired into the
+  hooks yet: `fakeip.hpp` (guard `ENCAPSULE_INJECTEE_FAKEIP`) — the ROADMAP P6 fake-IP name table
+  (T1+T2) over TEST-NET-2 / RFC 5737, nothing but `inline`/`constexpr`, no winsock and no
+  `schema.hpp`, so unlike `socks5.hpp` it carries no single-TU trap; the socket-facing layer that
+  feeds it real `sockaddr`/`IpAddr` values is still open. `udp_state.hpp` (guard
+  `ENCAPSULE_INJECTEE_UDP_STATE`) — the ROADMAP P7a UDP association / per-socket state (caps, drop
+  counters, recycled-`SOCKET` quarantine), sockets travel as `std::uintptr_t`, deliberately **not**
+  thread-safe (one pump thread), and there is no pump and no `UDP ASSOCIATE` client yet.
 - `src/injector/` — code that runs **outside**, in the tool's own process: `injector.hpp` (mapping +
   `VirtualAllocEx`/`WriteProcessMemory`/`CreateRemoteThread`; DLL names at :190-191; token store :65-109) ·
-  `server.hpp` (control server, `set_proxy_credentials`/`clear_proxy_credentials` :86-118, token check
-  :217-229) · `injector_cli.{cpp,hpp}` (argparse+spdlog; `-p` parse + credential log :135-207) ·
-  `injector_gui.{cpp,hpp}` (cycfi/elements) · `ui_elements/` (dynamic_list, text_box, tooltip widgets).
+  `server.hpp` — cited by symbol, it is growing with P6/P7 too: the control server keeps
+  `InjectorConfig` under `config_mutex`, `set_proxy_credentials` / `clear_proxy_credentials` push it
+  to every session, `injectee_session::process()` refuses any hello whose token fails
+  `injector::token_matches`, and `remove()` → `injector::forget_token` runs from `stop()` on every
+  session loss · `injector_cli.{cpp,hpp}`
+  (argparse+spdlog; `-p` parse, authority-only rejection message and the credential log line — no
+  line cites, in flight) · `injector_gui.{cpp,hpp}` (cycfi/elements; username/password boxes with the
+  255-char check — no line cites for the header, in flight) · `ui_elements/` (dynamic_list, text_box,
+  tooltip widgets).
 - `src/wow64/address_dumper.cpp` — Win32-only helper exe; returns the 32-bit `LoadLibraryW` address as
   its **process exit code** (`:22-26`); `#error`s if compiled as x64 (`:18-20`). Name unchanged by P3.
-- `tests/` — host-side CTest suite: `schema/`, `utils/`, `winnet/`, `socks5/`, `queue/`, `e2e/`
-  (+ `test_support.hpp`); the five unit dirs each hold one `add_executable(encapsule_test_<mod>)` +
-  one `add_test`, `e2e/` additionally builds a decoy exe (`encapsule_e2e_dummy`, :19-27).
+- `tests/` — host-side CTest suite: `schema/`, `utils/`, `winnet/`, `socks5/`, `queue/`, `fakeip/`,
+  `udp/`, `e2e/` (+ `test_support.hpp`); the **seven** unit dirs each hold one
+  `add_executable(encapsule_test_<mod>)` + one `add_test` (`tests/<mod>/CMakeLists.txt:4`), and
+  `fakeip/` / `udp/` link nothing but the include path — that is the point of those two headers.
+  `e2e/` additionally builds a decoy exe (`encapsule_e2e_dummy`, :19-27) and a header-only relay
+  (`socks5_test_server.hpp`, `require_auth`); `tests/` is not added in the injectee-only pass.
 
-Entry points (3 `main` + 1 `DllMain`): `src/injector/injector_cli.cpp:111` (`encapsule-cli`),
-`src/injector/injector_gui.cpp:41` (`encapsule`; window title `ce::app(..., "encapsule", "encapsule")` :45),
-`src/wow64/address_dumper.cpp:22` (`wow64-address-dumper`), `src/injectee/injectee.cpp:88` `DllMain`.
+Entry points (3 `main` + 1 `DllMain`): `main` in `src/injector/injector_cli.cpp` (`encapsule-cli`;
+line uncited, in flight), `src/injector/injector_gui.cpp:41` (`encapsule`; window title
+`ce::app(..., "encapsule", "encapsule")` :45), `src/wow64/address_dumper.cpp:22`
+(`wow64-address-dumper`), and `DllMain` in `src/injectee/injectee.cpp` (uncited, in flight).
 
 ## 3. Build & verify
 
@@ -91,32 +118,40 @@ cmake --build build/x64 --config Release -j $env:NUMBER_OF_PROCESSORS   # or: cm
 ctest --test-dir build/x64 -C Release --output-on-failure -E '^e2e\.'   # CI blocking step, build.yml:31
 ```
 
-- Registered tests: `common.schema`, `common.utils`, `injectee.winnet`, `injectee.socks5`,
-  `common.queue` — one `add_test` per `tests/<mod>/CMakeLists.txt:4`, against targets renamed
-  `encapsule_test_<mod>` (the pre-rebrand `proxinject_test_*` prefix is gone) — plus
-  `e2e.loopback_selfcheck` and `e2e.inject_connect` (label `e2e`, `RUN_SERIAL`, `TIMEOUT 120`,
-  `SKIP_RETURN_CODE 77`, `tests/e2e/CMakeLists.txt:52-53`). Test exes go to `build/<arch>/test_bin/`.
-- `e2e.inject_connect` is a **real inject-and-connect** test (decoy process + in-process socks5 relay),
-  registered only when `ENCAPSULE_E2E_INJECT` is ON (:58) **and** the build is 64-bit (:60); it is the
-  CI e2e step's target.
-- Auth coverage: `injectee.socks5` pins RFC 1929 **bytes** only (greeting shape + `socks5_build_auth`).
-  The live accept/refuse walks run against a header-only relay (`tests/e2e/socks5_test_server.hpp`,
-  `require_auth`) inside `e2e.loopback_selfcheck` (`e2e_test.cpp:674-682`); the inject-and-auth cases
-  (`:869-902`, `--inject-auth`) exist but are NOT registered as a CTest yet (ROADMAP P5 last item).
+- Registered tests — **10 on an x64 build, 8 on a Win32 one**. Seven unit: `common.schema`,
+  `common.utils`, `common.queue`, `injectee.winnet`, `injectee.socks5`, `injectee.fakeip`,
+  `injectee.udp` (one `add_test` each at `tests/<mod>/CMakeLists.txt:4`, targets `encapsule_test_<mod>`).
+  Three e2e, all labelled `e2e` with `RUN_SERIAL`, `TIMEOUT 120`, `SKIP_RETURN_CODE 77`
+  (`tests/e2e/CMakeLists.txt:52-53`): `e2e.loopback_selfcheck` (always registered), plus
+  `e2e.inject_connect` and `e2e.inject_auth`, both behind `ENCAPSULE_E2E_INJECT` (:58) **and** 64-bit
+  (:60-81). Test exes go to `build/<arch>/test_bin/`.
+- CI runs the same split: the blocking step is `ctest -E '^e2e\.'` (the seven unit tests, all four
+  matrix legs), and the x64/Release-only step is `ctest -R '^e2e\.' --repeat until-pass:3`, which now
+  covers **all three** e2e tests including the RFC 1929 one (`build.yml:30-35`).
+- Auth coverage, by layer: `injectee.socks5` pins the RFC 1929 **bytes** only (greeting shape +
+  `socks5_build_auth`); the live accept/refuse walks run against the header-only relay
+  (`tests/e2e/socks5_test_server.hpp`, `require_auth`) inside `e2e.loopback_selfcheck`; and
+  **`e2e.inject_auth` is registered** — real injection plus a proxy that demands credentials, one
+  accepted case and one refused case that must fail closed (`tests/e2e/CMakeLists.txt:69-80`).
+- Measured on a clean tree at `a6c23c4`, not inherited: the x64 suite ran **10/10 green** locally
+  (~99 s total, `e2e.inject_auth` ~62 s of it). The only compile errors anywhere in the project are
+  inside the `string_view.hpp` vendored by cycfi/elements (`nonstd/string_view.hpp:120`, C2143/C2447
+  under MSVC 17.14) — that is why the **GUI target is CI-built only**; the injectee, the CLI, the
+  dumper and every test build and run locally.
 - `BUILD_TESTING OFF CACHE BOOL "" FORCE` (`CMakeLists.txt:38`) silences only the *deps'* tests, not ours.
 
 ## 4. Codebase-memory index (use this for accurate tool calls)
 
 Indexed as project **`C-dev-encapsule`** (name derived from path `C:\dev\encapsule`) — the project key is
 **unchanged by the rebrand**. Root `C:/dev/encapsule`, branch `master`; `index_status` at this writing
-reports 654 nodes / 1842 edges, 45 File nodes, 0 skipped, and packages `injector`/`common`/`injectee`/
-`winnet`/`queue`/`utils`/`schema`/`test_support`/`wow64` (3 `main` entry points).
+reports **732 nodes / 2214 edges**, 47 File nodes, 0 skipped, and packages `injector`/`common`/
+`injectee`/`winnet`/`queue`/`utils`/`schema`/`test_support`/`wow64` (3 `main` entry points).
 
-⚠️ **P5-era code may be missing — re-index (`mode=moderate`) before graph queries.** The index was rebuilt
-after the P3 rename (the `tests/` tree is in it now, and the old "line numbers predate P3" warning is
-obsolete), but `tests/socks5/` and `tests/e2e/` have no File nodes yet (`docs/` is excluded by design).
-Live `parse_partial` list (5 files, ranges approximate): `build.ps1` (:9-10, :26-42),
-`src/injectee/client.hpp` (:91), `src/injectee/hook.hpp` (:159, :271-273, :308, :389),
+⚠️ **P6/P7-era code may be missing — re-index (`mode=moderate`) before graph queries.** The tree is in
+(it has `tests/socks5/` now), but `src/injectee/fakeip.hpp`, `src/injectee/udp_state.hpp`,
+`tests/fakeip/`, `tests/udp/` and `tests/e2e/` have **no File nodes**, and `docs/` is excluded by design.
+Live `parse_partial` (5 files, ranges approximate and drifting while `hook.hpp` is edited): `build.ps1`,
+`src/injectee/client.hpp` (:91), `src/injectee/hook.hpp` (:159, :271-273, :358, :473),
 `src/injectee/services.inc` (whole file, :1-292), `src/injector/injector.hpp` (:149). Use `grep`/`read`
 as fallback in those files.
 
@@ -136,27 +171,45 @@ Re-index: `mcp cbm index_repository(repo_path="C:\dev\encapsule", mode="moderate
   or the `encapsule-injectee*.dll` lookup names (`injector.hpp:190-191`).
 - IPC is authenticated: the mapping carries port + 8-byte per-injection token (`utils.hpp:306-329`,
   built fail-closed by `get_port_mapping_payload`, :334-351), the injectee re-presents it in every
-  message (`client.hpp:113-123`), the server refuses mismatches (`server.hpp:217-229`), and the mapping
-  gets an explicit user+SYSTEM DACL, failing closed (`winraii.hpp:142-200`).
+  message (`client.hpp:113-123`), the server refuses mismatches (`server.hpp`, `injectee_session::process`), and the mapping
+  gets an explicit user+SYSTEM DACL, failing closed (`winraii.hpp:145-203`).
 - Proxy credentials are **injector → injectee only**: parsed by `parse_proxy_url` (`utils.hpp:162-298`,
-  `[user[:pass]@]host:port`), stored in `InjectorConfig` fields 4/5 (`server.hpp:86-118`), borrowed per
-  connect by `socks5_credentials_from` (`socks5.hpp:80-85`). Report messages carry none
-  (`schema.hpp:58-67`); the CLI logs the user name and the password *length*, never the secret
-  (`injector_cli.cpp:201-206`); the GUI password box is unmasked (elements limitation,
-  `injector_gui.hpp:319-322`).
+  `[user[:pass]@]host:port`, 255-char cap per field via `proxy_credential_max_length`), stored in
+  `InjectorConfig` fields 4/5 (`server.hpp`, `set_proxy_credentials`), borrowed per connect by
+  `socks5_credentials_from` (`socks5.hpp`); report messages carry none (`schema.hpp:58-67`) and an unset field adds zero
+  bytes, so a credential-free config is byte-identical to pre-P5.
+- Front-end credential handling, as read off the current tree (both files are in flight, so symbols
+  not lines): **neither front end trims the password** — the CLI passes `-p` through untrimmed, the
+  GUI reads its password box raw; the GUI *does* trim host, port and **username**, so a leading space
+  in a username is invisible from the GUI but literal from the CLI — and it is the **socks5 server**
+  that turns such a login down; encapsule's own front end never inspects a credential. The GUI
+  enforces the 255-char cap on both fields and, when they are over-long, pops its proxy toggle back
+  off and writes the reason into its log box. The CLI's cap is the same one: `parse_proxy_url`
+  refuses either field past it, and a rejected `-p` is a hard exit-2 error that names only the
+  authority after the last `@` (a non-numeric host is refused there too — only dotted IPv4/IPv6 is
+  accepted). The CLI logs the user name plus the password *length* and nothing more; the GUI's
+  password box is **not masked** (elements has no password box) and holds credentials in memory
+  only.
+- Two credential exposures stay OPEN and are documented in `docs/BUILDING.md`: the endpoint is argv on
+  the CLI (readable by same-user processes and by Sysmon EID 1), and argparse's
+  `"Unknown argument: " + token` message is printed verbatim by the CLI's catch-all, so a mistyped
+  `-p…`/`-p=…`/`--user:pass@…` leaks the secret past the project's authority-only redaction.
 - Two architectures in play: x64 injectee for 64-bit targets, Win32 `encapsule-injectee32.dll` +
   `wow64-address-dumper` for 32-bit targets under WoW64.
 
 ## 6. Conventions (observed in src/)
 
-- 2-space indent, no tabs in `src/`; ~80-column clang-format style (8 lines in `injector.hpp`/`injector_gui.hpp` run to 82-109). `CMakeLists.txt`/`build.ps1` use tabs.
+- 2-space indent, no tabs in `src/`; ~80-column clang-format style — re-measured on the current
+  tree, exactly **1** line of `src/` runs past 80 columns (`injector.hpp:191`, 82 chars); the
+  longest line in `injector_gui.hpp` and `fakeip.hpp` is 80. `CMakeLists.txt`/`build.ps1` use tabs.
 - Includes: `"quoted"` for same-package headers, `<angle>` for stdlib, third-party and `src/common`
   (on the include path, so `<utils.hpp>` and `"utils.hpp"` both appear).
-- Header guards `ENCAPSULE_<PKG>_<NAME>` — all 17 `.hpp` headers under `src/` plus `version.hpp.in`
-  (:16-17) use it; the last two stragglers (`injector.hpp`, `injector_gui.hpp`) are converted.
-  `services.inc` has no guard by design (X-macro table included inside `hook.hpp`). No `#pragma once`
-  anywhere.
-- Every source file starts with the Apache-2.0 `// Copyright 2022 PragmaTwice` block (26/26 files);
-  `ui_elements/` files additionally carry the upstream elements copyright. Attribution stays after the rebrand.
+- Header guards `ENCAPSULE_<PKG>_<NAME>` — all **19** `.hpp` headers under `src/` (now including
+  `fakeip.hpp` → `ENCAPSULE_INJECTEE_FAKEIP`, `udp_state.hpp` → `ENCAPSULE_INJECTEE_UDP_STATE`) plus
+  `version.hpp.in` use it; no stragglers. `services.inc` has no guard by design (X-macro table
+  included inside `hook.hpp`). No `#pragma once` anywhere.
+- Every source file starts with the Apache-2.0 `// Copyright 2022 PragmaTwice` block (**28/28** files
+  under `src/`); `ui_elements/` files additionally carry the upstream elements copyright. Attribution
+  stays after the rebrand.
 - snake_case for functions/variables and for `struct` names (`virtual_memory`, `get_port_mapping_name`);
   CRTP hook types are `hook_<winapi>`; aliases like `namespace ce = cycfi::elements`.
