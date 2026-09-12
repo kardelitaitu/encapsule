@@ -155,7 +155,13 @@ auto make_controls(injector_server &server, ce::view &view,
       },
       input_tip_options);
 
-  auto inject_click = [input_select_ptr, process_input_ptr]<typename F>(F &&f) {
+  // CLI `-w` parity: give a launched console process its own console window.
+  // Unchecked (the default) keeps the current flags == 0 behavior.
+  auto new_console_toggle = share(check_box("new console"));
+
+  auto inject_click =
+      [input_select_ptr, process_input_ptr,
+       new_console_toggle]<typename F>(F &&f) {
     auto text = trim_copy(process_input_ptr->get_text());
     if (text.empty())
       return;
@@ -202,7 +208,9 @@ auto make_controls(injector_server &server, ce::view &view,
       if (!success)
         return;
     } else if (option == "exec") {
-      auto res = create_process(text);
+      DWORD creation_flags =
+          new_console_toggle->value() ? CREATE_NEW_CONSOLE : 0;
+      auto res = create_process(text, creation_flags);
       if (!res) {
         return;
       }
@@ -299,7 +307,10 @@ auto make_controls(injector_server &server, ce::view &view,
                 hsize(80, input_select),
                 left_margin(5, hmin_size(100, process_input)),
                 left_margin(10, make_tip_below(inject_button, "add specific processes to inject")), 
-                left_margin(5, make_tip_below(remove_button, "remove specific processes from injecting"))
+                left_margin(5, make_tip_below(remove_button, "remove specific processes from injecting")),
+                left_margin(10,
+                  make_tip_below(hold(new_console_toggle),
+                    "create a new console window for the launched process"))
               ),
               top_margin(10, 
                 vmin_size(250, 
