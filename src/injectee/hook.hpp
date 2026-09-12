@@ -151,18 +151,43 @@ inline int fail_proxied_connect(SOCKET s, int ret) {
   return ret;
 }
 
-// Is this a TCP stream socket?  Everything below is a TCP machine: the
-// proxification re-points the caller's socket at the proxy, then speaks the
-// socks5 conversation -- send, wait, recv -- over it.  A SOCK_DGRAM socket
-// cannot answer that conversation no matter where it is pointed: connect() on
-// one only records a peer.  Before this check existed, that meant the
-// greeting left as one datagram, nothing ever came back, blocking_scope
-// waited out the handshake timeout, and fail_proxied_connect shut the socket
-// down -- an application lost a perfectly good datagram socket to a
-// proxification that could not have worked.  So the four routing detours ask
-// this first and hand anything else straight to the original: datagrams stay
-// exactly as reachable as they were before the capsule existed, and get a
-// relay of their own in P7 rather than a TCP one borrowed.
+// Is this a TCP stream socket?  Three answers, not two.
+//
+// Everything below is a TCP machine: the proxification re-points the caller's
+// socket at the proxy, then speaks the socks5 conversation -- send, wait,
+// recv -- over it.  A SOCK_DGRAM socket cannot answer that conversation no
+// matter where it is pointed: connect() on one only records a peer.  Before
+// this check existed, that meant the greeting left as one datagram, nothing
+// ever came back, blocking_scope waited out the handshake timeout, and
+// fail_proxied_connect shut the socket down -- an application lost a perfectly
+// good datagram socket to a proxification that could not have worked.  So the
+// four routing detours ask this first and hand anything the provider rules out
+// straight to the original: datagrams stay exactly as reachable as they were
+// before the capsule existed, and get a relay of their own in P7 rather than a
+// TCP one borrowed.
+//
+// What a bool could not say is the difference between "the provider answered:
+// not SOCK_STREAM" and "the provider was never heard from" -- a failed query
+// is not evidence about a socket.  The codes that arrive there are all
+// ordinary: WSAENOTSOCK in the window where another thread has just closed the
+// handle (and the OS is free to hand that value straight back out for a
+// brand-new stream socket), WSAENOPROTOOPT / WSAEOPNOTSUPP behind a
+// partially-implementing LSP or an anti-cheat provider, WSASYSNOTREADY /
+// WSANOTINITIALISED from winsock itself.  Calling those "not a stream" sent an
+// AF_INET connect to a real destination DIRECT, silently -- inverting the rule
+// this file already states where an unresolvable service name is refused: with
+// a proxy configured, an endpoint this hook cannot make up its mind about is
+// not a licence to let the operating system route it.  So the caller branches
+// on the verdict:
+//
+//   stream     -> route it, exactly the path this file has always had;
+//   not_stream -> the provider has authoritatively ruled it out: the original,
+//                 untouched, and no refusal borrowed from a TCP decision;
+//   unknown    -> no answer: refuse through fail_proxied_connect when THIS
+//                 site has a proxy configured, because that is the case where
+//                 guessing wrong leaks a connection out of the capsule, and
+//                 otherwise the original, untouched, since there is nothing
+//                 here to keep a promise about.
 //
 // getsockopt is not one of the hooked APIs (hook_create_all at the bottom of
 // this file: connect, WSAConnect, WSAConnectByList, WSAConnectByName{A,W},
@@ -170,21 +195,54 @@ inline int fail_proxied_connect(SOCKET s, int ret) {
 // closesocket, ConnectEx), so this is the real winsock entry point and it
 // cannot re-enter a detour -- blocking_scope above already reads
 // SO_RCVTIMEO/SO_SNDTIMEO the same way from inside these very functions.
-// Nothing is cached: a getsockopt per connect sits next to the connect itself
-// and the sockets here are never in a per-datagram loop.
 //
-// A getsockopt that fails -- a bad descriptor, a provider that will not say
-// -- reads as "not a stream", which declines to route rather than running a
-// TCP handshake over something unknown; the original then gives the caller
-// the error it actually expects, instead of one this hook invented.
-inline bool socket_is_stream(SOCKET s) {
+// Nothing is cached here, and no site asks twice: the recycle window above is
+// exactly the one in which a cached answer could be wrong about a live handle,
+// and a getsockopt per connect sits next to the connect itself.
+// src/injectee/udp_state.hpp keeps its OWN per-row copy of this same answer
+// (udp_state_table::set_type, stamped when the UDP path first looks); when P7
+// wires the two paths together they must agree because ONE of them is the
+// source of truth, not because two tables happened to ask the same question at
+// two different times.
+//
+// One load-bearing invariant makes a whole failure mode here unreachable, and
+// it lives outside this function: no detour can run before winsock is up,
+// because hook_ConnectEx::create -> GetConnectEx -> WSAStartup runs inside
+// hook_create_all, which DllMain completes -- and aborts the whole install on
+// failure -- before minhook::enable().  A hook is therefore never live without
+// that WSAStartup behind it, so "pre-WSAStartup" cannot be observed from a
+// detour.  WSANOTINITIALISED is still classified unknown rather than stream:
+// the argument is about one particular call order in another file, and a
+// refactor that changes it must degrade into a refused connect, not into a
+// silent direct route.
+enum class socket_stream_verdict : std::uint8_t {
+  stream,      // the provider says SOCK_STREAM: the TCP machine may take it
+  not_stream,  // the provider says otherwise: hands off, untouched
+  unknown,     // the query failed: no answer, and no licence to go direct
+};
+
+inline socket_stream_verdict socket_stream_type(SOCKET s) {
   int type = 0;
   int size = sizeof(type);
   if (getsockopt(s, SOL_SOCKET, SO_TYPE, (char *)&type, &size) != 0) {
-    return false;
+    // The query failed.  Each code named below is a provider that did not
+    // answer, not a provider that said "no"; and a code this list does not
+    // carry is no more an answer than one it does, so the default falls in the
+    // same place -- unknown is the safe floor, and it is the caller that
+    // decides whether an unanswered question is worth a refusal.
+    switch (WSAGetLastError()) {
+      case WSAENOTSOCK:       // closed under us; the value may be recycled
+      case WSAENOPROTOOPT:    // a provider that will not talk about SO_TYPE
+      case WSAEOPNOTSUPP:
+      case WSASYSNOTREADY:    // winsock itself is not ready
+      case WSANOTINITIALISED:
+      default:
+        return socket_stream_verdict::unknown;
+    }
   }
 
-  return type == SOCK_STREAM;
+  return type == SOCK_STREAM ? socket_stream_verdict::stream
+                             : socket_stream_verdict::not_stream;
 }
 
 template <auto F, pp::basic_fixed_string N>
@@ -194,16 +252,30 @@ struct hook_connect_fn : minhook::api<F, hook_connect_fn<F, N>> {
   template <typename... T>
   static int WSAAPI detour(SOCKET s, const sockaddr *name, int namelen,
                            T... args) {
-    // A datagram socket is not routed, whatever else is true of it.
-    if (!socket_is_stream(s)) {
-      return base::original(s, name, namelen, args...);
-    }
-
+    // Everything this site does is gated on a destination it would actually
+    // route, and the socket-type query is hoisted to sit inside that gate: a
+    // victim with no config, or a connect to localhost or a non-INET family,
+    // pays no syscall for a question whose answer cannot change the call.
     if (is_inet(name) && config && !is_localhost(name)) {
       auto cfg = config->get();
+      auto proxy = cfg["addr"_f];
+
+      // A datagram socket is not routed, whatever else is true of it.
+      const auto verdict = socket_stream_type(s);
+      if (verdict == socket_stream_verdict::not_stream) {
+        return base::original(s, name, namelen, args...);
+      }
+      // No answer from the provider: with a proxy configured this connect must
+      // fail like a refused proxy would, not leave direct.
+      if (verdict == socket_stream_verdict::unknown) {
+        if (proxy) {
+          return fail_proxied_connect(s, SOCKET_ERROR);
+        }
+        return base::original(s, name, namelen, args...);
+      }
+
       if (auto v = to_ip_addr(name)) {
 
-        auto proxy = cfg["addr"_f];
         auto log = cfg["log"_f];
         if (queue && log && log.value()) {
           queue->push(create_message<InjecteeMessage, "connect">(
@@ -245,23 +317,46 @@ struct hook_WSAConnectByList
                             LPDWORD RemoteAddressLength,
                             LPSOCKADDR RemoteAddress, const timeval *timeout,
                             LPWSAOVERLAPPED Reserved) {
-    // Not a stream: straight through -- including past the "a proxy is set,
-    // so refuse" fall-out at the bottom of this block, which is a TCP
-    // decision and none of a datagram socket's business.
-    if (!socket_is_stream(s)) {
-      return original(s, SocketAddress, LocalAddressLength, LocalAddress,
-                      RemoteAddressLength, RemoteAddress, timeout, Reserved);
-    }
-
     if (config) {
       auto cfg = config->get();
       auto proxy = cfg["addr"_f];
       auto log = cfg["log"_f];
 
+      // Asked once per call, and only at the first address this site would
+      // route: a list of nothing but loopback, or a process whose config
+      // carries no routing at all, must not pay a syscall per connect.
+      std::optional<socket_stream_verdict> verdict;
+      auto ask_type = [&] {
+        if (!verdict) {
+          *verdict = socket_stream_type(s);
+        }
+        return *verdict;
+      };
+
       for (size_t i = 0; i < SocketAddress->iAddressCount; ++i) {
         LPSOCKADDR name = SocketAddress->Address[i].lpSockaddr;
 
         if (is_inet(name) && !is_localhost(name)) {
+          // Not a stream: straight through -- including past the "a proxy is
+          // set, so refuse" fall-out at the bottom of this block, which is a
+          // TCP decision and none of a datagram socket's business.  Unknown is
+          // the same walk with a proxy attached: the list is refused here,
+          // whole, rather than sent out direct.
+          const auto type = ask_type();
+          if (type == socket_stream_verdict::not_stream) {
+            return original(s, SocketAddress, LocalAddressLength, LocalAddress,
+                            RemoteAddressLength, RemoteAddress, timeout,
+                            Reserved);
+          }
+          if (type == socket_stream_verdict::unknown) {
+            if (proxy) {
+              return fail_proxied_connect(s, FALSE);
+            }
+            return original(s, SocketAddress, LocalAddressLength, LocalAddress,
+                            RemoteAddressLength, RemoteAddress, timeout,
+                            Reserved);
+          }
+
           if (auto v = to_ip_addr(name)) {
 
             if (queue && log && log.value()) {
@@ -410,19 +505,34 @@ struct hook_WSAConnectByName : minhook::api<F, hook_WSAConnectByName<F, N>> {
                             LPSOCKADDR RemoteAddress,
                             const struct timeval *timeout,
                             LPWSAOVERLAPPED Reserved) {
-    // Not a stream: straight through, refusal included -- the fail-closed
-    // below is about not leaking a TCP connection, and a datagram socket
-    // has no TCP connection to leak.
-    if (!socket_is_stream(s)) {
-      return base::original(s, nodename, servicename, LocalAddressLength,
-                            LocalAddress, RemoteAddressLength, RemoteAddress,
-                            timeout, Reserved);
-    }
-
+    // The verdict is asked inside this gate, never before it: with no config
+    // there is nothing this site could route, and the syscall would be pure
+    // overhead on a victim the capsule is not proxying.
     if (config) {
       auto cfg = config->get();
       auto proxy = cfg["addr"_f];
       auto log = cfg["log"_f];
+
+      // Not a stream: straight through, refusal included -- the fail-closed
+      // below is about not leaking a TCP connection, and a datagram socket
+      // has no TCP connection to leak.  "No answer" is not that: with a proxy
+      // set, the node this hook cannot classify is refused exactly the way a
+      // node it cannot name is, and only without a proxy does it reach the
+      // original.
+      const auto verdict = socket_stream_type(s);
+      if (verdict == socket_stream_verdict::not_stream) {
+        return base::original(s, nodename, servicename, LocalAddressLength,
+                              LocalAddress, RemoteAddressLength, RemoteAddress,
+                              timeout, Reserved);
+      }
+      if (verdict == socket_stream_verdict::unknown) {
+        if (proxy) {
+          return fail_proxied_connect(s, FALSE);
+        }
+        return base::original(s, nodename, servicename, LocalAddressLength,
+                              LocalAddress, RemoteAddressLength, RemoteAddress,
+                              timeout, Reserved);
+      }
 
       // Neither pointer may be handed over unchecked: WSAConnectByName
       // validates them itself (measured on this SDK -- a NULL node or a NULL
@@ -592,19 +702,34 @@ struct hook_ConnectEx {
                             int namelen, PVOID lpSendBuffer,
                             DWORD dwSendDataLength, LPDWORD lpdwBytesSent,
                             LPOVERLAPPED lpOverlapped) {
-    // Not a stream: straight through.  MSDN restricts ConnectEx to
-    // SOCK_STREAM sockets anyway, so this costs nothing and keeps all four
-    // routing sites saying the same thing first.
-    if (!socket_is_stream(s)) {
-      return original(s, name, namelen, lpSendBuffer, dwSendDataLength,
-                      lpdwBytesSent, lpOverlapped);
-    }
-
+    // The type question is hoisted inside this site's cheap bail-outs, like
+    // the three above it: ConnectEx is the busiest of these entry points and a
+    // routed-around call must not be paying for a getsockopt.
     if (is_inet(name) && config && !is_localhost(name)) {
       auto cfg = config->get();
+      auto proxy = cfg["addr"_f];
+
+      // Not a stream: straight through.  MSDN restricts ConnectEx to
+      // SOCK_STREAM sockets anyway, so this costs nothing and keeps all four
+      // routing sites saying the same thing first.
+      const auto verdict = socket_stream_type(s);
+      if (verdict == socket_stream_verdict::not_stream) {
+        return original(s, name, namelen, lpSendBuffer, dwSendDataLength,
+                        lpdwBytesSent, lpOverlapped);
+      }
+      // No answer: refused, not overlapped-and-then-silently-direct -- a
+      // ConnectEx that goes out of the capsule unproxied would take the
+      // lpSendBuffer payload with it.
+      if (verdict == socket_stream_verdict::unknown) {
+        if (proxy) {
+          return fail_proxied_connect(s, FALSE);
+        }
+        return original(s, name, namelen, lpSendBuffer, dwSendDataLength,
+                        lpdwBytesSent, lpOverlapped);
+      }
+
       if (auto v = to_ip_addr(name)) {
 
-        auto proxy = cfg["addr"_f];
         auto log = cfg["log"_f];
         if (queue && log && log.value()) {
           queue->push(create_message<InjecteeMessage, "connect">(
@@ -647,6 +772,16 @@ struct hook_ConnectEx {
                     lpdwBytesSent, lpOverlapped);
   }
 
+  // Load-bearing, and the reason "a connect before WSAStartup" is never
+  // observed as an unknown verdict: GetConnectEx() runs while hook_create_all()
+  // is still installing, and injectee.cpp's DllMain calls minhook::enable()
+  // only after hook_create_all() has returned without error -- unrolling the
+  // whole set, and never enabling a partial one, if it did.  So this WSAStartup
+  // stands behind every detour in this file, including the four that ask
+  // socket_stream_type(), and winsock cannot be down while they run.  Move
+  // enable() ahead of that install, or create ConnectEx lazily, and
+  // WSANOTINITIALISED becomes reachable from a detour: the helper then answers
+  // unknown, which refuses a routed connect rather than leaking it direct.
   static minhook::status create() {
     ConnectEx = GetConnectEx();
     return minhook::create(ConnectEx, detour, original);
