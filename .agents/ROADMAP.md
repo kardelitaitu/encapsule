@@ -111,8 +111,9 @@ UI data-race fixes (`view.post`).
 - [x] Update docs/meta: README title, badges, screenshots done (owner); repo description + winget manifest remain owner-domain
       already points at `kardelitaitu/encapsule.git`); decide whether to publish a
       `kardelitaitu.encapsule` winget manifest (upstream's package stays theirs).
-- [ ] Full rebuild (x64 + Win32) and end-to-end smoke test: inject into a real process
-      and confirm the proxy path still works after the rename.
+- [x] Full rebuild (x64 + Win32) and end-to-end smoke test: inject into a real process
+      and confirm the proxy path still works after the rename. (Gate: build.ps1 exit 0
+      both passes, ctest 6/6 incl. e2e.inject_connect through renamed mapping+DLLs.)
 
 ### P4 — Correctness & hardening
 - [x] Fix the only in-code FIXME: address-family equality in
