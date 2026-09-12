@@ -154,10 +154,15 @@ UI data-race fixes (`view.post`).
       required creds param at all 4 hook sites — compiler-enforced, no dangling-view
       trap via socks5_credentials_from(cfg), fail-closed on 0xFF/short/bad-status,
       no silent unauthenticated fallback).
-- [ ] Server side: validate and forward credentials from the frontends into the
-      config message.
-- [ ] CLI: accept credentials via `-p user:pass@host:port` and/or dedicated
-      `--proxy-user/--proxy-pass` flags.
+- [x] Server side: validate and forward credentials from the frontends into the
+      config message (41e2d2e: injector_server::set_proxy_credentials/
+      clear_proxy_credentials under config_mutex + broadcast_config; optional engaged
+      -> set, nullopt -> field stays ABSENT (never ""), clear re-broadcasts a
+      byte-identical credential-free config).
+- [x] CLI: accept credentials via `-p [user[:pass]@]host:port` (41e2d2e: shared pure
+      parse_proxy_url — last-@ / first-: / bracketed-IPv6 / 255 caps; embedded form
+      chosen over flags; empty username => no creds; hostname now exit 2 instead of
+      std::terminate; password never logged, `-p` help updated).
 - [x] GUI: accept credentials in the proxy input (41de274: dedicated username/password
       boxes + no-mask tooltip; CI-compiled — local elements/MSVC exception).
 - [x] Unit tests: handshake byte-level tests covering auth success and auth failure
