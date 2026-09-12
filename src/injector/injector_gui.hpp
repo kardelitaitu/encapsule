@@ -24,6 +24,7 @@
 #include "utils.hpp"
 #include "version.hpp"
 #include <elements.hpp>
+#include <cstdint>
 #include <optional>
 #include <sstream>
 
@@ -142,6 +143,15 @@ const std::vector<std::string_view> input_tip_options = [] {
   return result;
 }();
 
+// The address box is free text, so it gets a length bound before a parser
+// sees it.  Not a grammar rule and no cap borrowed from <utils.hpp>, which has
+// none: no numeric address is anywhere near this long (15 characters for IPv4,
+// 45 for IPv6), so what exceeds it is a paste that went wrong, not a proxy to
+// reach.  Refusing it by length, in its own words, is also what stops the
+// generic "not an address" line from being the only thing a 300-character box
+// can say.
+constexpr std::size_t proxy_host_max_length = 255;
+
 auto make_controls(injector_server &server, ce::view &view,
                    process_vector &process_vec) {
   using namespace ce;
@@ -257,7 +267,35 @@ auto make_controls(injector_server &server, ce::view &view,
   proxy_toggle->on_click = [&server, &view, proxy_toggle, log_box,
                             addr_input_ptr, port_input_ptr, user_input_ptr,
                             pass_input_ptr](bool on) {
-    if (on) {
+    // This handler answers a click on the UI thread, so an exception that
+    // escapes it is not an error message -- it is the injector process dying,
+    // taking the control channel of every already-injected process with it.
+    // Every field it reads is free text, and the conversions they fed either
+    // throw or silently narrow, so: validate every one of them against the
+    // rules the CLI applies to `-p`, through parsers that report rather than
+    // throw, and catch whatever is left.  A refusal snaps the toggle back
+    // (what a rejected click has always looked like) and puts one line in the
+    // log below.  No user text is echoed into it: the address box
+    // takes free input too, and `user:pass@host` pasted there is a password
+    // the log would keep on screen.
+    auto refuse = [&](const std::string &why) {
+      proxy_toggle->value(false);
+      // Wrapped because this runs from inside a catch below: a refusal that
+      // throws on its way out -- the log grows, the repaint allocates -- would
+      // escape the very handler this exists to protect.
+      try {
+        log_box->set_text(log_box->get_text() + "[proxy] " + why + "\n");
+        view.refresh();
+      } catch (...) {
+      }
+    };
+
+    try {
+      if (!on) {
+        server.clear_proxy();
+        return;
+      }
+
       auto addr = trim_copy(addr_input_ptr->get_text());
       auto port = trim_copy(port_input_ptr->get_text());
       // A username gets trimmed: a space around a name is a slip of the
@@ -271,37 +309,102 @@ auto make_controls(injector_server &server, ce::view &view,
       // panel is where they belong.  Both lengths travel in a single octet, so
       // an over-long credential can never reach a server: accepting it here
       // would leave the injectee building no auth request at all, every
-      // connect of the process refused, and not one word said anywhere -- a
-      // silent self-inflicted outage.  Refuse it, and say why.
-      bool oversize = user.size() > proxy_credential_max_length ||
-                      pass.size() > proxy_credential_max_length;
-
-      if (!oversize && all_of_digit(port) && !addr.empty() && !port.empty()) {
-        server.set_proxy(ip::address::from_string(addr), std::stoul(port));
-
-        // Credentials follow the same apply path as the address. A password
-        // without a username is ignored, matching the CLI; an empty field
-        // means "unset", never an empty string.
-        if (user.empty()) {
-          server.clear_proxy_credentials();
-        } else if (pass.empty()) {
-          server.set_proxy_credentials(std::move(user), std::nullopt);
-        } else {
-          server.set_proxy_credentials(std::move(user), std::move(pass));
-        }
-      } else {
-        proxy_toggle->value(false);
-        if (oversize) {
-          log_box->set_text(log_box->get_text() +
-                            "[proxy] username and password must each be at "
-                            "most " +
-                            std::to_string(proxy_credential_max_length) +
-                            " characters\n");
-          view.refresh();
-        }
+      // connect of the process refused, and not one word said anywhere.
+      if (user.size() > proxy_credential_max_length ||
+          pass.size() > proxy_credential_max_length) {
+        return refuse("username and password must each be at most " +
+                      std::to_string(proxy_credential_max_length) +
+                      " characters");
       }
-    } else {
-      server.clear_proxy();
+
+      if (addr.empty() || port.empty()) {
+        return refuse("an IP address and a port are both required");
+      }
+
+      // Digits, at most as long as the widest port, and a value 16 bits can
+      // hold -- the same three rules `parse_proxy_url` applies to the port of
+      // `-p` (utils.hpp:251-266), applied the same way: accumulated digit by
+      // digit rather than handed to a converter.  `std::stoul` was the second
+      // thrower in this handler, `out_of_range` at the eleventh digit, and no
+      // amount of preceding checking makes a throwing call the right one on a
+      // UI thread -- so there is none left here.  Bounding the length by
+      // `proxy_port_max_length` first is what makes the accumulation
+      // overflow-free; the range bound then stops 99999 from being truncated
+      // to 34463 on its way to the wire (server.hpp takes a uint32_t,
+      // schema.hpp stores a uint16_t), and port 0, which means "no port" and
+      // not an endpoint.  A port that is not digits at all -- "1080abc", "+1",
+      // "1_0" -- falls out of the same loop, one fixed line for all of them.
+      constexpr const char *bad_port =
+          "the port must be a number from 1 to 65535";
+      if (port.size() > proxy_port_max_length) {
+        return refuse(bad_port);
+      }
+      std::uint32_t port_value = 0;
+      for (const char digit : port) {
+        if (digit < '0' || digit > '9') {
+          return refuse(bad_port);
+        }
+        port_value = port_value * 10 + static_cast<std::uint32_t>(digit - '0');
+      }
+      if (port_value == 0 || port_value > 65535) {
+        return refuse(bad_port);
+      }
+
+      if (addr.size() > proxy_host_max_length) {
+        return refuse("the proxy address is too long to be an IP address");
+      }
+
+      // A bracketed IPv6 host is the spelling every endpoint of this tool
+      // takes -- `parse_proxy_url` takes the brackets off `-p` before it
+      // parses a thing (utils.hpp:221-231) -- so the box accepts it too, since
+      // refusing here would reject a string the CLI accepts.  Any bracket that
+      // is not a matching pair around a non-empty host ("[::1", "a]b") stays
+      // in place: the parser below refuses it, which is also what
+      // `parse_proxy_url` does with a stray one.
+      if (addr.front() == '[' && addr.size() > 2 && addr.back() == ']') {
+        addr = addr.substr(1, addr.size() - 2);
+      }
+
+      // The numeric test is the CLI's own `ip::make_address` call, through
+      // the overload that reports failure in `error_code`.  What stood here
+      // before, `ip::address::from_string` -- deprecated exactly because it
+      // throws -- ended the process on a hostname, which is the one thing a
+      // box labelled "address" invites.  Nothing resolves a name on this path:
+      // IpAddr carries an address, never a name, so a name is refused here
+      // rather than becoming a crash or a half-configured proxy.
+      asio::error_code ec;
+      auto ip_addr = ip::make_address(addr, ec);
+      if (ec) {
+        return refuse("the proxy address must be a numeric IPv4 or IPv6 "
+                      "address; names are not resolved here");
+      }
+
+      server.set_proxy(ip_addr, port_value);
+
+      // Credentials follow the same apply path as the address. A password
+      // without a username is ignored, matching the CLI; an empty field
+      // means "unset", never an empty string.
+      if (user.empty()) {
+        server.clear_proxy_credentials();
+      } else if (pass.empty()) {
+        server.set_proxy_credentials(std::move(user), std::nullopt);
+      } else {
+        server.set_proxy_credentials(std::move(user), std::move(pass));
+      }
+    } catch (...) {
+      // The backstop for whatever the checks above do not foresee: an
+      // allocation that fails behind a megabyte of pasted text, a throw from
+      // inside asio or protopuf on the apply path.  Fixed text again -- an
+      // exception's `what()` is the one string in this handler nobody
+      // reviewed, and a converter is free to put whatever it was handed into
+      // it, which is exactly the byte the log must never keep on screen.
+      // Reporting cannot be allowed to escape either, so it is guarded in its
+      // own turn: what `refuse` can fail at it wraps itself, and this catches
+      // the rest -- the toggle write above all.
+      try {
+        refuse("the proxy settings were not applied");
+      } catch (...) {
+      }
     }
   };
 
