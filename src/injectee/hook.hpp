@@ -273,24 +273,74 @@ inline const std::map<std::string, std::uint16_t> service_map = {
 #undef X
 };
 
+// A service name is turned into a port by three sources, tried in this order.
+//
+// The third is the one that matters.  WSAConnectByName is handed a service,
+// not a port, and every service this function cannot name used to make its
+// detour fall through to the original call -- which resolves the name its own
+// way and connects, direct and unproxied.  "some-exotic-svc", or any name the
+// IANA list compiled in above does not carry, leaked that way:
+// the table is a fast path, it is not allowed to be the last word.
+inline std::optional<std::uint16_t>
+service_to_port(const std::string &servicename) {
+  // Numeric.  Accumulated rather than handed to std::stoi: stoi throws on
+  // "999999999" and on "" (std::all_of calls the empty string all-digit), and
+  // an exception escaping a detour is the host process dying.  The bounds are
+  // the same ones parse_proxy_url applies, "0" included -- not a port.
+  if (!servicename.empty() &&
+      servicename.size() <= proxy_port_max_length &&
+      all_of_digit(servicename)) {
+    std::uint32_t port = 0;
+    for (const char digit : servicename) {
+      port = port * 10 + static_cast<std::uint32_t>(digit - '0');
+    }
+    if (port > 0 && port <= 65535) {
+      return static_cast<std::uint16_t>(port);
+    }
+  }
+
+  // The compile-time table.  Its keys are the lower-case IANA names, while
+  // Windows matches service names without regard to case, so the lookup is
+  // folded the same way -- ASCII only, which is all a service name is.
+  std::string folded;
+  folded.reserve(servicename.size());
+  for (const char c : servicename) {
+    const bool upper = c >= 'A' && c <= 'Z';
+    folded.push_back(upper ? static_cast<char>(c - 'A' + 'a') : c);
+  }
+  if (auto iter = service_map.find(folded); iter != service_map.end()) {
+    return iter->second;
+  }
+
+  // The OS services database: the same registry/HOSTS/Services-file source
+  // Windows' own resolver consults, and the one that answers for every
+  // service the table above does not carry.  Case-insensitive per the API,
+  // TCP only because every hook here tunnels a TCP connection.  The
+  // servent it returns is owned by winsock and only s_port is read, from
+  // this thread, immediately, so the shared buffer is of no concern.
+  if (const auto *entry = getservbyname(servicename.c_str(), "tcp");
+      entry != nullptr) {
+    const auto port = ntohs(entry->s_port);
+    if (port != 0) {
+      return port;
+    }
+  }
+
+  return std::nullopt;
+}
+
 inline std::optional<IpAddr> ipaddr_from_name(const std::string &nodename,
                                               const std::string &servicename) {
-  std::uint16_t port;
-  if (std::all_of(servicename.begin(), servicename.end(),
-                  [](char c) { return std::isdigit(c); })) {
-    port = std::stoi(servicename);
-  } else if (auto iter = service_map.find(servicename);
-             iter != service_map.end()) {
-    port = iter->second;
-  } else {
+  auto port = service_to_port(servicename);
+  if (!port) {
     return std::nullopt;
   }
 
   asio::error_code ec;
   if (auto addr = ip::make_address(nodename, ec); !ec) {
-    return from_asio(addr, port);
+    return from_asio(addr, *port);
   } else {
-    return IpAddr({}, {}, nodename, port);
+    return IpAddr({}, {}, nodename, *port);
   }
 }
 
@@ -316,7 +366,25 @@ struct hook_WSAConnectByName : minhook::api<F, hook_WSAConnectByName<F, N>> {
       auto proxy = cfg["addr"_f];
       auto log = cfg["log"_f];
 
-      if (auto addr = ipaddr_from_name(nodename, servicename)) {
+      auto addr = ipaddr_from_name(nodename, servicename);
+
+      // A service nobody could name is a dead end, not a licence to let the
+      // original resolve it and connect: that is a direct, unproxied route out
+      // of the capsule and the app would never know.  So this fails closed,
+      // the P4 policy every other refusal in this file follows.
+      //
+      // WSAConnectByName2 says of its return value: "If the function fails,
+      // the return value is FALSE. To get extended error information, call
+      // WSAGetLastError."  fail_proxied_connect supplies both halves -- FALSE
+      // plus WSAECONNREFUSED (or the WSAETIMEDOUT already pending) -- the same
+      // code a refused or unreachable proxy leaves behind, so a caller that
+      // copes with one copes with both, and no new failure mode appears on a
+      // path that used to silently succeed.
+      if (!addr && proxy) {
+        return fail_proxied_connect(s, FALSE);
+      }
+
+      if (addr) {
         if (queue && log && log.value()) {
           queue->push(create_message<InjecteeMessage, "connect">(
               InjecteeConnect{(std::uint32_t)s, addr, proxy, N}));
