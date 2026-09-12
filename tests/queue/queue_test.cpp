@@ -19,20 +19,23 @@
 
 #include <queue.hpp>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <exception>
+#include <thread>
 #include <vector>
 
 // blocking_queue<T> is a std::queue guarded by a channel<void(error_code)>.
 // Every scenario below runs on its own io_context, started with asio::co_spawn
 // and bounded by a steady_timer watchdog, so a stuck channel fails the test
 // instead of hanging CI.  The per-scenario budget keeps the worst case
-// (4 scenarios) below the 60s TIMEOUT set on common.queue in CMake.
+// (7 scenarios) below the 60s TIMEOUT set on common.queue in CMake.
 namespace {
 
-constexpr int kWatchdogMs = 10000;
+constexpr int kWatchdogMs = 8000;
 constexpr int kItems = 64;
 constexpr int kSentinel = -7;
 
@@ -249,6 +252,149 @@ asio::awaitable<void> destructor_with_pending_items(asio::io_context &ctx) {
   CHECK(code == asio::experimental::error::channel_closed);
 }
 
+// (5) capacity: an overflowing bounded queue drops the OLDEST item and counts
+// it, so what survives is the newest report -- the one still worth reading.
+// No consumer runs here at all, which is the parked-injector shape that made
+// M5 unbounded: the bound has to hold with nobody popping.
+asio::awaitable<void> overflow_drops_oldest_and_counts(asio::io_context &ctx) {
+  constexpr std::size_t cap = 8;
+  //  The token channel stays wide on purpose, so every item below is turned
+  // away by the QUEUE bound and not by a full channel.
+  blocking_queue<int> q(ctx, 1024, cap);
+
+  CHECK_EQ(q.capacity(), cap);
+  CHECK_EQ(q.drops(), static_cast<std::size_t>(0));
+
+  for (int i = 0; i < 20; ++i) {
+    q.push(i);
+  }
+
+  CHECK_EQ(q.size(), cap);
+  CHECK_EQ(q.drops(), static_cast<std::size_t>(20 - cap));
+
+  // The twelve that went away were the twelve OLDEST, so 12..19 remain, in
+  // order, and the eight tokens behind them still match eight items.
+  for (int i = 12; i < 20; ++i) {
+    CHECK_EQ(co_await q.pop(), i);
+  }
+
+  CHECK_EQ(q.size(), static_cast<std::size_t>(0));
+  // eight delivered + twelve dropped + none left == the twenty pushed.
+  CHECK_EQ(static_cast<std::size_t>(8) + q.drops() + q.size(),
+           static_cast<std::size_t>(20));
+}
+
+// (6) cancel() drains what is still queued instead of stranding it, and every
+// item it removes is counted as a drop rather than vanishing.
+asio::awaitable<void> cancel_drains_queued_items(asio::io_context &ctx) {
+  blocking_queue<int> q(ctx, 1024, 16);
+
+  for (int i = 0; i < 10; ++i) {
+    q.push(i);
+  }
+  CHECK_EQ(q.size(), static_cast<std::size_t>(10));
+  CHECK_EQ(q.drops(), static_cast<std::size_t>(0));
+
+  q.cancel();
+
+  // Nothing is left behind in a queue nobody is going to read again...
+  CHECK_EQ(q.size(), static_cast<std::size_t>(0));
+  // ... and the ten items were accounted for, not lost.
+  CHECK_EQ(q.drops(), static_cast<std::size_t>(10));
+
+  // The session is still usable afterwards: the drain cancelled the pending
+  // sends, not the channel, and the tokens the drained items owned are skipped
+  // rather than read as items (that skip is the old front()-on-empty UB).
+  q.push(4242);
+  CHECK_EQ(co_await q.pop(), 4242);
+  CHECK_EQ(q.size(), static_cast<std::size_t>(0));
+  CHECK_EQ(q.drops(), static_cast<std::size_t>(10));
+}
+
+// (7) The reviewer's accounting case: four threads pushing 10 000 items each
+// into one bounded queue, a consumer that can only spare ten, then a cancel().
+// Three things are pinned at once: the size is bounded at EVERY moment (not
+// merely once it settles), no pop() ever reads past an empty queue, and
+// pushed == delivered + dropped + queued holds exactly.
+asio::awaitable<void> concurrent_bounded_accounting(asio::io_context &ctx) {
+  constexpr int producer_count = 4;
+  constexpr int per_producer = 10000;
+  constexpr std::size_t cap = 64;
+  constexpr int pop_count = 10;
+
+  blocking_queue<int> q(ctx, 1024, cap);
+
+  std::atomic<std::size_t> max_seen{0};
+  std::atomic<bool> sampling{true};
+  std::thread sampler([&] {
+    while (sampling.load()) {
+      const auto n = q.size();
+      auto prev = max_seen.load();
+      while (n > prev && !max_seen.compare_exchange_weak(prev, n)) {
+      }
+    }
+  });
+
+  // Four producers on their own threads, and deliberately no consumer on the
+  // io thread while they run: the join parks it exactly the way give_up()
+  // parks the real injectee, so the queue takes the whole storm.
+  std::vector<std::thread> pushers;
+  for (int p = 0; p < producer_count; ++p) {
+    pushers.emplace_back([&q, p] {
+      for (int i = 0; i < per_producer; ++i) {
+        q.push(p * per_producer + i);
+      }
+    });
+  }
+  for (auto &t : pushers) {
+    t.join();
+  }
+  sampling.store(false);
+  sampler.join();
+
+  CHECK_EQ(q.size(), cap);
+  CHECK(max_seen.load() <= cap);
+
+  // The consumer that cannot keep up: ten items, then it stops.  Cancelled
+  // here would be a bug, so a throw is recorded rather than swallowed.
+  std::vector<int> got;
+  bool pop_threw = false;
+  asio::co_spawn(
+      ctx, [&]() -> asio::awaitable<void> {
+        try {
+          for (int i = 0; i < pop_count; ++i) {
+            got.push_back(co_await q.pop());
+          }
+        } catch (const asio::system_error &) {
+          pop_threw = true;
+        }
+      },
+      asio::detached);
+
+  for (int spin = 0; spin < 1000 && static_cast<int>(got.size()) < pop_count;
+       ++spin) {
+    co_await asio::post(ctx, asio::use_awaitable);
+  }
+
+  CHECK(!pop_threw);
+  CHECK_EQ(got.size(), static_cast<std::size_t>(pop_count));
+  // No underflow: every value handed back is one that was pushed, and exactly
+  // once -- forty thousand distinct ints went in, so a repeat or a stray is a
+  // read past the end of the deque.
+  std::sort(got.begin(), got.end());
+  CHECK(std::adjacent_find(got.begin(), got.end()) == got.end());
+  CHECK(!got.empty());
+  CHECK(got.front() >= 0);
+  CHECK(got.back() < producer_count * per_producer);
+
+  q.cancel();
+  CHECK_EQ(q.size(), static_cast<std::size_t>(0));
+
+  const auto pushed = static_cast<std::size_t>(producer_count) *
+                      static_cast<std::size_t>(per_producer);
+  CHECK_EQ(got.size() + q.drops() + q.size(), pushed);
+}
+
 void test_fifo_order() {
   run_scenario("fifo_order", fifo_order);
 }
@@ -265,6 +411,19 @@ void test_destructor_with_pending_items() {
   run_scenario("destructor_with_pending_items", destructor_with_pending_items);
 }
 
+void test_overflow_drops_oldest_and_counts() {
+  run_scenario("overflow_drops_oldest_and_counts",
+               overflow_drops_oldest_and_counts);
+}
+
+void test_cancel_drains_queued_items() {
+  run_scenario("cancel_drains_queued_items", cancel_drains_queued_items);
+}
+
+void test_concurrent_bounded_accounting() {
+  run_scenario("concurrent_bounded_accounting", concurrent_bounded_accounting);
+}
+
 } // namespace
 
 int main() {
@@ -272,5 +431,8 @@ int main() {
   RUN(test_single_consumer_drains);
   RUN(test_cancel_wakes_pending_pop);
   RUN(test_destructor_with_pending_items);
+  RUN(test_overflow_drops_oldest_and_counts);
+  RUN(test_cancel_drains_queued_items);
+  RUN(test_concurrent_bounded_accounting);
   return test_failures;
 }
