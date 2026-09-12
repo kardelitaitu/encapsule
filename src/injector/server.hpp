@@ -22,6 +22,8 @@
 #include <asio.hpp>
 #include <atomic>
 #include <cstdio>
+#include <iterator>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -30,10 +32,27 @@
 
 using tcp = asio::ip::tcp;
 
+// Why a session is going away.  M1: these two used to be one event, and that
+// was the bug.  A dropped control connection does not stop the capsule --
+// src/injectee/client.hpp fixes its token at construction, re-presents it on
+// every reconnect, and parks rather than unloads -- so a transient reset, or
+// the injector's own io thread losing the socket, is followed by a fresh
+// hello from a process that is still encapsulated and still routable.  Burn
+// the token on that path and the answer to every later hello is "refused":
+// the capsule spins on reconnect while the front end still lists the pid as
+// injected.  Only an explicit un-inject has earned the word "gone".
+//
+// No default argument on either: the intent is what this whole distinction is
+// about, so every call site has to spell it out.
+enum class session_end {
+  lost,    // the connection dropped; keep the bootstrap so it can re-register
+  retired  // the front end closed it; the injection is over
+};
+
 struct injectee_client {
   virtual ~injectee_client() {}
 
-  virtual void stop() = 0;
+  virtual void stop(session_end end) = 0;
   virtual asio::awaitable<void> config(const InjectorConfig &) = 0;
   virtual asio::any_io_executor get_context() = 0;
 };
@@ -126,8 +145,79 @@ private:
   std::map<DWORD, injectee_client_ptr> clients;
 };
 
+// The pids whose bootstrap a lost session left in place, oldest first.
+//
+// M1-a: keeping is what makes re-registration possible, but it is also state
+// that only grows -- a GUI left running with -s loses a session for every
+// child that exits, and each one would otherwise hold a token and a live
+// section handle for the life of the tool.  So the record is capped and an
+// overflow retires the OLDEST kept pid: the one that has stayed away longest,
+// the least likely to come back.  Same reasoning as the report queue's bound
+// in <queue.hpp>, and the same shape: bound, evict, count.
+//
+// Why keeping a bootstrap is safe at all: the token was never readable by
+// anybody who was not given it.  It travelled in a named section built by
+// create_mapping() with an explicit user+SYSTEM DACL (winraii.hpp), so a
+// process that merely recycles the pid cannot read the old payload, and a
+// stranger that guesses the mapping name still has nothing to present in the
+// hello.  A FRESH injection of the same pid rotates the token before this
+// record could matter: publish() insert_or_assign's both maps, and open() and
+// inject() below drop the pid from the record, so a re-injected capsule is
+// never evicted by an entry left over from the one it replaced.
+class kept_bootstraps {
+public:
+  static constexpr std::size_t cap = 4096;
+
+  // Remembers the pid; hands back the pid whose bootstrap must now be
+  // retired because the record overflowed, or nullopt when there was room.
+  std::optional<DWORD> keep(DWORD pid) {
+    std::lock_guard guard(mtx);
+    erase_locked(pid); // re-keeping moves it to the newest end
+    order.push_back(pid);
+    where.emplace(pid, std::prev(order.end()));
+    if (order.size() <= cap) {
+      return std::nullopt;
+    }
+    const DWORD oldest = order.front();
+    order.pop_front();
+    where.erase(oldest);
+    return oldest;
+  }
+
+  // The pid is live again (registered, or freshly injected), so it is no
+  // longer something an eviction may take away.
+  void drop(DWORD pid) {
+    std::lock_guard guard(mtx);
+    erase_locked(pid);
+  }
+
+  std::size_t size() const {
+    std::lock_guard guard(mtx);
+    return order.size();
+  }
+
+private:
+  // Caller holds the lock; a leaf operation, so keep() cannot double-count.
+  void erase_locked(DWORD pid) {
+    auto iter = where.find(pid);
+    if (iter == where.end()) {
+      return;
+    }
+    order.erase(iter->second);
+    where.erase(iter);
+  }
+
+  // Leaf lock, deliberately: nothing under it calls asio, injector:: or the
+  // clients table, so it adds no edge to the documented order above and can
+  // never be the inner lock of a cycle.
+  mutable std::mutex mtx;
+  std::list<DWORD> order;
+  std::map<DWORD, std::list<DWORD>::iterator> where;
+};
+
 struct injector_server {
   injector_clients clients;
+  kept_bootstraps kept;
   InjectorConfig config_;
   std::mutex config_mutex;
 
@@ -148,13 +238,25 @@ struct injector_server {
     }
     if (clients.contains(pid)) {
       return false;
-    } else {
-      return injector::inject(pid, port_);
     }
+    if (!injector::inject(pid, port_)) {
+      return false;
+    }
+    // publish() just minted a new token for this pid, so anything remembered
+    // about the old one has to go: an eviction must never retire the
+    // bootstrap that was created a moment ago.
+    kept.drop(pid);
+    return true;
   }
 
   bool open(DWORD pid, injectee_client_ptr ptr) {
-    return clients.insert(pid, std::move(ptr));
+    if (!clients.insert(pid, std::move(ptr))) {
+      return false;
+    }
+    // Registered -- first hello or the re-registration M1-a exists for, the
+    // pid is live and so is not evictable.
+    kept.drop(pid);
+    return true;
   }
 
   // Called with config_mutex held (every config_*() setter does), which is why
@@ -241,9 +343,21 @@ struct injector_server {
     return config_;
   }
 
-  bool remove(DWORD pid) {
-    // The injection is over, so its token is no longer worth keeping.
-    injector::forget_token(pid);
+  // The two endings: only "retired" may touch injector:: here.  "lost"
+  // records the pid for a later eviction instead, which is what lets the
+  // resident capsule walk up with the token it still holds and be accepted by
+  // token_matches() a second time.
+  bool remove(DWORD pid, session_end end) {
+    if (end == session_end::retired) {
+      // Explicit un-inject: today's behavior, and the token is gone.
+      kept.drop(pid);
+      injector::forget_token(pid);
+    } else if (auto stale = kept.keep(pid)) {
+      // The record was full: retire the bootstrap of whoever has been away
+      // longest.  Done outside the record's own lock, which keep() has
+      // already dropped, and outside the clients table's.
+      injector::forget_token(*stale);
+    }
 
     return clients.erase(pid);
   }
@@ -256,7 +370,9 @@ struct injector_server {
 
     // Unlocked: stop() closes the socket and re-enters the table through
     // remove(), so doing it under the table's lock would be a self-deadlock.
-    client->stop();
+    // This is the one call site that means "retire": the front end's un-inject
+    // button runs it, so the bootstrap goes with the session, as today.
+    client->stop(session_end::retired);
     return true;
   }
 };
@@ -306,7 +422,9 @@ struct injectee_session : injectee_client,
             asio::detached);
       }
     } catch (std::exception &) {
-      stop();
+      // A lost connection, not an un-inject: the capsule on the other end is
+      // still resident and still holds its token, so keep the bootstrap.
+      stop(session_end::lost);
     }
   }
 
@@ -329,7 +447,10 @@ struct injectee_session : injectee_client,
                      "encapsule: refused pid %lu, no valid injection token\n",
                      static_cast<unsigned long>(*v));
         std::fflush(stderr);
-        stop();
+        // Lost by definition, and never registered, so stop() will not reach
+        // remove() at all: an unverified connection must not be able to
+        // retire the bootstrap of the capsule this pid really holds.
+        stop(session_end::lost);
         co_return;
       }
 
@@ -348,7 +469,11 @@ struct injectee_session : injectee_client,
     }
   }
 
-  void stop() {
+  // Runs on whichever thread noticed the end; the "end" argument says why.
+  // The exchange below picks the one thread that owns the teardown, so the
+  // session that never registered - a refused hello - contributes nothing to
+  // the token store either way.
+  void stop(session_end end) override {
     socket_.close();
     timer_.cancel();
 
@@ -363,7 +488,7 @@ struct injectee_session : injectee_client,
       return;
     }
 
-    server_.remove(pid_);
+    server_.remove(pid_, end);
     process_close();
   }
 };
