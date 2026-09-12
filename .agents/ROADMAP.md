@@ -143,6 +143,24 @@ UI data-race fixes (`view.post`).
       unmanageable. Remediation ladder M1-a..f accepted (A now: stop forgetting;
       C-lite: durable mapping re-read per attempt = the real fix; B rejected —
       re-inject cannot re-enter DllMain). BUILDING.md's re-inject promise fixed too.
+      ⚠ MEASURED (fd745e7, disabled probe e2e.inject_exec): a brand-new '-e' child's FIRST
+      connect goes DIRECT ~0.4s before its config lands (relay 1 CONNECT vs sink 1 direct
+      accept at 617ms; attempt #1 RST by the witness, attempt #2 round-trips once hooked).
+      Harness caveat found on the way: the in-repo relay CANNOT see a direct connect (it
+      drops a non-SOCKS greeting unrecorded) and TEST-NET-3 dials black-hole, and loopback
+      is exempt by policy, so a leak-proof needs a NON-LOOPBACK witness sink and
+      'ordering + hard zero' assertions (never 'count >= N'). A-chain (CREATE_SUSPENDED +
+      resume on verified hello + bounded pre-config park) is now evidence-backed, not
+      cosmetic; it waits on M1-a/M1-d freeing server.hpp + injector.hpp.
+      ✅ M5 CONSUMER LANDED (7ae8623b @ d966b93): the injectee's report queue is now bounded
+      at 1024 — NOT the 4096 this roadmap asked for, and the lane was right to override: a
+      push() posts one token per item and the asio channel buffers only 'max' (1024), so a
+      larger bound re-creates the stranded-async_send half of what M5 closes. Cap is defined
+      FROM kReportQueueTokens so both knobs move together.
+      ⚠ OPEN (needs a 4-file chain, filed not started): drops() has NO consumer — a user
+      cannot see that reports were dropped. Surface needs client.hpp (read at report time)
+      -> server.hpp -> a schema.hpp report field -> GUI/CLI log; schema is the frozen P5
+      contract, so this is an additive-field decision, not a quick edit.
 - [x] Audit partial injection failure: mapping cleanup and no half-initialized hooks
       left in the target process. (256e27d fail-safe mapping + verified load result;
       41369fd reverse-order hook unroll + DllMain never live half-initialized + WSA refcount guard.)
@@ -151,8 +169,25 @@ UI data-race fixes (`view.post`).
       mapping attaches 109ms later where it previously NEVER attached (ipc_conns=0 forever).
       Corrected intel: the reviewer's 'AV on the next winsock call' did NOT reproduce —
       DLL_PROCESS_DETACH restores the stubs first; the defect was SILENT PERMANENT capsule loss,
-      not a crash. STILL OPEN: C4 — scope_ptr_bind nulls the detours' globals with no barrier
-      (+ ~mutex with waiters on detach) -> R3 in the same lane.
+      not a crash.
+      ✅ C4 RESOLVED (49069da2 @ 12e46f1, pushed, isolated double-run evidence): the three
+      scope-bound globals publish via std::atomic_ref (release in ctor, release-nullptr in
+      dtor) and are read through ONE acquire load_scope(); 13 loads + 3 deleted guards = 15
+      sites, grep-verified clean by the race review. Measured on MSVC x64 /O2 without TSan:
+      PRE 1094 'test said non-null, use found null' events in 3s -> POST 0 by construction.
+      Honest limits (review 10df26db): the release/acquire half is STRUCTURAL, not measured —
+      x86-TSO lowers both to plain mov, so 'saw-unpublished-object=0' was the only possible
+      result; and lifetime of the POINTED-TO objects is NOT bought by acquire at all, it is
+      guaranteed 100% by residency (the null-before-free order only narrows a window that
+      cannot currently open).
+      ⚠ C4 REVIEW BLOCKER (fix in flight, same lane): do_client had no try/catch, so an
+      asio ctor/run exception unwinds the three guards and FREES qu/cfg/sock_map while the
+      detours stay enabled and victim threads keep calling connect — the AV-in-the-victim
+      window reached by unwinding. Fix = non-unwinding body falling into the existing park
+      loop + a compile-time static_assert on atomic_ref alignment (MSVC's own check is
+      _STL_ASSERT, Debug-only; Release degrades to _Analysis_assume_) + a real test pin.
+      STILL OPEN: ~nbio_mutex (hook.hpp static) runs its dtor at DLL_PROCESS_DETACH while a
+      thread may sit in nbio_store — that half is C3's detach policy, untouched.
 
 ### P5 — Feature: proxy username + password (owner-approved; RFC 1929)
 - [x] Extend `InjectorConfig` (`src/common/schema.hpp`) with credential fields; both
