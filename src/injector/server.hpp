@@ -32,8 +32,9 @@
 
 using tcp = asio::ip::tcp;
 
-// Why a session is going away.  M1: these two used to be one event, and that
-// was the bug.  A dropped control connection does not stop the capsule --
+// Why a session is going away.  M1: losing the connection and being
+// un-injected used to be one event, and that was the bug.  A dropped control
+// connection does not stop the capsule --
 // src/injectee/client.hpp fixes its token at construction, re-presents it on
 // every reconnect, and parks rather than unloads -- so a transient reset, or
 // the injector's own io thread losing the socket, is followed by a fresh
@@ -42,8 +43,8 @@ using tcp = asio::ip::tcp;
 // the capsule spins on reconnect while the front end still lists the pid as
 // injected.  Only an explicit un-inject has earned the word "gone".
 //
-// No default argument on either: the intent is what this whole distinction is
-// about, so every call site has to spell it out.
+// No default argument: the intent is what this whole distinction is about, so
+// every call site has to spell it out.
 enum class session_end {
   lost,    // the connection dropped; keep the bootstrap so it can re-register
   retired  // the front end closed it; the injection is over
