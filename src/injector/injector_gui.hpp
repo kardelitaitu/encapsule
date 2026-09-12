@@ -206,7 +206,11 @@ auto make_controls(injector_server &server, ce::view &view,
   // exactly like one that was never caught at all.  The growing log is the
   // realistic thing to fail here: this box keeps every line the tool has
   // reported since it started.
-  auto report = [&](std::string_view panel, std::string_view why) {
+  // log_box is copied, not captured by reference: this closure is copied into
+  // the handlers below and lives in the widget tree, so it outlives this
+  // function, and a reference to a local shared_ptr would dangle on the first
+  // refusal.  view is a reference parameter, so binding to it is safe.
+  auto report = [log_box, &view](std::string_view panel, std::string_view why) {
     try {
       auto line = log_box->get_text() + std::string(panel) + " " +
                   std::string(why) + "\n";
