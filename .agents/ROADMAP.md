@@ -4,12 +4,12 @@
 > Grounded in the verified state of `master@ede7e02`; file/line references included.
 > Tick checkboxes as items land, and re-verify line numbers after refactors.
 >
-> Rebrand note: the project is being renamed `proxinject` → `encapsule` (see P3).
-> Until that lands, file/target names in this document still use the old branding.
+> Rebrand note: P3 LANDED — the tree is now branded `encapsule` (old names survive only
+> in this document's historical task text, the README fork-attribution, and legal lines).
 
 ## 1. Where the project stands
 
-**encapsule** (still branded `proxinject` throughout the tree until the P3 rebrand) is a **Windows-only socks5 proxy injection tool**: it injects `proxinjectee.dll`
+**encapsule** (formerly `proxinject`; fork of PragmaTwice/proxinject) is a **Windows-only socks5 proxy injection tool**: it injects `proxinjectee.dll`
 into a running process and redirects that process's outbound TCP connections through a
 user-supplied socks5 server. One codebase, four real build targets
 (CMake ≥ 3.20, C++20, MSVC only, static CRT):
@@ -93,22 +93,22 @@ UI data-race fixes (`view.post`).
       `--error-on-skip`.)
 
 ### P3 — Rebrand `proxinject` → `encapsule` (owner-approved)
-- [ ] Decide final names: GUI exe `encapsule`, CLI `encapsule-cli`, injectee
+- [x] Decide final names: GUI exe `encapsule`, CLI `encapsule-cli`, injectee
       `encapsule-injectee.dll` / `encapsule-injectee32.dll` (or mirror the old
       `proxinjectee` naming); keep `wow64-address-dumper` unless decided otherwise.
-- [ ] CMake: `project()` name, target names, `ELEMENTS_APP_PROJECT`, and the
+- [x] CMake: `project()` name, target names, `ELEMENTS_APP_PROJECT`, and the
       `PROXINJECT_VERSION` / `version.hpp.in` variable set (`CMakeLists.txt`).
-- [ ] Rename the IPC mapping prefix `PROXINJECT_PORT_IPC_<pid>` on BOTH injector and
+- [x] Rename the IPC mapping prefix `ENCAPSULE_PORT_IPC_<pid>` on BOTH injector and
       injectee sides atomically (`src/common/utils.hpp:156` + the injectee lookup).
-- [ ] Update `find_injectee` DLL lookup (`src/injector/injector.hpp`) and the
+- [x] Update `find_injectee` DLL lookup (`src/injector/injector.hpp`) and the
       `build.ps1` Win32 copy step (proxinjectee.dll → *32.dll).
-- [ ] Update UI/CLI strings: `ce::app("proxinject")` window title
+- [x] Update UI/CLI strings: `ce::app(...)` window title now `encapsule`
       (`src/injector/injector_gui.cpp`), CLI description/help text
       (`src/injector/injector_cli.cpp`).
-- [ ] Update packaging: `setup.nsi` product/shortcut names,
+- [x] Update packaging: `setup.nsi` product/shortcut names,
       `.github/workflows/build.yml` artifact/release names (`proxinject-snapshot-*`),
       `resources/proxinject.rc` and logo assets.
-- [ ] Update docs/meta: README title, badges, screenshots, repo description (origin
+- [x] Update docs/meta: README title, badges, screenshots done (owner); repo description + winget manifest remain owner-domain
       already points at `kardelitaitu/encapsule.git`); decide whether to publish a
       `kardelitaitu.encapsule` winget manifest (upstream's package stays theirs).
 - [ ] Full rebuild (x64 + Win32) and end-to-end smoke test: inject into a real process
