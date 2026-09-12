@@ -62,12 +62,12 @@ using injectee_client_ptr = std::shared_ptr<injectee_client>;
 // injector_server, so it could not be posted to from here at all.
 //
 // The mutex lives in the table rather than next to it on purpose: `clients`
-// has to stay reachable as a public member - injectee_session_cli::
-// process_close() reads server_.clients.size() to decide whether any client is
-// left - and a lock that sits beside a public map is a lock that public code
-// can walk past.  Every operation here is short, non-blocking and returns a copy
-// (a bool, a size, or a shared_ptr), so no caller can hold the lock while it
-// calls into asio, and nothing here co_awaits at all.
+// has to stay reachable as a public member - injectee_session_cli's
+// process_close() reads server_.clients.size() to ask whether any client is
+// left - and a lock beside a public map is a lock public code can walk past.
+// Every operation here is short, non-blocking and returns a copy (a bool, a
+// size, or a shared_ptr), so no caller can hold the lock while it calls into
+// asio, and nothing here co_awaits at all.
 //
 // Lock order: config_mutex -> this lock, never the reverse.  Every config_*()
 // setter on injector_server holds config_mutex and then walks the table (via
