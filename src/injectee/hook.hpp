@@ -366,12 +366,28 @@ struct hook_WSAConnectByName : minhook::api<F, hook_WSAConnectByName<F, N>> {
       auto proxy = cfg["addr"_f];
       auto log = cfg["log"_f];
 
-      auto addr = ipaddr_from_name(nodename, servicename);
+      // Neither pointer may be handed over unchecked: WSAConnectByName
+      // validates them itself (measured on this SDK -- a NULL node or a NULL
+      // service comes back FALSE with WSAEINVAL 10022 and connects to
+      // nothing), and either one reaching ipaddr_from_name would build a
+      // std::string out of nullptr, undefined behaviour sitting inside
+      // someone else's process.  So the names are read only when both are
+      // there; a missing one is simply "no endpoint", the same dead end as an
+      // unresolvable service, which the refusal below already handles.
+      auto addr = nodename && servicename
+                      ? ipaddr_from_name(nodename, servicename)
+                      : std::optional<IpAddr>{};
 
       // A service nobody could name is a dead end, not a licence to let the
       // original resolve it and connect: that is a direct, unproxied route out
       // of the capsule and the app would never know.  So this fails closed,
-      // the P4 policy every other refusal in this file follows.
+      // the P4 policy every other refusal in this file follows.  A name that
+      // was never passed (NULL above) is refused the same way: with a proxy
+      // configured, an endpoint this hook cannot name is not a reason to let
+      // the operating system pick the destination -- the app gets a failed
+      // connect either way, and the capsule keeps its word.  Without a proxy
+      // there is nothing to route, so the original still answers, WSAEINVAL
+      // and all.
       //
       // WSAConnectByName2 says of its return value: "If the function fails,
       // the return value is FALSE. To get extended error information, call
