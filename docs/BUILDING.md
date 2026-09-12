@@ -1,8 +1,6 @@
 # Building from source — encapsule (contributor docs)
 
-> Rebrand note: the project is being renamed `proxinject` → `encapsule`
-> (see `.agents/ROADMAP.md`, P3). Until that rebrand lands, targets, binaries
-> and file names in this document still use the old `proxinject` branding.
+> Formerly `proxinject`; this tree is a fork of [PragmaTwice/proxinject](https://github.com/PragmaTwice/proxinject). Everything below uses the post-rebrand names (ROADMAP P3).
 
 This guide is for contributors building and debugging the project from
 source. For end-user installs see the [README](../README.md).
@@ -14,8 +12,8 @@ source. For end-user installs see the [README](../README.md).
 | Windows 10+ | Windows-only by design; `CMakeLists.txt` fails fast on non-WIN32 hosts. |
 | MSVC C++20 toolset | Visual Studio 2019/2022 (Build Tools are enough) with the "Desktop development with C++" workload. MSVC is the only supported compiler; C++20 is required (`CMAKE_CXX_STANDARD 20`). |
 | Windows SDK (winsock2) | Comes with the VS C++ workload. The injectee links `ws2_32`; `_WIN32_WINNT` is pinned to `0x0A00`. |
-| CMake >= 3.20 | On `PATH` (`cmake_minimum_required(VERSION 3.20)`). `build.ps1` only shells out to `cmake`; the VS generator locates MSBuild for the actual compile. |
-| git | Configuration runs `git describe --tags` to read the version string; when that fails (e.g. a fresh clone with **no tags**) CMake warns and falls back to `v0.0.0-unknown` (`CMakeLists.txt:82-91`), so a fresh clone configures without needing a tag. |
+| CMake >= 3.20 | On `PATH` (`cmake_minimum_required(VERSION 3.20)`). `build.ps1` only shells out to `cmake`; the VS generator locates MSBuild for the actual compile. With CMake 4.x keep `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` on every configure (`build.ps1:26,28`) — the FetchContent deps still declare older minimums. |
+| git | Configuration runs `git describe --tags` to read the version string; when that fails (e.g. a fresh clone with **no tags**) CMake warns and falls back to `v0.0.0-unknown` (`CMakeLists.txt:83-92`), so a fresh clone configures without needing a tag. |
 
 All third-party libraries (minhook, protopuf, argparse, spdlog, asio, the
 cycfi/elements fork) are FetchContent-pinned and downloaded **at configure
@@ -43,11 +41,11 @@ Script parameters (`build.ps1`):
 
 ### What `-arch x64` does
 
-1. **x64 pass** — full configure + build: the GUI (`proxinjector.exe`), the
-   CLI (`proxinjector-cli.exe`) and the 64-bit `proxinjectee.dll`.
-2. **Win32 pass** — a second configure with `-DPROXINJECTEE_ONLY=ON`, which
-   builds *only* the 32-bit injectee, plus the Win32-only
-   `wow64-address-dumper.exe` helper.
+1. **x64 pass** — full configure + build: the GUI (`encapsule.exe`), the
+   CLI (`encapsule-cli.exe`) and the 64-bit `encapsule-injectee.dll`.
+2. **Win32 pass** — a second configure with `-DENCAPSULE_INJECTEE_ONLY=ON`
+   (`build.ps1:20,28`), which builds *only* the 32-bit injectee, plus the
+   Win32-only `wow64-address-dumper.exe` helper.
 3. Both passes compile via `cmake --build <dir> --config <mode>` (MSBuild
    under the hood), and the artifacts are copied into `./release`.
 
@@ -55,14 +53,23 @@ Script parameters (`build.ps1`):
 
 | File | Purpose |
 |---|---|
-| `proxinjector.exe` | GUI front end. |
-| `proxinjector-cli.exe` | CLI front end. |
-| `proxinjectee.dll` | 64-bit injectee, loaded into 64-bit target processes. |
-| `proxinjectee32.dll` | 32-bit injectee (from the Win32 pass), for 32-bit/WoW64 targets. |
-| `wow64-address-dumper.exe` | Win32 helper that reports the 32-bit `LoadLibraryW` address as its **process exit code** — the WoW64 pivot used by the 64-bit injector. |
+| `encapsule.exe` | GUI front end (target `encapsule`, `CMakeLists.txt:123`). |
+| `encapsule-cli.exe` | CLI front end (target `encapsule-cli`, `CMakeLists.txt:141`). |
+| `encapsule-injectee.dll` | 64-bit injectee (target `encapsule-injectee`, `CMakeLists.txt:110`), loaded into 64-bit target processes. |
+| `encapsule-injectee32.dll` | 32-bit injectee — the Win32 pass's DLL renamed by `build.ps1:41`, for 32-bit/WoW64 targets. |
+| `wow64-address-dumper.exe` | Win32 helper (name unchanged) that reports the 32-bit `LoadLibraryW` address as its **process exit code** — the WoW64 pivot used by the 64-bit injector. |
 | `resources/`, `LICENSE` | App assets and license, staged for packaging. |
 
+The two DLL names above are the ones the injector looks up at runtime
+(`src/injector/injector.hpp:190-191`) — renaming them means changing both
+sides together.
+
 `-arch Win32` runs the single Win32 pass only (all targets, 32-bit).
+
+`CMakePresets.json` mirrors both configure/build passes (presets `x64` and
+`win32-injectee-only`), so `cmake --preset x64 && cmake --build --preset x64`
+is an alternative to the wrapper script; the presets do **not** perform the
+copy into `./release`, so `build.ps1` stays the reference for a full build.
 
 Optional installer (see `setup.nsi`):
 
@@ -70,24 +77,24 @@ Optional installer (see `setup.nsi`):
 makensis /DVERSION=$(git describe --tags) setup.nsi
 ```
 
-CI (`.github/workflows/build.yml`) runs the same script on `windows-2022`
-with a `{Debug, Release} × {Win32, x64}` matrix.
+> ⚠️ Packaging straggler: `setup.nsi:10-11` still defines the pre-rebrand
+> product name and the old GUI exe name, so the installer currently points at
+> a binary this build no longer produces. Tracked as a ROADMAP P3 packaging
+> item; fix it before shipping an installer.
 
-> **CMakePresets note:** `CMakePresets.json` presets mirroring `build.ps1`
-> (x64 full build + Win32 `PROXINJECTEE_ONLY=ON` pass that yields
-> `proxinjectee32.dll`) are landing in parallel (ROADMAP P1). Once merged,
-> `cmake --preset ...` becomes an alternative to the wrapper script;
-> `build.ps1` stays the source-of-truth reference for what the presets must
-> reproduce.
+CI (`.github/workflows/build.yml`) runs the same script on `windows-2022`
+with a `{Debug, Release} × {Win32, x64}` matrix, then a blocking `ctest` step
+that excludes the e2e label (`:31`) and an x64/Release-only e2e step retried
+with `--repeat until-pass:3` (`:33-35`).
 
 ## 3. Injector-exit behavior
 
 **Policy: the injectee stays resident — the injector is not the victim's
-lifeline.** When `proxinjector.exe` / `proxinjector-cli.exe` dies, is killed,
+lifeline.** When `encapsule.exe` / `encapsule-cli.exe` dies, is killed,
 or simply exits once its last client is gone, nothing already done to the
 injected process is undone. What the victim then experiences:
 
-1. **Hooks stay installed.** `proxinjectee.dll` is never unloaded on the
+1. **Hooks stay installed.** `encapsule-injectee.dll` is never unloaded on the
    mid-session IPC-loss path. The client thread used to `FreeLibrary` itself
    as soon as the IPC channel closed; that was removed (ROADMAP P4 #5),
    because any other thread of the victim can be inside a detour at that
@@ -119,39 +126,40 @@ helper thread.
 
 ## 4. Debugging injected processes
 
-`proxinjectee.dll` executes **inside the target process** and detours live
-winsock APIs — a crash in injected code kills the target, so debug against
-disposable processes (a small test program, a `python` REPL, ...). The
-injector side (`src/injector/`) is an ordinary process and needs no special
-treatment.
+`encapsule-injectee.dll` executes **inside the target process** and detours
+live winsock APIs — a crash in injected code kills the target, so debug
+against disposable processes (a small test program, a `python` REPL, ...).
+The injector side (`src/injector/`) is an ordinary process and needs no
+special treatment.
 
 ### Attaching a debugger to the target process
 
 - Attach **before injecting** (Visual Studio: *Debug → Attach to Process*;
   WinDbg: `windbg -p <pid>`, or launch the target under the debugger) so you
-  catch the DLL load. Once injected, `proxinjectee.dll` shows up in the
+  catch the DLL load. Once injected, `encapsule-injectee.dll` shows up in the
   target's module list.
 - **Bitness must match**: use the x64 debugger for 64-bit targets, the x86
-  debugger for WoW64 targets (those receive `proxinjectee32.dll`).
+  debugger for WoW64 targets (those receive `encapsule-injectee32.dll`).
 - Build `-mode Debug` for an unoptimized injectee and point the debugger's
   symbol path at the PDBs of the same build tree (`build/<arch>/<mode>/`).
-- In WinDbg, `sxe ld:proxinjectee.dll` breaks the moment the injected DLL
-  maps in. `DllMain` (`src/injectee/injectee.cpp`) only initializes MinHook,
-  installs the hooks and **detaches a worker thread** — the real logic (IPC
-  client, config, logging) runs on that thread, so set your breakpoints in
-  the `src/injectee/hook.hpp` detours and `client.hpp`, not in `DllMain`.
+- In WinDbg, `sxe ld:encapsule-injectee.dll` breaks the moment the injected
+  DLL maps in. `DllMain` (`src/injectee/injectee.cpp:88`) only initializes
+  MinHook, installs the hooks and **detaches a worker thread** — the real
+  logic (IPC client, config, logging) runs on that thread, so set your
+  breakpoints in the `src/injectee/hook.hpp` detours and `client.hpp`, not in
+  `DllMain`.
 
 ### The connection log flag: `-l` / `--enable-log`
 
-`proxinjector-cli -l` (and the GUI log toggle) tells the injectee to push a
+`encapsule-cli -l` (and the GUI log toggle) tells the injectee to push a
 `connect` message — socket handle, original destination, proxy address and
 the name of the hooked API — over the IPC channel for every hooked outbound
 connect; the front end prints these with timestamps. It is the fastest way
 to confirm that redirection actually happened:
 
 ```powershell
-# smoke test against a local socks5 server (ROADMAP §5)
-./release/proxinjector-cli.exe -p 127.0.0.1:1080 -i <pid> -l
+# smoke test against a local socks5 server
+./release/encapsule-cli.exe -p 127.0.0.1:1080 -i <pid> -l
 ```
 
 If a connection is *not* logged: hooks only act on AF_INET non-localhost
@@ -169,17 +177,19 @@ full table lives in `.agents/ROADMAP.md` §2:
   temporarily forces the socket into blocking mode (`FIONBIO = 0`) for the
   socks5 handshake, then restores the remembered mode; that state is tracked
   in `nbio_map` by the `ioctlsocket`, `WSAAsyncSelect` and `WSAEventSelect`
-  hooks (sockets that never went non-blocking stay blocking). There is **no
-  timeout yet** (P4): a socks5 server that never answers hangs the target's
-  thread indefinitely. When stepping here, check that the non-blocking state
-  is restored correctly — a wrongly restored mode looks like an unrelated
-  async-I/O bug in the target application.
+  hooks (sockets that never went non-blocking stay blocking). The handshake
+  is bounded by a 3 s timeout (`SOCKS_HANDSHAKE_TIMEOUT_MS`, `hook.hpp:66`),
+  applied as `SO_RCVTIMEO`/`SO_SNDTIMEO` in `blocking_scope` (`hook.hpp:111-121`)
+  and surfacing as `WSAETIMEDOUT` — so a hung proxy fails the connect after
+  ~3 s rather than hanging the victim's thread. When stepping here, check that
+  the non-blocking state is restored correctly — a wrongly restored mode looks
+  like an unrelated async-I/O bug in the target application.
 - **Injector exit — `src/injectee/injectee.cpp`, `client.hpp`.** `DllMain`
   spawns a *detached* worker thread (`do_client`) that runs the asio
   `io_context`. It no longer calls `FreeLibrary` on the DLL when the IPC
   channel closes: the injector dying must not unmap code that other threads
   of the victim may be executing inside a detour. The module therefore stays
-  mapped for the lifetime of the process — see §4 for the whole policy, and
+  mapped for the lifetime of the process — see §3 for the whole policy, and
   stop expecting the unload that used to make breakpoints and module
   presence vanish mid-session.
 - **WoW64 exit-code pivot — `src/injector/injector.hpp`,
@@ -194,7 +204,20 @@ full table lives in `.agents/ROADMAP.md` §2:
 
 Also read before changing things (ROADMAP §2): the exact detour signatures
 (`src/common/minhook.hpp`; `hook_ConnectEx` bypasses the CRTP wrapper), the
-surprising IPv6 byte order in `src/injectee/winnet.hpp`, and the
-unauthenticated IPC mapping in `src/common/utils.hpp`.
+surprising IPv6 byte order in `src/injectee/winnet.hpp`, and the IPC mapping
+contract below.
 
-The IPC mapping that carries the control port is now created with an explicit user+SYSTEM DACL (`D:P(A;;GA;;;SY)(A;;GA;;;<current-user-SID>)`, `create_mapping` in `src/common/winraii.hpp`), and it fails closed: if that descriptor cannot be built the mapping is not created at all, never silently left world-accessible.
+### The IPC mapping: name, payload and DACL
+
+- The mapping name is `ENCAPSULE_PORT_IPC_<pid>` (`src/common/utils.hpp:161-165`).
+  Both sides must agree on it — renaming it is a two-sided change.
+- The payload is not just the port: `port_mapping_payload` carries the control
+  port plus an 8-byte per-injection random token (`src/common/utils.hpp:175-190`),
+  and the injectee re-presents that token in every message it sends
+  (`src/injectee/client.hpp:113-121`). The control server refuses any session
+  whose token does not match (`src/injector/server.hpp:183-188`). No RNG, no
+  token, no injection (`src/injector/injector.hpp:114`).
+- The mapping is created with an explicit user+SYSTEM DACL
+  (`D:P(A;;GA;;;SY)(A;;GA;;;<current-user-SID>)`) and **fails closed**: if the
+  descriptor cannot be built, the mapping is not created at all — never
+  silently left world-accessible (`create_mapping`, `src/common/winraii.hpp:143-195`).
