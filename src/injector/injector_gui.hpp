@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <optional>
 #include <sstream>
+#include <string_view>
 
 namespace ce = cycfi::elements;
 
@@ -152,16 +153,99 @@ const std::vector<std::string_view> input_tip_options = [] {
 // can say.
 constexpr std::size_t proxy_host_max_length = 255;
 
+// The same bound for the pid box: a DWORD is 32 bits, and the widest value one
+// can hold -- 4294967295 -- is ten digits.  Ten digits also fit a uint64_t
+// twelve times over, so the accumulation below has nothing to overflow.
+constexpr std::size_t process_id_max_digits = 10;
+
+// The pid box, parsed the way the port of the proxy panel is: compared against
+// '0'..'9' rather than handed to std::isdigit (whose argument is a signed char
+// here, and every byte above 0x7f is outside its domain), bounded by
+// `process_id_max_digits` before any arithmetic, and never passed to
+// `std::stoul` -- which throws `out_of_range` at the eleventh digit, out of a
+// click handler, on the thread that owns the window.  Returns null and fills
+// `out`, or returns fixed text naming the refusal; what was typed is never in
+// it, because a paste gone wrong belongs in nobody's log.
+inline const char *parse_process_id(const std::string &text, DWORD &out) {
+  constexpr const char *bad_id =
+      "the process id must be a number from 1 to 4294967295";
+
+  if (text.empty())
+    return "no process id was entered";
+  if (text.size() > process_id_max_digits)
+    return bad_id;
+
+  std::uint64_t value = 0;
+  for (const char digit : text) {
+    if (digit < '0' || digit > '9') {
+      return bad_id;
+    }
+    value = value * 10 + static_cast<std::uint64_t>(digit - '0');
+  }
+  if (value == 0 || value > 0xFFFFFFFFull) {
+    return bad_id; // 0 is "no process", not a process
+  }
+
+  out = static_cast<DWORD>(value);
+  return nullptr;
+}
+
 auto make_controls(injector_server &server, ce::view &view,
                    process_vector &process_vec) {
   using namespace ce;
+
+  // Created before every handler that can refuse a click, because this log is
+  // the only text the window can make the user see: a rejection nobody reads is
+  // a silent failure, and a silent failure in a tool that injects into other
+  // processes is an outage with no report.
+  auto log_box = share(selectable_text_box(""));
+
+  // One refusal, one shape: a FIXED line, panel-tagged, appended to that log,
+  // then a repaint.  Guarded inside, because the handlers below report from
+  // within a `catch` -- and a throw on the way out of a catch ends the process
+  // exactly like one that was never caught at all.  The growing log is the
+  // realistic thing to fail here: this box keeps every line the tool has
+  // reported since it started.
+  auto report = [&](std::string_view panel, std::string_view why) {
+    try {
+      auto line = log_box->get_text() + std::string(panel) + " " +
+                  std::string(why) + "\n";
+      log_box->set_text(line);
+      view.refresh();
+    } catch (...) {
+    }
+  };
+
+  // The backstop for the clicks that cannot be refused by validating first: an
+  // allocation that fails, a throw from inside asio, protopuf or the injector,
+  // a std::regex giving up in some way its own catch does not name.  The line
+  // to show is a literal at every call site, so nothing about the click has to
+  // be guessed at -- and nothing of it is printed.
+  auto guarded = [report](auto &&action, std::string_view panel,
+                          const char *line) {
+    try {
+      action();
+    } catch (...) {
+      report(panel, line);
+    }
+  };
 
   auto [process_input, process_input_ptr] =
       input_box(std::string(input_tip_texts.at("pid")));
 
   auto [input_select, input_select_ptr] = selection_menu(
-      [process_input_ptr](auto str) {
-        process_input_ptr->_placeholder = input_tip_texts.at(str);
+      [process_input_ptr, report](auto str) {
+        // Picking from this menu is a click, and this was a throwing map
+        // lookup inside one.  `str` comes back from the widget rather than
+        // from here, so the key is nobody's promise: `input_tip_texts` and the
+        // menu are built from the same table today, but a lookup that cannot
+        // fail should not be one that ends the process if it ever can.
+        auto tip = input_tip_texts.find(str);
+        if (tip != input_tip_texts.end()) {
+          process_input_ptr->_placeholder = tip->second;
+        } else {
+          report("[process]", "that process selector is not known");
+        }
       },
       input_tip_options);
 
@@ -170,19 +254,30 @@ auto make_controls(injector_server &server, ce::view &view,
   auto new_console_toggle = share(check_box("new console"));
 
   auto inject_click =
-      [input_select_ptr, process_input_ptr,
-       new_console_toggle]<typename F>(F &&f) {
+      [input_select_ptr, process_input_ptr, new_console_toggle,
+       report]<typename F>(F &&f) {
     auto text = trim_copy(process_input_ptr->get_text());
-    if (text.empty())
+    if (text.empty()) {
+      // A click with nothing in the box used to do nothing at all, which is
+      // indistinguishable from a click that was refused for a reason.  It is a
+      // refusal, so it now says so, in the same fixed-text shape as the rest.
+      report("[process]", "no process id, name, path or command was entered");
       return;
+    }
     auto option = input_select_ptr->get_text();
     if (option == "pid") {
-      if (!all_of_digit(text))
+      // Where this stood, `all_of_digit` then `std::stoul`: the first leans on
+      // `std::isdigit` with a signed char, and the second throws
+      // `out_of_range` at the eleventh digit -- a number the box accepts, since
+      // a run of digits is exactly what a pid looks like.  `parse_process_id`
+      // is both checks done without either hazard, and its refusal is a line in
+      // the log instead of the end of the process.
+      DWORD pid = 0;
+      if (const char *why = parse_process_id(text, pid)) {
+        report("[process]", why);
         return;
+      }
 
-      DWORD pid = std::stoul(text);
-      if (pid == 0)
-        return;
       if (!std::forward<F>(f)(pid))
         return;
     } else if (option == "name") {
@@ -232,14 +327,23 @@ auto make_controls(injector_server &server, ce::view &view,
     process_input_ptr->set_text("");
   };
 
+  // The two buttons share everything but the operation, and both need the same
+  // backstop: past the parse there is a process enumeration, a regex the user
+  // wrote, a `CreateProcessW` argument built from a paste, and an injector
+  // that allocates.  None of it can be refused by validating the box first, so
+  // it is caught, and the line naming it is a literal.
   auto inject_button = icon_button(icons::plus, 1.2, bblue);
-  inject_button.on_click = [&server, inject_click](bool) {
-    inject_click([&server](DWORD x) { return server.inject(x); });
+  inject_button.on_click = [&server, inject_click, guarded](bool) {
+    guarded(
+        [&] { inject_click([&server](DWORD x) { return server.inject(x); }); },
+        "[process]", "the process was not added");
   };
 
   auto remove_button = icon_button(icons::cancel, 1.2, bred);
-  remove_button.on_click = [&server, inject_click](bool) {
-    inject_click([&server](DWORD x) { return server.close(x); });
+  remove_button.on_click = [&server, inject_click, guarded](bool) {
+    guarded(
+        [&] { inject_click([&server](DWORD x) { return server.close(x); }); },
+        "[process]", "the process was not removed");
   };
 
   auto process_list = share(dynamic_list_s(basic_cell_composer(
@@ -258,14 +362,9 @@ auto make_controls(injector_server &server, ce::view &view,
   auto [user_input, user_input_ptr] = input_box("username");
   auto [pass_input, pass_input_ptr] = input_box("password");
 
-  // Created before the proxy toggle because that handler reports rejected
-  // input here: this log is the only text the proxy panel can make the user
-  // see, and a credential that cannot be sent has to say so out loud.
-  auto log_box = share(selectable_text_box(""));
-
   auto proxy_toggle = share(toggle_icon_button(icons::power, 1.2, brblue));
-  proxy_toggle->on_click = [&server, &view, proxy_toggle, log_box,
-                            addr_input_ptr, port_input_ptr, user_input_ptr,
+  proxy_toggle->on_click = [&server, proxy_toggle, report, addr_input_ptr,
+                            port_input_ptr, user_input_ptr,
                             pass_input_ptr](bool on) {
     // This handler answers a click on the UI thread, so an exception that
     // escapes it is not an error message -- it is the injector process dying,
@@ -278,16 +377,17 @@ auto make_controls(injector_server &server, ce::view &view,
     // log below.  No user text is echoed into it: the address box
     // takes free input too, and `user:pass@host` pasted there is a password
     // the log would keep on screen.
-    auto refuse = [&](const std::string &why) {
-      proxy_toggle->value(false);
-      // Wrapped because this runs from inside a catch below: a refusal that
-      // throws on its way out -- the log grows, the repaint allocates -- would
-      // escape the very handler this exists to protect.
+    // Every refusal in this handler is one of these: the toggle back off, and
+    // one fixed line in the log.  The write that snaps the toggle is covered
+    // too, because `refuse` is also what runs from the `catch` below -- and
+    // what is escaping a catch there is the same death this whole block exists
+    // to prevent.  `report` guards its own log write and repaint.
+    auto refuse = [&](std::string_view why) {
       try {
-        log_box->set_text(log_box->get_text() + "[proxy] " + why + "\n");
-        view.refresh();
+        proxy_toggle->value(false);
       } catch (...) {
       }
+      report("[proxy]", why);
     };
 
     try {
@@ -398,31 +498,41 @@ auto make_controls(injector_server &server, ce::view &view,
       // exception's `what()` is the one string in this handler nobody
       // reviewed, and a converter is free to put whatever it was handed into
       // it, which is exactly the byte the log must never keep on screen.
-      // Reporting cannot be allowed to escape either, so it is guarded in its
-      // own turn: what `refuse` can fail at it wraps itself, and this catches
-      // the rest -- the toggle write above all.
-      try {
-        refuse("the proxy settings were not applied");
-      } catch (...) {
-      }
+      // `refuse` cannot throw on its way out, so nothing is left to escape.
+      refuse("the proxy settings were not applied");
     }
   };
 
+  // Three more clicks that take no input to validate and still allocate, or
+  // reach into asio and protopuf to push a config: the same backstop, with a
+  // literal line each, so the answer to "why is the log still empty?" is never
+  // a window that quietly stopped being there.
   auto log_toggle = toggle_icon_button(icons::doc, 1.2, brblue);
-  log_toggle.on_click = [&server](bool on) { server.enable_log(on); };
+  log_toggle.on_click = [&server, guarded](bool on) {
+    guarded([&] { server.enable_log(on); }, "[proxy]",
+            "the connection log was not switched");
+  };
 
   auto subprocess_toggle = toggle_icon_button(icons::record, 1.2, brblue);
-  subprocess_toggle.on_click = [&server](bool on) {
-    server.enable_subprocess(on);
+  subprocess_toggle.on_click = [&server, guarded](bool on) {
+    guarded([&] { server.enable_subprocess(on); }, "[proxy]",
+            "subprocess injection was not switched");
   };
 
   auto clean_button = icon_button(icons::trash, 1.2, bcblue);
-  clean_button.on_click = [log_box](bool) { log_box->set_text(""); };
+  clean_button.on_click = [log_box, guarded](bool) {
+    guarded([&] { log_box->set_text(""); }, "[proxy]",
+            "the log was not cleared");
+  };
 
   auto info_button = icon_button(icons::info, 1.2, bcblue);
-  info_button.on_click = [&view](bool) {
-    view.add(message_box1(view, encapsule_copyright(encapsule_version),
-                          icons::info, [] {}));
+  info_button.on_click = [&view, guarded](bool) {
+    guarded(
+        [&] {
+          view.add(message_box1(view, encapsule_copyright(encapsule_version),
+                                icons::info, [] {}));
+        },
+        "[proxy]", "the information box did not open");
   };
 
   // clang-format off
