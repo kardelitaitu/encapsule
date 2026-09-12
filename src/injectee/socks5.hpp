@@ -61,8 +61,16 @@ constexpr const size_t SOCKS_REQUEST_MAX_SIZE =
 constexpr const size_t SOCKS_UDP_HEADER_MAX = 4 + 1 + SOCKS_DOMAIN_MAX_LENGTH +
                                               2;
 
-// VER + NMETHODS + up to 255 methods (RFC 1928 section 3).
-constexpr const size_t SOCKS_GREETING_MAX_SIZE = 2 + 255;
+// The widest legal NMETHODS octet (RFC 1928 section 3): a greeting can name
+// at most 255 methods.  Named for what it COUNTS -- SOCKS_DOMAIN_MAX_LENGTH is
+// 255 too, but by coincidence: that one bounds a domain name's LEN octet, this
+// one bounds a method list.  Sharing the old name made a method list look like
+// a name, and would silently resize the greeting if either concept ever moved.
+// No wire byte changes: the bound is still X'FF' and the buffer still 257.
+constexpr const size_t SOCKS_NMETHODS_MAX = 255;
+
+// VER + NMETHODS + up to SOCKS_NMETHODS_MAX methods (RFC 1928 section 3).
+constexpr const size_t SOCKS_GREETING_MAX_SIZE = 2 + SOCKS_NMETHODS_MAX;
 
 // VER + ULEN + 255 + PLEN + 255 (RFC 1929).  Note this is 513, not a round
 // 512: a caller that sizes its buffer with SOCKS_AUTH_MAX_SIZE must hold the
@@ -109,11 +117,12 @@ inline socks5_credentials socks5_credentials_from(const InjectorConfig &cfg) {
 // Writes the client greeting {VER, NMETHODS, METHODS...}.  `methods` holds
 // `n` method ids; `out` needs room for `n` + 2 bytes, at most
 // SOCKS_GREETING_MAX_SIZE.  Returns the number of bytes written, or 0 when the
-// method list is empty or too long to encode.
+// method list is empty or too long to encode -- too long being more than
+// SOCKS_NMETHODS_MAX, i.e. more than one NMETHODS octet can spell.
 inline size_t socks5_build_greeting(const uint8_t *methods, size_t n,
                                     char *out) {
   if (methods == nullptr || out == nullptr || n == 0 ||
-      n > SOCKS_DOMAIN_MAX_LENGTH) {
+      n > SOCKS_NMETHODS_MAX) {
     return 0;
   }
 
@@ -490,10 +499,40 @@ struct socks5_relay_endpoint {
   sockaddr_storage bound{};
 };
 
+// Wipes a frame that held a plaintext login on its way out of scope.
+//
+// WHY a guard and not a SecureZeroMemory at each `return`: socks5_handshake has
+// four exits after the subnegotiation is laid down -- accepted, refused, bad
+// version, and socket error -- and a hand-written wipe has to be remembered at
+// every one of them, plus at any exit a later edit adds.  Destructors run on
+// all of them by construction.  SecureZeroMemory (not memset) because the frame
+// is dead stack the moment it runs: an ordinary fill MSVC can prove unread is
+// elided, and an elided wipe is the same leak with a comment on it.
+struct socks5_auth_frame_scrub {
+  uint8_t *frame;
+  size_t size;
+
+  ~socks5_auth_frame_scrub() {
+    SecureZeroMemory(frame, (DWORD)size);
+  }
+};
+
 // The RFC 1928 greeting, plus the RFC 1929 subnegotiation when the caller has
 // credentials.  creds is REQUIRED, not defaulted: every call site has to say
 // where the login comes from, and hook.hpp passes the InjectorConfig it already
-// holds.  Any failure returns false and the caller's fail_proxied_connect()
+// holds.
+//
+// NOTE -- the frame wiped below is not the only one that held the password.
+// `creds` borrows: both of its views point INTO the caller's InjectorConfig,
+// so the octets that went out on the wire stay sitting there, unzeroed, for as
+// long as the caller's frame does.  At all four connect sites that frame is the
+// by-value copy injectee_config::get() returned, which was itself copied out of
+// the live and the pinned config -- further frames, none of them zeroized, in a
+// process any same-user debugger can ReadProcessMemory.  Closing that is a
+// config-slice job (a borrow out of get(), or a move that zeroes its source);
+// nothing this function owns can reach someone else's object.
+//
+// Any failure returns false and the caller's fail_proxied_connect()
 // turns it into WSAECONNREFUSED -- a proxy that refused the login is never
 // silently downgraded to an unauthenticated connection.
 bool socks5_handshake(SOCKET s, const socks5_credentials &creds) {
@@ -532,6 +571,13 @@ bool socks5_handshake(SOCKET s, const socks5_credentials &creds) {
     return false;
 
   uint8_t auth[SOCKS_AUTH_MAX_SIZE];
+  // Armed before the frame is filled, so it covers the auth_size == 0 case too
+  // (nothing was written, so there is nothing to lose -- but the buffer is
+  // already in scope and a reader cannot tell a wiped frame from an armed one
+  // that was never used).  See socks5_auth_frame_scrub for why this is the
+  // wipe that survives the optimizer.
+  const socks5_auth_frame_scrub scrub{auth, sizeof(auth)};
+
   const size_t auth_size =
       socks5_build_auth(creds.username, creds.password, auth);
 
@@ -562,7 +608,16 @@ bool socks5_handshake(SOCKET s, const socks5_credentials &creds) {
 // arrived and the other three came out of the request buffer -- and a request
 // buffer that starts {05 00 00 ...} reads back as "success"), and a reply that
 // stops inside its own address (the old code tested only for SOCKET_ERROR, so a
-// five-of-six read was a fine tunnel).
+// five-of-six read was a fine tunnel).  The order matters as much as the
+// flags: the four fixed octets are read and length-checked BEFORE ATYP is
+// believed, because ATYP is what sizes every read after it -- trusting a value
+// that arrived in a short read is how a two-octet answer buys a phantom tunnel
+// and a follow-on recv that eats the application's own data.  Neither buffer
+// is the caller's: the reply lands in `head`, so the request octets a caller
+// still holds can never be read back as an answer.  Pinned twice on the
+// wire: two_octets_then_close_is_a_protocol_error (the BND path) and
+// a_two_octet_reply_never_passes_as_a_tunnel_on_the_connect_path (the connect
+// path, where the caller's buffer is the request).
 //
 // A refusal reads no further.  RFC 1928 fills a failed reply's BND with zeros,
 // but a server may close instead, and waiting for six octets that never come

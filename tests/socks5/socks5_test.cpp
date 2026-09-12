@@ -196,6 +196,28 @@ void build_greeting_rejects_unencodable_method_lists() {
   CHECK_EQ(socks5_build_greeting(methods, 255, buf), 257u);  // fits exactly
 }
 
+void greeting_bound_counts_methods_not_domain_octets() {
+  // WHY this pin exists: the NMETHODS bound used to be spelled with
+  // SOCKS_DOMAIN_MAX_LENGTH.  Both are 255, so naming it SOCKS_NMETHODS_MAX
+  // moved no octet -- but the two 255s bound different things (a method list
+  // vs a domain name), and a cap that changes on one side must not silently
+  // resize the greeting buffer under the handshake.  These lines are what turn
+  // that into a failed test rather than a wire change.
+  CHECK_EQ(SOCKS_NMETHODS_MAX, 255u);
+  CHECK_EQ(SOCKS_GREETING_MAX_SIZE, 257u);
+  CHECK_EQ(SOCKS_GREETING_MAX_SIZE, 2 + SOCKS_NMETHODS_MAX);
+  CHECK_EQ(SOCKS_DOMAIN_MAX_LENGTH, SOCKS_NMETHODS_MAX);  // equal by accident
+
+  // Still 2 + 255 on the wire, and still refused one octet past it.
+  char buf[SOCKS_GREETING_MAX_SIZE] = {};
+  const uint8_t methods[SOCKS_NMETHODS_MAX] = {};
+  CHECK_EQ(socks5_build_greeting(methods, SOCKS_NMETHODS_MAX, buf), 257u);
+  CHECK_EQ((int)(uint8_t)buf[0], 5);    // VER
+  CHECK_EQ((int)(uint8_t)buf[1], 255);  // NMETHODS: the octet this bounds
+  const uint8_t over[256] = {};
+  CHECK_EQ(socks5_build_greeting(over, 256, buf), 0u);
+}
+
 // ------------------------------------------------------------------- request
 
 void build_request_ipv4_is_network_order() {
@@ -1054,6 +1076,50 @@ void two_octets_then_close_is_a_protocol_error() {
   CHECK_EQ((int)verdict_for(nullptr, 0), (int)socks5_reply::protocol_error);
 }
 
+void a_two_octet_reply_never_passes_as_a_tunnel_on_the_connect_path() {
+  // The pin above, moved down to the shape the four connect() hooks use: the
+  // pre-P7 reader answered from `socks5_request_send`'s OWN request buffer, so
+  // a reply that stopped after two octets left buf[2] and buf[3] holding the
+  // request's RSV and ATYP.  X'00' there reads as REP=success and X'01' as
+  // ATYP=IPv4 -- a granted tunnel that was never granted, after which the next
+  // recv() on that socket eats the application's first bytes.  That is why the
+  // reader keeps its own `head` buffer and length-checks it before it believes
+  // ATYP: the request has to stay a request.
+  //
+  // WHY the half-close comes before the call: the fixed header is read with
+  // MSG_WAITALL, so on a socket whose peer neither finishes nor closes the read
+  // parks forever -- a hung test exe, and the linker waits on it.  The missing
+  // two octets have to arrive as an EOF.
+  auto p = make_loop_pair();
+  CHECK(p.app != INVALID_SOCKET);
+  const char two[] = {0x05, 0x00};
+  CHECK_EQ(::send(p.relay, two, 2, 0), 2);
+  ::shutdown(p.relay, SD_SEND);
+
+  char req[SOCKS_REQUEST_MAX_SIZE] = {};
+  const uint8_t dst[4] = {0, 0, 0, 0};
+  const size_t n = socks5_build_request(SOCKS_IPV4, dst, 0, req);
+  CHECK_EQ(n, 10u);
+  CHECK_EQ(socks5_request_send(p.app, req, n), SOCKS_GENERAL_FAILURE);
+  // The buffer still holds exactly what the builder put in it: no reply octet
+  // was ever written over the request.
+  CHECK_EQ((int)(uint8_t)req[0], 5);
+  CHECK_EQ((int)(uint8_t)req[1], (int)SOCKS_CONNECT);
+  CHECK_EQ((int)(uint8_t)req[3], (int)SOCKS_IPV4);
+  CHECK_EQ(octets_waiting(p.app), 0);  // and the read stopped at the cut
+  close_loop_pair(p);
+
+  // Same verdict through the overload a hook calls, where the request is built
+  // in the callee's frame and could not be safer-looking to a sloppy reader.
+  auto q = make_loop_pair();
+  CHECK(q.app != INVALID_SOCKET);
+  CHECK_EQ(::send(q.relay, two, 2, 0), 2);
+  ::shutdown(q.relay, SD_SEND);
+  const auto sa = make_v4(0, 0);  // {05 01 00 01 00 00 00 00 00 00}
+  CHECK_EQ(socks5_request(q.app, as_sockaddr(&sa)), SOCKS_GENERAL_FAILURE);
+  close_loop_pair(q);
+}
+
 void a_reply_cut_inside_its_address_is_truncated() {
   // Four legal octets promising an IPv4 BND, then only three of the six.  The
   // old code tested this read against SOCKET_ERROR alone, so three was a fine
@@ -1342,6 +1408,7 @@ int main() {
   RUN(build_greeting_offers_no_auth);
   RUN(build_greeting_offers_userpass_then_no_auth);
   RUN(build_greeting_rejects_unencodable_method_lists);
+  RUN(greeting_bound_counts_methods_not_domain_octets);
   RUN(build_request_ipv4_is_network_order);
   RUN(build_request_ipv6);
   RUN(build_request_domain);
@@ -1383,6 +1450,7 @@ int main() {
   RUN(an_ipv6_bnd_reply_is_decoded_wide_enough);
   RUN(a_domain_bnd_is_kept_raw_and_refused);
   RUN(two_octets_then_close_is_a_protocol_error);
+  RUN(a_two_octet_reply_never_passes_as_a_tunnel_on_the_connect_path);
   RUN(a_reply_cut_inside_its_address_is_truncated);
   RUN(a_refusal_reports_its_rep_and_reads_no_further);
   RUN(an_unparseable_reply_is_a_protocol_error_not_a_relay);
