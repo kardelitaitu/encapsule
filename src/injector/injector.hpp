@@ -71,14 +71,54 @@ struct injector {
   inline static std::mutex token_mutex;
   inline static std::map<DWORD, injection_token> tokens;
 
+  // The published mappings themselves, kept for the injector's whole lifetime
+  // (M1-b).  A named section's NAME exists only while some handle to it is
+  // open, so this map is not a cache and not a convenience: it is the reason
+  // an injectee can still find the bootstrap after inject() has returned.  See
+  // the two facts at the head of publish().
+  //
+  // Same mutex as the tokens, on purpose, and one invariant with it: a pid is
+  // in `tokens` exactly when it is in `mappings`.  The two records are the two
+  // halves of one publish, and either alone is a half-injection -- a name
+  // nobody can authenticate against, or a token pointing at a section that is
+  // already gone.  Both maps are therefore written in one critical section and
+  // erased in one, and the lock covers only a map operation and the
+  // CloseHandle it releases: nothing here blocks, waits or co_awaits.
+  inline static std::map<DWORD, handle> mappings;
+
   static void remember_token(DWORD pid, const injection_token &token) {
     std::lock_guard guard(token_mutex);
     tokens[pid] = token;
   }
 
+  // Retires a bootstrap by pid: the token the server checks, and the handle
+  // that keeps the section's name alive.  This is what a lost session leaves
+  // behind (server.hpp's remove() calls it from stop()), and it is
+  // deliberately total -- an injectee reads its mapping once, at attach, so a
+  // session that is gone could not be handed a new port and token either way.
   static void forget_token(DWORD pid) {
     std::lock_guard guard(token_mutex);
     tokens.erase(pid);
+    mappings.erase(pid); // the CloseHandle that takes the name out
+  }
+
+  // The rollback for a publish whose load failed, and the reason publish
+  // returns the token: erase only what THIS publish recorded.  A re-injection
+  // of the same pid, or two threads that raced past the server's contains()
+  // check, has already overwritten both records, and erasing by pid alone
+  // would then retire a bootstrap some live capsule is using.  Returns
+  // whether it did anything, so a caller can tell a rollback from a no-op.
+  static bool forget_bootstrap(DWORD pid, const injection_token &token) {
+    std::lock_guard guard(token_mutex);
+
+    auto iter = tokens.find(pid);
+    if (iter == tokens.end() || !(iter->second == token)) {
+      return false;
+    }
+
+    tokens.erase(iter);
+    mappings.erase(pid);
+    return true;
   }
 
   // Fail-closed: a missing field, a pid nobody injected, a different length or
@@ -109,40 +149,87 @@ struct injector {
                            payload.token + port_mapping_token_size);
   }
 
-  static bool inject(DWORD pid, HANDLE proc, std::uint16_t port, BOOL isWoW64,
-                     std::wstring_view filename) {
+  // --------------------------------------------------------------- publish --
+
+  // Step one of an injection: put the bootstrap in the namespace and
+  // remember what is in it.  Step two is load_into(), the remote load; inject
+  // below is the two, in that order.  Two facts belong at the head of this
+  // function, because a reader who does not know them will undo both:
+  //
+  //   1. A named section's NAME lives only while some handle to it stays
+  //      open.  Until now the handle was a local of inject(), so the
+  //      CloseHandle in its destructor retired the name on the way OUT of a
+  //      successful injection -- an injectee that had not mapped the payload
+  //      by then could never find it again.  No amount of retrying on the
+  //      injectee side recovers that; it was built and measured, and
+  //      e2e.inject_connect came back with 0 CONNECTs and the decoy still
+  //      running.  So the handle moves into `mappings` and is held for the
+  //      injector's whole lifetime.  Do not localise it again.
+  //
+  //   2. A resident injectee reads this mapping exactly once, at attach.  It
+  //      has no channel to be handed a new port and token, so re-publishing
+  //      under the same name reaches nobody already loaded: holding the name
+  //      here is the precondition for reconnecting a capsule, not the whole
+  //      answer.  That answer -- the server-side adopt / publish-without-load
+  //      step -- is M1-d's, which is why publish() is split out and exposed
+  //      and why it hands the token back to its caller.
+  //
+  // Returns the published token so the caller can roll the publish back by
+  // identity (forget_bootstrap) if its load fails; null on a failure that
+  // recorded nothing and left nothing open.
+  static std::optional<injection_token> publish(DWORD pid,
+                                               std::uint16_t port) {
     // No RNG, no token: refuse the injection rather than publish a payload
     // whose "secret" is whatever the zero-initialised struct holds.
     auto payload = get_port_mapping_payload(port);
     if (!payload) {
-      return false;
+      return std::nullopt;
     }
 
     handle mapping = create_mapping(get_port_mapping_name(pid),
                                     (DWORD)get_port_mapping_payload_size());
     if (!mapping) {
-      return false;
+      return std::nullopt;
     }
 
     mapped_buffer payload_buf(mapping.get());
     auto payload_dst = payload_buf.checked<port_mapping_payload>();
     if (!payload_dst) {
-      return false;
+      return std::nullopt; // the handle is still a local: it goes back here
     }
     *payload_dst = *payload;
 
-    // Record it before the remote thread runs, so an injectee can never
-    // introduce itself ahead of the token it has to present.
-    remember_token(pid, token_of(*payload));
+    auto token = token_of(*payload);
+    {
+      std::lock_guard guard(token_mutex);
+      // What remember_token() used to be handed, written here instead so that
+      // the token and the mapping that describe one publish land in one
+      // critical section (the invariant on `mappings`).  Still before any
+      // remote thread exists -- load_into() is the next call -- so an injectee
+      // can never introduce itself ahead of the token it has to present.
+      tokens[pid] = token;
+      mappings.insert_or_assign(pid, std::move(mapping));
+    }
 
+    return token;
+  }
+
+  // Step two: load the capsule into a process that already has step one.
+  // Every word of the remote sequence is what inject() used to do inline --
+  // the allocation, the write, the choice of LoadLibraryW for the target's
+  // bitness, the 5-second cap that keeps a wedged target from hanging the
+  // injector, and the exit-code read that tells a refused DLL from a loaded
+  // one.  Every failure un-does the publish, token AND mapping.
+  static bool load_into(DWORD pid, HANDLE proc, const injection_token &token,
+                        BOOL isWoW64, std::wstring_view filename) {
     virtual_memory mem(proc, (filename.size() + 1) * sizeof(wchar_t));
     if (!mem) {
-      forget_token(pid);
+      forget_bootstrap(pid, token);
       return false;
     }
 
     if (!mem.write(filename.data())) {
-      forget_token(pid);
+      forget_bootstrap(pid, token);
       return false;
     }
 
@@ -153,7 +240,7 @@ struct injector {
         load_library;
 #endif
     if (!current_load_library) {
-      forget_token(pid);
+      forget_bootstrap(pid, token);
       return false;
     }
 
@@ -161,7 +248,7 @@ struct injector {
         proc, nullptr, 0, (LPTHREAD_START_ROUTINE)current_load_library,
         mem.get(), 0, nullptr);
     if (!thread) {
-      forget_token(pid);
+      forget_bootstrap(pid, token);
       return false;
     }
 
@@ -169,7 +256,7 @@ struct injector {
     // the target: never hang the injector, and give back the allocation.
     if (WaitForSingleObject(thread.get(), 5000) != WAIT_OBJECT_0) {
       mem.free();
-      forget_token(pid);
+      forget_bootstrap(pid, token);
       return false;
     }
 
@@ -180,11 +267,26 @@ struct injector {
     if (!GetExitCodeThread(thread.get(), &module_handle) ||
         module_handle == 0) {
       mem.free();
-      forget_token(pid);
+      forget_bootstrap(pid, token);
       return false;
     }
 
     return true;
+  }
+
+  // Both halves, in order: publish, then load, and a load that fails takes
+  // the publish with it.  The success path is what it always was -- mapping
+  // created, payload written, token recorded before the thread, the remote
+  // LoadLibraryW waited for and its exit code read -- with one addition: the
+  // mapping handle now stays open in `mappings` after this returns true.
+  static bool inject(DWORD pid, HANDLE proc, std::uint16_t port, BOOL isWoW64,
+                     std::wstring_view filename) {
+    auto token = publish(pid, port);
+    if (!token) {
+      return false;
+    }
+
+    return load_into(pid, proc, *token, isWoW64, filename);
   }
 
   static inline const char injectee_filename[] = "encapsule-injectee.dll";
