@@ -134,12 +134,23 @@ UI data-race fixes (`view.post`).
       cleanly via the W2 fail-safe — same-user injection proven by e2e.inject_connect.)
 - [x] Define and implement injector-exit behavior mid-session: reconnect policy and
       clean DLL unload; document it. (4a37adc: stay-resident, bounded 1s-10s backoff
-      re-presenting the token, fail-closed routing via pinned config, docs §3;
-      manual kill-probe: routing 3ms post-kill, reconnect at 1.006s, per-injection
-      token randomness verified. Follow-up: e2e.inject_kill_reconnect case.)
+      for 60s against the port it already knows, fail-closed routing via pinned
+      config, docs §3; kill-probe: routing 3ms post-kill, retry hello at 1.006s.)
+      ⚠ SCOPE CORRECTED by races review 4c67ea5c + design dossier: the probe evidenced
+      RETRY and RESIDENCY only — re-registration was never proven and cannot work today
+      (token forgotten on every session loss + ephemeral control port + one-shot
+      mapping), so a transient reset OR an injector restart leaves a resident victim
+      unmanageable. Remediation ladder M1-a..f accepted (A now: stop forgetting;
+      C-lite: durable mapping re-read per attempt = the real fix; B rejected —
+      re-inject cannot re-enter DllMain). BUILDING.md's re-inject promise fixed too.
 - [x] Audit partial injection failure: mapping cleanup and no half-initialized hooks
       left in the target process. (256e27d fail-safe mapping + verified load result;
       41369fd reverse-order hook unroll + DllMain never live half-initialized + WSA refcount guard.)
+      ⚠ FOLLOW-UPS OPEN (races review): C2 — port-0 unload path can still FreeLibrary
+      with detours ENABLED, and the mapping name can expire before the remote thread
+      reads it (both handles are function-locals); C4 — scope_ptr_bind nulls detour
+      globals with no barrier (~mutex-with-waiters on detach too). R2/R3 scheduled in
+      the hook/injectee lane BEFORE P6/P7 resume there.
 
 ### P5 — Feature: proxy username + password (owner-approved; RFC 1929)
 - [x] Extend `InjectorConfig` (`src/common/schema.hpp`) with credential fields; both
