@@ -235,9 +235,17 @@ stderr, so a mistyped `-palice:hunter2@1.2.3.4:1080`, a `-p=...` form or a
 bare `--alice:hunter2@1.2.3.4:1080` prints `1.2.3.4:1080`; a token holding
 nothing but a secret, with no authority to name, is dropped whole and leaves
 only the parser's fixed prefix (measured: a bare `Unknown argument:` with
-nothing after it). The practical rule is unchanged: treat a
-credential typed onto the command line as visible to whatever can read argv —
-but no longer as something the tool will echo back at you.
+nothing after it). The net is wide as well as scrubbed: `main` catches
+`const std::exception &` rather than only `std::runtime_error`, so a value the
+parser cannot convert at all — `-i abc`, which argparse throws as
+`std::invalid_argument`, a logic_error — is reported through the same
+sanitizer and exits 1 with its fixed message plus the usage, where it used to
+escape to `std::terminate` and abort the process with `0xC0000409` and an empty
+stderr; a fixed-text `catch (...)` sits behind that for anything not derived
+from `std::exception` at all, and it prints no value either. The practical rule
+is unchanged: treat a credential typed onto the command line as visible to
+whatever can read argv — but no longer as something the tool will echo back at
+you.
 
 The other detail is whitespace. Nothing unescapes or percent-decodes either
 credential: `parse_proxy_url` (`src/common/utils.hpp:162-298`) treats every

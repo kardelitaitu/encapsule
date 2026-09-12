@@ -203,14 +203,22 @@ Re-index: `mcp cbm index_repository(repo_path="C:\dev\encapsule", mode="moderate
   only.
 - One credential exposure stays OPEN and is documented in `docs/BUILDING.md`: the CLI's endpoint is
   an argument, so a `-p user:pass@host:port` sits in argv where same-user processes and Sysmon EID 1
-  can read it (the GUI's separate boxes keep it out of argv). The error paths are closed: a rejected `-p`
-  names only the authority after the last `@`, and argparse's `"Unknown argument: " + token` echo is
-  run through `sanitize_parse_error`/`scrub_token` in `injector_cli.cpp` (no line cites, in flight),
-  which drops everything up to and including that last `@` — so a mistyped
-  `-palice:pw@1.2.3.4:1080` prints `1.2.3.4:1080`, and a proxy-flag token holding nothing but the
-  secret is dropped whole, leaving only the fixed prefix (measured: `Unknown argument:` with nothing
-  after it; the `"Invalid argument (value redacted)"` fallback exists but argparse's messages all
-  carry fixed words, so it is not reachable today).
+  can read it (the GUI's separate boxes keep it out of argv). The error surface is
+  closed *and* complete — it prints no unwashed value and lets nothing escape
+  uncaught: a rejected `-p` names only the authority after the last `@`, and
+  argparse's `"Unknown argument: " + token` echo is run through
+  `sanitize_parse_error`/`scrub_token` in `injector_cli.cpp` (no line cites, in
+  flight), which drops everything up to and including that last `@` — so a
+  mistyped `-palice:pw@1.2.3.4:1080` prints `1.2.3.4:1080`, and a proxy-flag
+  token holding nothing but the secret is dropped whole, leaving only the fixed
+  prefix (measured: `Unknown argument:` with nothing after it; the
+  `"Invalid argument (value redacted)"` fallback exists but argparse's messages
+  all carry fixed words, so it is not reachable today). Widening the catch in
+  `main` to `const std::exception &` closed the last hole in that surface: a
+  malformed number (`-i abc`, which argparse throws as `std::invalid_argument`,
+  a logic_error) is sanitized and exits 1 with its fixed message plus the usage
+  instead of reaching `std::terminate` and aborting with `0xC0000409` on an empty
+  stderr, and a fixed-text `catch (...)` behind it prints no value at all.
 - Two architectures in play: x64 injectee for 64-bit targets, Win32 `encapsule-injectee32.dll` +
   `wow64-address-dumper` for 32-bit targets under WoW64.
 
