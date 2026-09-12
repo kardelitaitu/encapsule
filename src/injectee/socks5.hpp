@@ -522,15 +522,29 @@ struct socks5_auth_frame_scrub {
 // where the login comes from, and hook.hpp passes the InjectorConfig it already
 // holds.
 //
-// NOTE -- the frame wiped below is not the only one that held the password.
-// `creds` borrows: both of its views point INTO the caller's InjectorConfig,
-// so the octets that went out on the wire stay sitting there, unzeroed, for as
-// long as the caller's frame does.  At all four connect sites that frame is the
-// by-value copy injectee_config::get() returned, which was itself copied out of
-// the live and the pinned config -- further frames, none of them zeroized, in a
-// process any same-user debugger can ReadProcessMemory.  Closing that is a
-// config-slice job (a borrow out of get(), or a move that zeroes its source);
-// nothing this function owns can reach someone else's object.
+// NOTE -- the frame wiped below is not the only one that held the password,
+// and it never was the worst of them.
+//
+// `creds` borrows: both views point INTO the caller's object, so the octets
+// that went out on the wire sit wherever that object sits, for as long as it
+// lives.  That is now a bounded statement, because the four connect sites hold
+// an injectee_route (client.hpp) instead of a by-value InjectorConfig: it owns
+// the login as two fixed arrays, and its destructor SecureZeroMemorys them --
+// so the bytes leave with the detour's frame rather than outliving it.  Before
+// that, every proxied connect made a fresh unzeroed copy of the whole config,
+// one plaintext login per connection, in a process any same-user debugger can
+// ReadProcessMemory.
+//
+// What still holds it, and this function cannot reach any of it:
+//   * injectee_config::cfg and ::pinned -- the live config and the fail-closed
+//     pin, both std::strings behind mtx, kept for the life of the capsule
+//     because routing depends on them.  set() replaces them without wiping
+//     what they were.
+//   * the InjectorConfig decoded off the IPC stream, which lives in reader()'s
+//     lambda frame (client.hpp) until that coroutine ends.  One transient
+//     copy per config push rather than one per connect, and not zeroized.
+// Anything below either of those has to be scrubbed where it is made, not
+// here: nothing this function owns can reach someone else's object.
 //
 // Any failure returns false and the caller's fail_proxied_connect()
 // turns it into WSAECONNREFUSED -- a proxy that refused the login is never

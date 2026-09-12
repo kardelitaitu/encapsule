@@ -35,6 +35,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,12 @@ namespace ip = asio::ip;
 
 #include <schema.hpp>
 #include <socks5.hpp>
+
+// client.hpp for injectee_route: the type a hooked connect now carries in place
+// of a by-value InjectorConfig, and the one whose job is to wipe the login.  It
+// brings no second copy of anything above -- winnet.hpp and schema.hpp are
+// guarded, and it does not include socks5.hpp at all.
+#include <client.hpp>
 
 #include "test_support.hpp"
 
@@ -1273,6 +1280,61 @@ void a_refused_login_never_asks_for_a_relay() {
   close_loop_pair(p);
 }
 
+// ---------------------------------------- the route wipes the login it holds
+//
+// injectee_config::get() used to hand every connect site a whole
+// InjectorConfig by value -- a plaintext socks5 login sitting in a frame nobody
+// wipes, once per connection, in a process any same-user debugger can
+// ReadProcessMemory.  It
+// hands out an injectee_route now, which owns the login as fixed arrays and
+// SecureZeroMemorys them in its destructor.  This pins that the wipe happens to
+// the bytes that were actually carrying the secret.
+//
+// The observation is an after-life read on purpose, and it is only sound
+// because the object lives in storage THIS test owns: placement new into an
+// unsigned char buffer, destroyed by an explicit call, so nothing can recycle
+// the memory in between.  The same test written against a stack frame would be
+// vacuous -- the frame is free to be reused by the code that checks it, and the
+// compiler is free to skip a fill nobody reads afterwards.
+void a_route_wipes_the_login_it_carried() {
+  injectee_config source;
+  const InjectorConfig ic{IpAddr{0x7F000001u, {}, {}, 1080u},
+                          true,
+                          false,
+                          std::string("alice"),
+                          std::string("sup3r-s3cr3t-login")};
+  source.set(ic);
+
+  alignas(injectee_route) unsigned char storage[sizeof(injectee_route)] = {};
+  auto *route = new (storage) injectee_route(source.get());
+
+  const std::string_view carried = route->password();
+  CHECK_EQ(carried, "sup3r-s3cr3t-login");
+  const char *const where = carried.data();
+  const std::size_t width = carried.size();
+  // The view must point into the buffer owned above, or the scan below is
+  // looking at somebody else's memory and proves nothing.
+  const auto *const base = reinterpret_cast<const char *>(storage);
+  CHECK(where >= base);
+  CHECK(where + width <= base + sizeof storage);
+  // And the secret is really present before the destructor runs, so the wipe
+  // cannot pass by having never had anything to remove.
+  CHECK(std::memcmp(where, "sup3r-s3cr3t-login", width) == 0);
+
+  route->~injectee_route();
+
+  const char zeros[sizeof("sup3r-s3cr3t-login") - 1] = {};
+  CHECK(std::memcmp(where, zeros, width) == 0);
+  bool still_there = false;
+  for (std::size_t i = 0; i + width <= sizeof storage; ++i) {
+    if (std::memcmp(storage + i, "sup3r-s3cr3t-login", width) == 0) {
+      still_there = true;
+      break;
+    }
+  }
+  CHECK(!still_there);  // not one byte of it left anywhere in the storage
+}
+
 
 
 // --------------------------------------------- the delegate chain, on the wire
@@ -1456,6 +1518,7 @@ int main() {
   RUN(an_unparseable_reply_is_a_protocol_error_not_a_relay);
   RUN(associate_runs_the_whole_exchange_on_one_socket);
   RUN(a_refused_login_never_asks_for_a_relay);
+  RUN(a_route_wipes_the_login_it_carried);
 
   print_pinned_vectors();
 

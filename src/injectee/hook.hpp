@@ -270,9 +270,12 @@ struct hook_connect_fn : minhook::api<F, hook_connect_fn<F, N>> {
     // pays no syscall for a question whose answer cannot change the call.
     if (auto *bound = load_scope(config);
         is_inet(name) && bound && !is_localhost(name)) {
-      auto cfg = bound->get();
-      auto proxy = cfg["addr"_f];
-      auto log = cfg["log"_f];
+      auto route = bound->get();
+      const auto &proxy = route.proxy;
+      const bool log = route.log;
+      // The login, borrowed from this frame's route: two views, never a copy
+      // of their own, and the frame that owns them outlives the handshake.
+      const socks5_credentials creds{route.username(), route.password()};
       // One acquire read of the queue, shared by the gate below and by the
       // report site: two reads would be two answers to the same question, and
       // a plain read of a scope-bound global is the exact thing C4 rules out.
@@ -285,7 +288,7 @@ struct hook_connect_fn : minhook::api<F, hook_connect_fn<F, N>> {
       // is asked: straight to the original, no getsockopt.  A proxy is enough
       // on its own, whatever logging says: that is the case where the verdict
       // decides between a refusal and a leak, and it is the whole point of F1.
-      if (proxy || (q && log && log.value())) {
+      if (proxy || (q && log)) {
         // A datagram socket is not routed, whatever else is true of it.
         const auto verdict = socket_stream_type(s);
         if (verdict == socket_stream_verdict::not_stream) {
@@ -303,7 +306,7 @@ struct hook_connect_fn : minhook::api<F, hook_connect_fn<F, N>> {
 
       if (auto v = to_ip_addr(name)) {
 
-        if (q && log && log.value()) {
+        if (q && log) {
           q->push(create_message<InjecteeMessage, "connect">(
               InjecteeConnect{(std::uint32_t)s, *v, proxy, N}));
         }
@@ -317,7 +320,7 @@ struct hook_connect_fn : minhook::api<F, hook_connect_fn<F, N>> {
             if (ret)
               return ret;
 
-            if (!socks5_handshake(s, socks5_credentials_from(cfg))) {
+            if (!socks5_handshake(s, creds)) {
               return fail_proxied_connect(s, SOCKET_ERROR);
             }
             if (socks5_request(s, name) != SOCKS_SUCCESS) {
@@ -344,9 +347,12 @@ struct hook_WSAConnectByList
                             LPSOCKADDR RemoteAddress, const timeval *timeout,
                             LPWSAOVERLAPPED Reserved) {
     if (auto *bound = load_scope(config); bound) {
-      auto cfg = bound->get();
-      auto proxy = cfg["addr"_f];
-      auto log = cfg["log"_f];
+      auto route = bound->get();
+      const auto &proxy = route.proxy;
+      const bool log = route.log;
+      // The login, borrowed from this frame's route: two views, never a copy
+      // of their own, and the frame that owns them outlives the handshake.
+      const socks5_credentials creds{route.username(), route.password()};
       auto *q = load_scope(queue);  // once, for the gate and the report site
 
       // Asked at most once per call, only at the first address this site would
@@ -365,7 +371,7 @@ struct hook_WSAConnectByList
         LPSOCKADDR name = SocketAddress->Address[i].lpSockaddr;
 
         if (is_inet(name) && !is_localhost(name)) {
-          if (proxy || (q && log && log.value())) {
+          if (proxy || (q && log)) {
             // Not a stream: straight through -- including past the "a proxy is
             // set, so refuse" fall-out at the bottom of this block, which is a
             // TCP decision and none of a datagram socket's business.  Unknown
@@ -389,7 +395,7 @@ struct hook_WSAConnectByList
 
           if (auto v = to_ip_addr(name)) {
 
-            if (q && log && log.value()) {
+            if (q && log) {
               q->push(
                   create_message<InjecteeMessage, "connect">(InjecteeConnect{
                       (std::uint32_t)s, *v, proxy, "WSAConnectByList"}));
@@ -404,7 +410,7 @@ struct hook_WSAConnectByList
                 if (ret)
                   return ret;
 
-                if (!socks5_handshake(s, socks5_credentials_from(cfg))) {
+                if (!socks5_handshake(s, creds)) {
                   fail_proxied_connect(s, FALSE);
                   continue;
                 }
@@ -539,16 +545,19 @@ struct hook_WSAConnectByName : minhook::api<F, hook_WSAConnectByName<F, N>> {
     // there is nothing this site could route, and the syscall would be pure
     // overhead on a victim the capsule is not proxying.
     if (auto *bound = load_scope(config); bound) {
-      auto cfg = bound->get();
-      auto proxy = cfg["addr"_f];
-      auto log = cfg["log"_f];
+      auto route = bound->get();
+      const auto &proxy = route.proxy;
+      const bool log = route.log;
+      // The login, borrowed from this frame's route: two views, never a copy
+      // of their own, and the frame that owns them outlives the handshake.
+      const socks5_credentials creds{route.username(), route.password()};
       auto *q = load_scope(queue);  // once, for the gate and the report site
 
       // Paid for only where it can still change the call: with no proxy this
       // site refuses nothing and routes nothing, so the verdict is left with
       // only a report to suppress.  "No proxy" never skips the refusal: the
       // gate asks whenever a proxy exists, whatever logging says.
-      if (proxy || (q && log && log.value())) {
+      if (proxy || (q && log)) {
         // Not a stream: straight through, refusal included -- the fail-closed
         // below is about not leaking a TCP connection, and a datagram socket
         // has no TCP connection to leak.  "No answer" is not that: with a
@@ -606,7 +615,7 @@ struct hook_WSAConnectByName : minhook::api<F, hook_WSAConnectByName<F, N>> {
       }
 
       if (addr) {
-        if (q && log && log.value()) {
+        if (q && log) {
           q->push(create_message<InjecteeMessage, "connect">(
               InjecteeConnect{(std::uint32_t)s, addr, proxy, N}));
         }
@@ -619,7 +628,7 @@ struct hook_WSAConnectByName : minhook::api<F, hook_WSAConnectByName<F, N>> {
             if (ret)
               return ret;
 
-            if (!socks5_handshake(s, socks5_credentials_from(cfg))) {
+            if (!socks5_handshake(s, creds)) {
               return fail_proxied_connect(s, FALSE);
             }
             if (socks5_request(s, *addr) != SOCKS_SUCCESS) {
@@ -689,10 +698,9 @@ struct hook_CreateProcess : minhook::api<F, hook_CreateProcess<F>> {
         lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
 
     if (auto *bound = load_scope(config); res && bound) {
-      auto cfg = bound->get();
-      auto subprocess = cfg["subprocess"_f];
+      auto route = bound->get();
 
-      if (auto *q = load_scope(queue); q && subprocess && subprocess.value()) {
+      if (auto *q = load_scope(queue); q && route.subprocess) {
         q->push(create_message<InjecteeMessage, "subpid">(
             lpProcessInformation->dwProcessId));
       }
@@ -744,16 +752,19 @@ struct hook_ConnectEx {
     // routed-around call must not be paying for a getsockopt.
     if (auto *bound = load_scope(config);
         is_inet(name) && bound && !is_localhost(name)) {
-      auto cfg = bound->get();
-      auto proxy = cfg["addr"_f];
-      auto log = cfg["log"_f];
+      auto route = bound->get();
+      const auto &proxy = route.proxy;
+      const bool log = route.log;
+      // The login, borrowed from this frame's route: two views, never a copy
+      // of their own, and the frame that owns them outlives the handshake.
+      const socks5_credentials creds{route.username(), route.password()};
       auto *q = load_scope(queue);  // once, for the gate and the report site
 
       // Same economy as the site above: no proxy and no logging leaves the
       // verdict nothing to change, so nothing is asked of the provider.  A
       // proxy alone still asks -- an unanswered question must not be allowed
       // to become an unproxied ConnectEx carrying lpSendBuffer out.
-      if (proxy || (q && log && log.value())) {
+      if (proxy || (q && log)) {
         // Not a stream: straight through.  MSDN restricts ConnectEx to
         // SOCK_STREAM sockets anyway, so this costs nothing and keeps all four
         // routing sites saying the same thing first.
@@ -775,7 +786,7 @@ struct hook_ConnectEx {
       }
 
       if (auto v = to_ip_addr(name)) {
-        if (q && log && log.value()) {
+        if (q && log) {
           q->push(create_message<InjecteeMessage, "connect">(
               InjecteeConnect{(std::uint32_t)s, *v, proxy, "ConnectEx"}));
         }
@@ -789,7 +800,7 @@ struct hook_ConnectEx {
             if (ret)
               return ret;
 
-            if (!socks5_handshake(s, socks5_credentials_from(cfg))) {
+            if (!socks5_handshake(s, creds)) {
               return fail_proxied_connect(s, FALSE);
             }
             if (socks5_request(s, name) != SOCKS_SUCCESS) {
