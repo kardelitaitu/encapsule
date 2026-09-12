@@ -7,8 +7,8 @@
 ;--------------------------------
 ; Custom defines
 
-!define NAME "proxinject"
-!define APPFILE "proxinjector.exe"
+!define NAME "encapsule"
+!define APPFILE "encapsule.exe"
 !define SLUG "${NAME} ${VERSION}"
 
 ;--------------------------------
