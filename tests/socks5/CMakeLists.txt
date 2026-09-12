@@ -1,0 +1,5 @@
+add_executable(encapsule_test_socks5 socks5_test.cpp)
+target_link_libraries(encapsule_test_socks5 PRIVATE encapsule_common protopuf ws2_32)
+target_include_directories(encapsule_test_socks5 PRIVATE ${CMAKE_SOURCE_DIR}/tests ${CMAKE_SOURCE_DIR}/src/injectee ${asio_SOURCE_DIR}/asio/include)
+add_test(NAME injectee.socks5 COMMAND encapsule_test_socks5)
+set_tests_properties(injectee.socks5 PROPERTIES TIMEOUT 60)

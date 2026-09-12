@@ -13,8 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifndef ENCAPSULE_INJECTEE_SOCKS5
+#define ENCAPSULE_INJECTEE_SOCKS5
+
 #include <WinSock2.h>
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <schema.hpp>
 
 constexpr const char SOCKS_VERSION = 5;
@@ -28,11 +34,170 @@ constexpr const char SOCKS_IPV6 = 4;
 constexpr const char SOCKS_SUCCESS = 0;
 constexpr const char SOCKS_GENERAL_FAILURE = 4;
 
-constexpr const size_t SOCKS_REQUEST_MAX_SIZE = 134;
+// A DOMAINNAME request is the widest one the builders below can emit:
+// VER + CMD + RSV + ATYP (4) + LEN + name (1 + 255) + PORT (2) == 262.
+constexpr const size_t SOCKS_DOMAIN_MAX_LENGTH = 255;
+constexpr const size_t SOCKS_REQUEST_MAX_SIZE =
+    4 + 1 + SOCKS_DOMAIN_MAX_LENGTH + 2;
+
+// VER + NMETHODS + up to 255 methods (RFC 1928 section 3).
+constexpr const size_t SOCKS_GREETING_MAX_SIZE = 2 + 255;
+
+// ----------------------------------------------------------- pure builders
+//
+// Everything that only *lays out bytes* is inline, socket-free and heap-free,
+// so it is testable on the host (see tests/socks5).  The SOCKET taking
+// functions underneath are thin: build the bytes, send them, read the reply.
+// P5 (RFC 1929 username/password negotiation) grows on top of these builders.
+
+// Writes the client greeting {VER, NMETHODS, METHODS...}.  `methods` holds
+// `n` method ids; `out` needs room for `n` + 2 bytes, at most
+// SOCKS_GREETING_MAX_SIZE.  Returns the number of bytes written, or 0 when the
+// method list is empty or too long to encode.
+inline size_t socks5_build_greeting(const uint8_t *methods, size_t n,
+                                    char *out) {
+  if (methods == nullptr || out == nullptr || n == 0 ||
+      n > SOCKS_DOMAIN_MAX_LENGTH) {
+    return 0;
+  }
+
+  out[0] = SOCKS_VERSION;
+  out[1] = (char)n;
+  for (size_t i = 0; i < n; ++i) {
+    out[2 + i] = (char)methods[i];
+  }
+
+  return n + 2;
+}
+
+// Writes the request {VER, CMD=CONNECT, RSV=0, ATYP, ADDR, PORT}; `out` needs
+// room for SOCKS_REQUEST_MAX_SIZE bytes.
+//
+// Byte order is the whole point of this function:
+//   * `addr_bytes` is copied verbatim and therefore must already carry WIRE
+//     (network) order -- 4 octets for SOCKS_IPV4, 16 octets for SOCKS_IPV6;
+//   * for SOCKS_DOMAINNAME, `addr_bytes` is a NUL-terminated string of at most
+//     SOCKS_DOMAIN_MAX_LENGTH characters, emitted as {LEN, bytes};
+//   * `port_host_order` is a plain integer (80, 8080, ...), emitted in network
+//     order, most significant octet first.
+//
+// Returns the number of bytes written, or 0 for an unknown ATYP, an empty or
+// over-long domain, or a null argument.
+inline size_t socks5_build_request(uint8_t atyp, const void *addr_bytes,
+                                   uint16_t port_host_order, char *out) {
+  if (addr_bytes == nullptr || out == nullptr) {
+    return 0;
+  }
+
+  const char *src = (const char *)addr_bytes;
+  char *addr = out + 4;  // past VER, CMD, RSV, ATYP
+  size_t addr_size = 0;
+
+  if (atyp == SOCKS_IPV4) {
+    std::memcpy(addr, src, 4);
+    addr_size = 4;
+  } else if (atyp == SOCKS_IPV6) {
+    std::memcpy(addr, src, 16);
+    addr_size = 16;
+  } else if (atyp == SOCKS_DOMAINNAME) {
+    const size_t name_size = std::strlen(src);
+    if (name_size == 0 || name_size > SOCKS_DOMAIN_MAX_LENGTH) {
+      return 0;
+    }
+    addr[0] = (char)name_size;
+    std::memcpy(addr + 1, src, name_size);
+    addr_size = name_size + 1;
+  } else {
+    return 0;
+  }
+
+  out[0] = SOCKS_VERSION;
+  out[1] = SOCKS_CONNECT;
+  out[2] = 0;  // RSV
+  out[3] = (char)atyp;
+
+  char *port = addr + addr_size;
+  port[0] = (char)((port_host_order >> 8) & 0xFF);
+  port[1] = (char)(port_host_order & 0xFF);
+
+  return (size_t)(port + 2 - out);
+}
+
+// Request bytes for a live `sockaddr` target -- the shape every connect() hook
+// hands over.  A sockaddr_in/sockaddr_in6 already holds the address and the
+// port in network order, so the octets go through unchanged and the port only
+// makes the ntohs -> re-big-endian round trip.  The bytes on the wire are
+// exactly what this overload wrote before the refactor.
+inline size_t socks5_build_request_from_sockaddr(const sockaddr *addr,
+                                                 char *out) {
+  if (addr == nullptr) {
+    return 0;
+  }
+
+  if (addr->sa_family == AF_INET) {
+    const auto *v4 = (const sockaddr_in *)addr;
+    return socks5_build_request(SOCKS_IPV4, &v4->sin_addr, ntohs(v4->sin_port),
+                                out);
+  } else if (addr->sa_family == AF_INET6) {
+    const auto *v6 = (const sockaddr_in6 *)addr;
+    return socks5_build_request(SOCKS_IPV6, &v6->sin6_addr,
+                                ntohs(v6->sin6_port), out);
+  }
+
+  return 0;  // neither AF_INET nor AF_INET6: caller reports a general failure
+}
+
+// Request bytes for an `IpAddr` IPC message.  By schema contract `v4_addr` and
+// `port` are HOST order integers (winnet.hpp ntohl/ntohs'ed them, schema.hpp
+// from_asio stores host order), while `v6_addr` carries WIRE order octets (what
+// from_asio stores, the only producer feeding this overload).  So the v4 octets
+// are split most-significant-byte first and the port goes to the builder as a
+// host-order integer.  Both used to be dumped raw, which put them on the wire
+// REVERSED (reviewer 801436d2); the sockaddr overload was always correct, and
+// the two must agree -- tests/socks5 pins that byte for byte.
+inline size_t socks5_build_request_from_ip_addr(const IpAddr &addr, char *out) {
+  const auto port_field = addr["port"_f];
+  if (!port_field) {
+    return 0;
+  }
+  const auto port = (uint16_t)*port_field;
+
+  if (auto v4 = addr["v4_addr"_f]) {
+    const auto host_order = *v4;
+    const char octets[4] = {(char)((host_order >> 24) & 0xFF),
+                            (char)((host_order >> 16) & 0xFF),
+                            (char)((host_order >> 8) & 0xFF),
+                            (char)(host_order & 0xFF)};
+    return socks5_build_request(SOCKS_IPV4, octets, port, out);
+  } else if (auto v6 = addr["v6_addr"_f]) {
+    if (v6->size() != 16) {
+      return 0;
+    }
+    return socks5_build_request(SOCKS_IPV6, v6->data(), port, out);
+  } else if (auto domain = addr["domain"_f]) {
+    if (domain->size() > SOCKS_DOMAIN_MAX_LENGTH) {
+      return 0;
+    }
+    char name[SOCKS_DOMAIN_MAX_LENGTH + 1];
+    std::copy(domain->begin(), domain->end(), name);
+    name[domain->size()] = '\0';
+    return socks5_build_request(SOCKS_DOMAINNAME, name, port, out);
+  }
+
+  return 0;
+}
+
+// ------------------------------------------------------------ socket layer
+//
+// NOTE: these define functions at namespace scope WITHOUT `inline`, so this
+// header may be included by exactly ONE translation unit per binary.
 
 bool socks5_handshake(SOCKET s) {
-  const char req[] = {SOCKS_VERSION, 1, SOCKS_NO_AUTHENTICATION};
-  if (send(s, req, sizeof(req), 0) != sizeof(req))
+  const uint8_t methods[] = {SOCKS_NO_AUTHENTICATION};
+  char req[SOCKS_GREETING_MAX_SIZE];
+  const size_t size = socks5_build_greeting(methods, sizeof(methods), req);
+
+  if (size == 0 || send(s, req, (int)size, 0) != (int)size)
     return false;
 
   char res[2];
@@ -66,48 +231,22 @@ char socks5_request_send(SOCKET s, char *buf, size_t size) {
 }
 
 char socks5_request(SOCKET s, const sockaddr *addr) {
-  char buf[SOCKS_REQUEST_MAX_SIZE] = {SOCKS_VERSION, SOCKS_CONNECT, 0};
-
-  char *ptr = buf + 3;
-  if (addr->sa_family == AF_INET) {
-    auto v4 = (const sockaddr_in *)addr;
-    *ptr++ = SOCKS_IPV4;
-    *((ULONG *&)ptr)++ = v4->sin_addr.s_addr;
-    *((USHORT *&)ptr)++ = v4->sin_port;
-  } else if (addr->sa_family == AF_INET6) {
-    auto v6 = (const sockaddr_in6 *)addr;
-    *ptr++ = SOCKS_IPV6;
-    ptr = std::copy((const char *)&v6->sin6_addr,
-                    (const char *)(&v6->sin6_addr + 1), ptr);
-    *((USHORT *&)ptr)++ = v6->sin6_port;
-  } else {
+  char buf[SOCKS_REQUEST_MAX_SIZE];
+  const size_t size = socks5_build_request_from_sockaddr(addr, buf);
+  if (size == 0)
     return SOCKS_GENERAL_FAILURE;
-  }
 
-  return socks5_request_send(s, buf, ptr - buf);
+  return socks5_request_send(s, buf, size);
 }
 
 char socks5_request(SOCKET s, const IpAddr &addr) {
-  char buf[SOCKS_REQUEST_MAX_SIZE] = {SOCKS_VERSION, SOCKS_CONNECT, 0};
-
-  char *ptr = buf + 3;
-  if (auto v4 = addr["v4_addr"_f]) {
-    *ptr++ = SOCKS_IPV4;
-    *((ULONG *&)ptr)++ = *v4;
-  } else if (auto v6 = addr["v6_addr"_f]) {
-    *ptr++ = SOCKS_IPV6;
-    ptr = std::copy(v6->begin(), v6->end(), ptr);
-  } else if (auto domain = addr["domain"_f]) {
-    *ptr++ = SOCKS_DOMAINNAME;
-    if (domain->size() >= 256) {
-      return SOCKS_GENERAL_FAILURE;
-    }
-    *ptr++ = (char)domain->size();
-    ptr = std::copy(domain->begin(), domain->end(), ptr);
-  } else {
+  char buf[SOCKS_REQUEST_MAX_SIZE];
+  const size_t size = socks5_build_request_from_ip_addr(addr, buf);
+  if (size == 0)
     return SOCKS_GENERAL_FAILURE;
-  }
-  *((USHORT *&)ptr)++ = *addr["port"_f];
 
-  return socks5_request_send(s, buf, ptr - buf);
+  return socks5_request_send(s, buf, size);
 }
+
+#endif  // ENCAPSULE_INJECTEE_SOCKS5
+
