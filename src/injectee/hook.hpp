@@ -27,38 +27,51 @@
 #include <protopuf/fixed_string.h>
 #include <string>
 
-inline blocking_queue<InjecteeMessage> *queue = nullptr;
-inline injectee_config *config = nullptr;
-inline std::map<SOCKET, bool> *nbio_map = nullptr;
+// The three globals the detours read are bound by do_client() through
+// scope_ptr_bind, so another thread publishes and retires them while a victim's
+// thread may be inside a detour.  They stay plain pointers, and every read goes
+// through load_scope(): ONE acquire read into a local, which the detour then
+// uses (C4).  alignas spells out the demand std::atomic_ref<T *> puts on the
+// slot -- the natural alignment of a pointer (8 on x64, 4 on x86), stated so a
+// reshuffle of this block cannot break it silently.
+inline alignas(void *) blocking_queue<InjecteeMessage> *queue = nullptr;
+inline alignas(void *) injectee_config *config = nullptr;
+inline alignas(void *) std::map<SOCKET, bool> *nbio_map = nullptr;
 
 // guards nbio_map; never hold it across winsock calls (detour reentry)
 inline std::mutex nbio_mutex;
 
 inline void nbio_store(SOCKET s, bool nb) {
-  if (!nbio_map) {
+  // The sharpest of these three: the test, a std::mutex constructor (a call, so
+  // MSVC reloads) and then the use sat in that order, which is the C4 window
+  // with a call in the middle of it.  Read once, lock, use the local.
+  auto *map = load_scope(nbio_map);
+  if (!map) {
     return;
   }
   std::lock_guard<std::mutex> lock(nbio_mutex);
-  (*nbio_map)[s] = nb;
+  (*map)[s] = nb;
 }
 
 inline std::optional<bool> nbio_load(SOCKET s) {
-  if (!nbio_map) {
+  auto *map = load_scope(nbio_map);
+  if (!map) {
     return std::nullopt;
   }
   std::lock_guard<std::mutex> lock(nbio_mutex);
-  if (auto iter = nbio_map->find(s); iter != nbio_map->end()) {
+  if (auto iter = map->find(s); iter != map->end()) {
     return iter->second;
   }
   return std::nullopt;
 }
 
 inline void nbio_erase(SOCKET s) {
-  if (!nbio_map) {
+  auto *map = load_scope(nbio_map);
+  if (!map) {
     return;
   }
   std::lock_guard<std::mutex> lock(nbio_mutex);
-  nbio_map->erase(s);
+  map->erase(s);
 }
 
 // deadline for the socks5 handshake performed inside blocking_scope; a
@@ -67,7 +80,10 @@ inline constexpr std::uint32_t SOCKS_HANDSHAKE_TIMEOUT_MS = 3000;
 
 struct hook_ioctlsocket : minhook::api<ioctlsocket, hook_ioctlsocket> {
   static int WSAAPI detour(SOCKET s, long cmd, u_long FAR *argp) {
-    if (nbio_map && cmd == FIONBIO) {
+    if (cmd == FIONBIO) {
+      // No pointer test here on purpose: nbio_store owns the single acquire
+      // read, and guarding it with a second read of the same global is exactly
+      // what C4 removes.  With the map unbound it returns having done nothing.
       nbio_store(s, *argp != 0);
     }
 
@@ -76,19 +92,15 @@ struct hook_ioctlsocket : minhook::api<ioctlsocket, hook_ioctlsocket> {
 };
 struct hook_WSAAsyncSelect : minhook::api<WSAAsyncSelect, hook_WSAAsyncSelect> {
   static int WSAAPI detour(SOCKET s, HWND hWnd, u_int wMsg, long lEvent) {
-    if (nbio_map) {
-      nbio_store(s, true);
-    }
+    nbio_store(s, true);
 
     return original(s, hWnd, wMsg, lEvent);
   }
 };
 struct hook_WSAEventSelect : minhook::api<WSAEventSelect, hook_WSAEventSelect> {
   static int WSAAPI detour(SOCKET s, WSAEVENT hEventObject,
-                           long lNetworkEvents) {
-    if (nbio_map) {
-      nbio_store(s, true);
-    }
+                            long lNetworkEvents) {
+    nbio_store(s, true);
 
     return original(s, hEventObject, lNetworkEvents);
   }
@@ -256,8 +268,9 @@ struct hook_connect_fn : minhook::api<F, hook_connect_fn<F, N>> {
     // route, and the socket-type query is hoisted to sit inside that gate: a
     // victim with no config, or a connect to localhost or a non-INET family,
     // pays no syscall for a question whose answer cannot change the call.
-    if (is_inet(name) && config && !is_localhost(name)) {
-      auto cfg = config->get();
+    if (auto *bound = load_scope(config);
+        is_inet(name) && bound && !is_localhost(name)) {
+      auto cfg = bound->get();
       auto proxy = cfg["addr"_f];
 
       // A datagram socket is not routed, whatever else is true of it.
@@ -277,8 +290,8 @@ struct hook_connect_fn : minhook::api<F, hook_connect_fn<F, N>> {
       if (auto v = to_ip_addr(name)) {
 
         auto log = cfg["log"_f];
-        if (queue && log && log.value()) {
-          queue->push(create_message<InjecteeMessage, "connect">(
+        if (auto *q = load_scope(queue); q && log && log.value()) {
+          q->push(create_message<InjecteeMessage, "connect">(
               InjecteeConnect{(std::uint32_t)s, *v, proxy, N}));
         }
 
@@ -317,8 +330,8 @@ struct hook_WSAConnectByList
                             LPDWORD RemoteAddressLength,
                             LPSOCKADDR RemoteAddress, const timeval *timeout,
                             LPWSAOVERLAPPED Reserved) {
-    if (config) {
-      auto cfg = config->get();
+    if (auto *bound = load_scope(config); bound) {
+      auto cfg = bound->get();
       auto proxy = cfg["addr"_f];
       auto log = cfg["log"_f];
 
@@ -359,8 +372,8 @@ struct hook_WSAConnectByList
 
           if (auto v = to_ip_addr(name)) {
 
-            if (queue && log && log.value()) {
-              queue->push(
+            if (auto *q = load_scope(queue); q && log && log.value()) {
+              q->push(
                   create_message<InjecteeMessage, "connect">(InjecteeConnect{
                       (std::uint32_t)s, *v, proxy, "WSAConnectByList"}));
             }
@@ -508,8 +521,8 @@ struct hook_WSAConnectByName : minhook::api<F, hook_WSAConnectByName<F, N>> {
     // The verdict is asked inside this gate, never before it: with no config
     // there is nothing this site could route, and the syscall would be pure
     // overhead on a victim the capsule is not proxying.
-    if (config) {
-      auto cfg = config->get();
+    if (auto *bound = load_scope(config); bound) {
+      auto cfg = bound->get();
       auto proxy = cfg["addr"_f];
       auto log = cfg["log"_f];
 
@@ -569,8 +582,8 @@ struct hook_WSAConnectByName : minhook::api<F, hook_WSAConnectByName<F, N>> {
       }
 
       if (addr) {
-        if (queue && log && log.value()) {
-          queue->push(create_message<InjecteeMessage, "connect">(
+        if (auto *q = load_scope(queue); q && log && log.value()) {
+          q->push(create_message<InjecteeMessage, "connect">(
               InjecteeConnect{(std::uint32_t)s, addr, proxy, N}));
         }
 
@@ -651,12 +664,12 @@ struct hook_CreateProcess : minhook::api<F, hook_CreateProcess<F>> {
         lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
         lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
 
-    if (res && config) {
-      auto cfg = config->get();
+    if (auto *bound = load_scope(config); res && bound) {
+      auto cfg = bound->get();
       auto subprocess = cfg["subprocess"_f];
 
-      if (queue && subprocess && subprocess.value()) {
-        queue->push(create_message<InjecteeMessage, "subpid">(
+      if (auto *q = load_scope(queue); q && subprocess && subprocess.value()) {
+        q->push(create_message<InjecteeMessage, "subpid">(
             lpProcessInformation->dwProcessId));
       }
     }
@@ -705,8 +718,9 @@ struct hook_ConnectEx {
     // The type question is hoisted inside this site's cheap bail-outs, like
     // the three above it: ConnectEx is the busiest of these entry points and a
     // routed-around call must not be paying for a getsockopt.
-    if (is_inet(name) && config && !is_localhost(name)) {
-      auto cfg = config->get();
+    if (auto *bound = load_scope(config);
+        is_inet(name) && bound && !is_localhost(name)) {
+      auto cfg = bound->get();
       auto proxy = cfg["addr"_f];
 
       // Not a stream: straight through.  MSDN restricts ConnectEx to
@@ -731,8 +745,8 @@ struct hook_ConnectEx {
       if (auto v = to_ip_addr(name)) {
 
         auto log = cfg["log"_f];
-        if (queue && log && log.value()) {
-          queue->push(create_message<InjecteeMessage, "connect">(
+        if (auto *q = load_scope(queue); q && log && log.value()) {
+          q->push(create_message<InjecteeMessage, "connect">(
               InjecteeConnect{(std::uint32_t)s, *v, proxy, "ConnectEx"}));
         }
 

@@ -113,6 +113,18 @@ void do_client(HINSTANCE dll_handle, port_mapping_payload ipc) {
     auto cfg = std::make_unique<injectee_config>();
     auto sock_map = std::make_unique<std::map<SOCKET, bool>>();
 
+    // C4: these three globals are read by the victim's own threads, inside the
+    // winsock detours, while this thread publishes them -- so the bind is a
+    // cross-thread handoff and scope_ptr_bind orders it (release store, release
+    // null on retire).  The reader half is load_scope(): a detour takes ONE
+    // acquire read into a local and uses that local, because 'if (config)'
+    // followed by 'config->get()' is two reads of the global, not one.
+    //
+    // Retiring is, by design, unreachable while the hooks are live: the port-0
+    // give-up above returns BEFORE any of this binds, and past io_context run()
+    // this thread parks rather than unwinding these scopes.  So the objects
+    // bound here outlive every detour that can see them -- and the two plain
+    // reads below are the binding thread using what it just bound itself.
     scope_ptr_bind queue_bind(queue, qu.get());
     scope_ptr_bind config_bind(config, cfg.get());
     scope_ptr_bind map_bind(nbio_map, sock_map.get());

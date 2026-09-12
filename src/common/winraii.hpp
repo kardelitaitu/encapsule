@@ -20,6 +20,7 @@
 #include "utils.hpp"
 #include <Windows.h>
 #include <sddl.h>
+#include <atomic>
 #include <cctype>
 #include <memory>
 #include <optional>
@@ -115,12 +116,53 @@ std::wstring get_current_filename() {
   return path;
 }
 
+// Binds a pointer that OTHER threads read, for the lifetime of this scope.
+//
+// The injectee's winsock detours run on the victim's threads while its client
+// thread binds and retires the globals they consult, so a bind is a
+// cross-thread handoff.  A plain assignment publishes the pointer with no
+// ordering at all -- the compiler may sink the initialisation of *bind below
+// the store, and a reader can meet the pointer before the object behind it --
+// and a plain nulling races with a reader that has already tested it.  Both
+// ends are ordered here: release on publish, release on retire, and the reader
+// takes the value once through load_scope() below (acquire).
+//
+// The least invasive shape on purpose: the slot stays a plain 'T *'.  Making it
+// std::atomic<T *> instead would retype every scope-bound global and rewrite
+// every '->' and 'if (ptr)' that reads one -- including on the injector side,
+// which shares this header -- to buy what std::atomic_ref (C++20) buys without
+// touching the object's type at all.  atomic_ref's one demand is an address
+// aligned for an atomic pointer access; a scope-bound slot is always a plain
+// pointer object, whose natural alignment is exactly
+// std::atomic_ref<T *>::required_alignment (hook.hpp spells the alignas at the
+// declarations so a reshuffle there cannot break it silently).
 template <typename T> struct scope_ptr_bind {
   T *&ptr;
 
-  scope_ptr_bind(T *&ptr, T *bind) : ptr(ptr) { ptr = bind; }
-  ~scope_ptr_bind() { ptr = nullptr; }
+  scope_ptr_bind(T *&ptr, T *bind) : ptr(ptr) {
+    std::atomic_ref<T *>(this->ptr).store(bind, std::memory_order_release);
+  }
+
+  ~scope_ptr_bind() {
+    std::atomic_ref<T *>(ptr).store(nullptr, std::memory_order_release);
+  }
 };
+
+// Read a scope-bound pointer exactly once, with the acquire that pairs with
+// scope_ptr_bind's release.  Hold the result in a local and use the local:
+//
+//   if (auto *cfg = load_scope(config); cfg) { cfg->get(); }  // one read
+//   if (config) { config->get(); }                            // two reads
+//
+// The second spelling is the C4 window: it is not one value but two, and the
+// compiler is free to reload the global after the test (MSVC does as soon as
+// any call -- even a std::mutex constructor -- sits between the two), while the
+// thread owning the scope may retire it in between.  That is a null dereference
+// of a pointer a detour had just checked, or a use of an object the binder is
+// destroying, in someone else's process.
+template <typename T> T *load_scope(T *&ptr) {
+  return std::atomic_ref<T *>(ptr).load(std::memory_order_acquire);
+}
 
 template <typename F> void match_process(F &&f) {
   if (handle snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, NULL)) {
