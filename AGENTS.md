@@ -73,7 +73,9 @@ CMake >= 3.20, driven by `build.ps1`. Third-party deps are FetchContent-pinned a
   session loss · `injector_cli.{cpp,hpp}`
   (argparse+spdlog; `-p` parse, authority-only rejection message and the credential log line — no
   line cites, in flight) · `injector_gui.{cpp,hpp}` (cycfi/elements; username/password boxes with the
-  255-char check — no line cites for the header, in flight) · `ui_elements/` (dynamic_list, text_box,
+  255-char check; click handlers are **throw-free** — refusals go to the `report`
+  lambda / `guarded` backstop as fixed text, never user input — no line cites for
+  the header, in flight) · `ui_elements/` (dynamic_list, text_box,
   tooltip widgets).
 - `src/wow64/address_dumper.cpp` — Win32-only helper exe; returns the 32-bit `LoadLibraryW` address as
   its **process exit code** (`:22-26`); `#error`s if compiled as x64 (`:18-20`). Name unchanged by P3.
@@ -175,6 +177,13 @@ Re-index: `mcp cbm index_repository(repo_path="C:\dev\encapsule", mode="moderate
   built fail-closed by `get_port_mapping_payload`, :334-351), the injectee re-presents it in every
   message (`client.hpp:113-123`), the server refuses mismatches (`server.hpp`, `injectee_session::process`), and the mapping
   gets an explicit user+SYSTEM DACL, failing closed (`winraii.hpp:145-203`).
+- Routing is fail-closed too (`hook.hpp`, symbols only): `socket_stream_type`
+  answers `stream` / `not_stream` / `unknown` from `getsockopt(SO_TYPE)`. A
+  provider-authoritative `not_stream` (notably `SOCK_DGRAM`) goes to the
+  original connect untouched; an `unknown` verdict **with a proxy configured**
+  is refused by `fail_proxied_connect` as `WSAECONNREFUSED` rather than leaking
+  direct — so a handle closed under us now reports `WSAECONNREFUSED`, not the
+  `WSAENOTSOCK` it used to. With no proxy configured the original runs.
 - Proxy credentials are **injector → injectee only**: parsed by `parse_proxy_url` (`utils.hpp:162-298`,
   `[user[:pass]@]host:port`, 255-char cap per field via `proxy_credential_max_length`), stored in
   `InjectorConfig` fields 4/5 (`server.hpp`, `set_proxy_credentials`), borrowed per connect by

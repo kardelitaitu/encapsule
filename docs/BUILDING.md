@@ -266,6 +266,25 @@ full table lives in `.agents/ROADMAP.md` §2:
   ~3 s rather than hanging the victim's thread. When stepping here, check that
   the non-blocking state is restored correctly — a wrongly restored mode looks
   like an unrelated async-I/O bug in the target application.
+- **Socket-type verdict — `src/injectee/hook.hpp`.** Before a routing detour
+  proxifies anything it asks `socket_stream_type`, which reads
+  `getsockopt(SOL_SOCKET, SO_TYPE)` and answers three ways: the provider said
+  `SOCK_STREAM`, it said otherwise, or it never answered at all. A socket the
+  provider rules out — `SOCK_DGRAM` above all — goes straight to the original
+  connect, untouched: datagrams used to be dragged through the socks5 greeting,
+  left the handshake to time out and came back `shutdown()`-ed by
+  `fail_proxied_connect`, which is a bug that shipped (P7 gives UDP a relay of
+  its own instead of a borrowed TCP one). An *undecided* socket — the query
+  failed with `WSAENOTSOCK` on a handle another thread just closed, or
+  `WSAENOPROTOOPT`/`WSAEOPNOTSUPP` behind a partially-implementing LSP,
+  `WSASYSNOTREADY`/`WSANOTINITIALISED` from winsock itself — is refused the
+  same way a refused proxy is when this site has a proxy configured: the
+  connect reports `WSAECONNREFUSED` rather than leaking out direct, and the
+  closed handle that used to answer `WSAENOTSOCK` now answers
+  `WSAECONNREFUSED`. With no proxy configured there is no promise to keep, so
+  the original runs. So when a target says "the proxy refused", check the
+  verdict before believing the proxy: this `WSAECONNREFUSED` can mean
+  encapsule could not make up its mind.
 - **Injector exit — `src/injectee/injectee.cpp`, `client.hpp`.** `DllMain`
   spawns a *detached* worker thread (`do_client`) that runs the asio
   `io_context`. It no longer calls `FreeLibrary` on the DLL when the IPC
@@ -305,3 +324,38 @@ contract below.
   descriptor cannot be built, the mapping is not created at all — never
   silently left world-accessible (`create_mapping`,
   `src/common/winraii.hpp:153-203`).
+
+### Front-end click handlers: no throws, no user text
+
+Every `on_click` handler in `src/injector/injector_gui.hpp` runs on the UI
+thread, where an escaped exception is not an error message — it is the
+injector process dying, and it takes the control channel of every already
+encapsulated process with it. The convention is therefore that these handlers
+**cannot throw**:
+
+- `report(panel, why)` is how a handler says no: one log line, tagged with its
+  panel (`[process]`, `[proxy]`), plus a repaint — and it guards its own write,
+  because a throw on the way out of a `catch` ends the process just like one
+  that was never caught. `guarded(action, panel, line)` is the backstop for
+  what validation cannot reach (a failing allocation, asio, protopuf, a
+  `std::regex` giving up), and the proxy toggle's `refuse` lambda is `report`
+  plus snapping the toggle back off, which is what a rejected click looks like.
+- **Refusal text is a literal at every call site; nothing typed is
+  interpolated into it.** That is not tidiness — the address box takes free
+  text, so echoing a paste of `user:pass@host` would park a password in a log
+  that keeps every line since start-up. `parse_process_id` returning a
+  `const char *` rather than a message is the same rule.
+- No `std::stoul`, no `std::isdigit` on a signed char, no
+  `ip::address::from_string`. Port and pid are bounded by
+  `proxy_port_max_length` / `process_id_max_digits` and accumulated digit by
+  digit, so port 0, a non-numeric port and an eleventh-digit pid each get one
+  fixed line; addresses go through `ip::make_address(addr, ec)`, which reports
+  failure instead of throwing, so a hostname is refused (nothing here resolves
+  names). A bracketed IPv6 host is unbracketed first, exactly as
+  `parse_proxy_url` does, so both front ends accept the same spellings.
+
+An empty box is a refusal too: a click that used to do nothing now says so, for
+the same reason — silence looks like a click that was lost.
+
+Write new handlers this way: validate with the same rules the CLI applies to
+`-p`, `report` the refusal in fixed text, and let `guarded` catch the rest.
