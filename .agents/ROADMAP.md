@@ -78,10 +78,10 @@ UI data-race fixes (`view.post`).
 - [x] Tests for `utils.hpp` wildcard/regex process matching.
 - [x] Tests for `to_sockaddr` / `to_ip_addr` IPv4/IPv6/domain conversions (locks down
       the byte-order question flagged in §2).
-- [ ] Tests for socks5 request byte builders and `queue.hpp` behavior.
-      (queue.hpp done — cfb7622; socks5 builders need the P5 seam refactor first:
-      they take live SOCKETs and socks5.hpp has no guard. Latent wire bug noted
-      in the unused IpAddr overload — reviewer 801436d2.)
+- [x] Tests for socks5 request byte builders and `queue.hpp` behavior. (queue: cfb7622;
+      builders: 410a54e P5-S1 seam — pure inline builders, 17 byte-pinned cases incl.
+      the IpAddr-overload wire fix (LIVE path hook.hpp:336 WSAConnectByName) and the
+      SOCKS_REQUEST_MAX_SIZE stack-overrun fix.)
 - [x] Wire CTest into `.github/workflows/build.yml` (existing job: windows-2022 with a
       {Debug, Release} × {Win32, x64} matrix; snapshot/installer artifacts; gh-release
       on `v*` tags).
