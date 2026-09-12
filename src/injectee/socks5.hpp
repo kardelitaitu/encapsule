@@ -18,9 +18,11 @@
 
 #include <WinSock2.h>
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <schema.hpp>
 #include <string_view>
 
@@ -35,6 +37,12 @@ constexpr const char SOCKS_IPV6 = 4;
 constexpr const char SOCKS_SUCCESS = 0;
 constexpr const char SOCKS_GENERAL_FAILURE = 4;
 
+// RFC 1928 section 4 command, and the section 7 datagram fragment octet.  The
+// UDP associate is what turns a socks5 TCP tunnel into a UDP relay; FRAG is 0
+// for an unfragmented datagram, which is every one this tool builds.
+constexpr const uint8_t SOCKS_UDP_ASSOCIATE = 3;
+constexpr const uint8_t SOCKS_FRAG_NOT = 0;
+
 // RFC 1929 username/password subnegotiation, offered as greeting method 2.
 constexpr const char SOCKS_USERNAME_PASSWORD = 2;
 constexpr const uint8_t SOCKS_AUTH_VERSION = 1;    // the subnegotiation VER
@@ -45,6 +53,13 @@ constexpr const uint8_t SOCKS_AUTH_FAILURE = 0xFF;  // the usual rejection code
 constexpr const size_t SOCKS_DOMAIN_MAX_LENGTH = 255;
 constexpr const size_t SOCKS_REQUEST_MAX_SIZE =
     4 + 1 + SOCKS_DOMAIN_MAX_LENGTH + 2;
+
+// The widest RFC 1928 section 7 datagram header, a DOMAINNAME one:
+// RSV (2) + FRAG + ATYP + LEN + name (255) + PORT (2) == 262 -- the same
+// size as a DOMAINNAME request, because the two encodings share everything
+// from ATYP on.
+constexpr const size_t SOCKS_UDP_HEADER_MAX = 4 + 1 + SOCKS_DOMAIN_MAX_LENGTH +
+                                              2;
 
 // VER + NMETHODS + up to 255 methods (RFC 1928 section 3).
 constexpr const size_t SOCKS_GREETING_MAX_SIZE = 2 + 255;
@@ -111,27 +126,24 @@ inline size_t socks5_build_greeting(const uint8_t *methods, size_t n,
   return n + 2;
 }
 
-// Writes the request {VER, CMD=CONNECT, RSV=0, ATYP, ADDR, PORT}; `out` needs
-// room for SOCKS_REQUEST_MAX_SIZE bytes.
+// ATYP and the address field that follows it, written from `at` (the octet the
+// ATYP goes into): one octet of type, then the address.  Returns the number of
+// octets written -- including the ATYP octet -- or 0 for an unknown ATYP, an
+// empty or over-long domain, or a null argument.
 //
-// Byte order is the whole point of this function:
-//   * `addr_bytes` is copied verbatim and therefore must already carry WIRE
-//     (network) order -- 4 octets for SOCKS_IPV4, 16 octets for SOCKS_IPV6;
-//   * for SOCKS_DOMAINNAME, `addr_bytes` is a NUL-terminated string of at most
-//     SOCKS_DOMAIN_MAX_LENGTH characters, emitted as {LEN, bytes};
-//   * `port_host_order` is a plain integer (80, 8080, ...), emitted in network
-//     order, most significant octet first.
-//
-// Returns the number of bytes written, or 0 for an unknown ATYP, an empty or
-// over-long domain, or a null argument.
-inline size_t socks5_build_request(uint8_t atyp, const void *addr_bytes,
-                                   uint16_t port_host_order, char *out) {
-  if (addr_bytes == nullptr || out == nullptr) {
+// Shared by the two encoders below on purpose.  A request
+// {VER, CMD, RSV, ATYP, ADDR, PORT} and an RFC 1928 section 7 datagram header
+// {RSV, RSV, FRAG, ATYP, ADDR, PORT} agree on everything from ATYP onwards,
+// so the address rules -- the part with a byte-order trap in it -- are written
+// exactly once and cannot drift apart.
+inline size_t socks5_write_atyp_addr(uint8_t atyp, const void *addr_bytes,
+                                     char *at) {
+  if (addr_bytes == nullptr || at == nullptr) {
     return 0;
   }
 
   const char *src = (const char *)addr_bytes;
-  char *addr = out + 4;  // past VER, CMD, RSV, ATYP
+  char *addr = at + 1;
   size_t addr_size = 0;
 
   if (atyp == SOCKS_IPV4) {
@@ -152,16 +164,57 @@ inline size_t socks5_build_request(uint8_t atyp, const void *addr_bytes,
     return 0;
   }
 
-  out[0] = SOCKS_VERSION;
-  out[1] = SOCKS_CONNECT;
-  out[2] = 0;  // RSV
-  out[3] = (char)atyp;
+  at[0] = (char)atyp;
+  return addr_size + 1;
+}
 
-  char *port = addr + addr_size;
+// PORT, host order in, network order out (most significant octet first) -- the
+// other half of what the two encoders share.
+inline void socks5_write_port(char *port, uint16_t port_host_order) {
   port[0] = (char)((port_host_order >> 8) & 0xFF);
   port[1] = (char)(port_host_order & 0xFF);
+}
 
-  return (size_t)(port + 2 - out);
+// Writes the request {VER, CMD=cmd, RSV=0, ATYP, ADDR, PORT}; `out` needs room
+// for SOCKS_REQUEST_MAX_SIZE bytes.
+//
+// Byte order is the whole point of this function:
+//   * `addr_bytes` is copied verbatim and therefore must already carry WIRE
+//     (network) order -- 4 octets for SOCKS_IPV4, 16 octets for SOCKS_IPV6;
+//   * for SOCKS_DOMAINNAME, `addr_bytes` is a NUL-terminated string of at most
+//     SOCKS_DOMAIN_MAX_LENGTH characters, emitted as {LEN, bytes};
+//   * `port_host_order` is a plain integer (80, 8080, ...), emitted in network
+//     order, most significant octet first.
+//
+// Returns the number of bytes written, or 0 for an unknown ATYP, an empty or
+// over-long domain, or a null argument.  Nothing is written unless the whole
+// request can be, so a 0 return leaves `out` as the caller left it.
+inline size_t socks5_build_request_cmd(uint8_t cmd, uint8_t atyp,
+                                       const void *addr_bytes,
+                                       uint16_t port_host_order, char *out) {
+  if (out == nullptr) {
+    return 0;
+  }
+
+  const size_t field = socks5_write_atyp_addr(atyp, addr_bytes, out + 3);
+  if (field == 0) {
+    return 0;
+  }
+
+  out[0] = SOCKS_VERSION;
+  out[1] = (char)cmd;
+  out[2] = 0;  // RSV
+  socks5_write_port(out + 3 + field, port_host_order);
+
+  return field + 5;
+}
+
+// The CONNECT request every hook sends today: `socks5_build_request_cmd` with
+// the command fixed, kept as the name the call sites and the byte pins use.
+inline size_t socks5_build_request(uint8_t atyp, const void *addr_bytes,
+                                   uint16_t port_host_order, char *out) {
+  return socks5_build_request_cmd(SOCKS_CONNECT, atyp, addr_bytes,
+                                  port_host_order, out);
 }
 
 // Request bytes for a live `sockaddr` target -- the shape every connect() hook
@@ -252,6 +305,119 @@ inline size_t socks5_build_auth(std::string_view user, std::string_view pass,
   }
 
   return (size_t)(p - out);
+}
+
+// -------------------------------------------------- UDP datagram header
+//
+// RFC 1928 section 5 wraps every relayed datagram in
+//   {RSV(2)=0, FRAG, ATYP, DST.ADDR, DST.PORT, DATA}
+// which is the request layout shifted by one octet: RSV, RSV, FRAG stand
+// where VER, CMD, RSV do.  Both encoders below therefore share
+// socks5_write_atyp_addr, and a caller can size its buffer with
+// SOCKS_UDP_HEADER_MAX for either.
+
+// Builds that header for `atyp`/`addr_bytes`/`port_host_order`, with `frag`
+// copied through verbatim (0 = SOCKS_FRAG_NOT, a whole datagram; any other
+// value is the caller's fragment number and this builder does not judge it).
+// Returns the number of octets written -- 10 for IPv4, 22 for IPv6, 7 + name
+// length for a domain -- or 0 for an unknown ATYP, an empty or over-long
+// domain, or a null `out`.  On 0 nothing has been written.
+inline size_t socks5_build_udp_header(uint8_t atyp, const void *addr_bytes,
+                                      uint16_t port_host_order, uint8_t frag,
+                                      char *out) {
+  if (out == nullptr) {
+    return 0;
+  }
+
+  const size_t field = socks5_write_atyp_addr(atyp, addr_bytes, out + 3);
+  if (field == 0) {
+    return 0;
+  }
+
+  out[0] = 0;  // RSV
+  out[1] = 0;  // RSV
+  out[2] = (char)frag;
+  socks5_write_port(out + 3 + field, port_host_order);
+
+  return field + 5;
+}
+
+// One decoded datagram header.  `addr` carries the WIRE order octets -- the
+// first 4 for an IPv4 source, all 16 for IPv6, the name without its LEN octet
+// for a domain -- and `port_host_order` has already been brought round to a
+// plain integer.  `header_size` is where DATA begins, so the payload is
+// [header_size, total).
+
+struct socks5_udp_datagram {
+  uint8_t atyp;
+  std::array<uint8_t, 16> addr;
+  uint16_t port_host_order;
+  size_t header_size;
+};
+
+// Reads a header a server sent us.  The bytes are hostile by definition --
+// they arrive over the relay from wherever the datagram came -- so every field
+// is checked against the buffer before it is read, and anything that does not
+// describe a whole header yields nullopt rather than a guess:
+//   * shorter than the 4 fixed octets, or shorter than the address it claims;
+//   * an ATYP that is not IPv4 / IPv6 / DOMAINNAME;
+//   * FRAG not zero, because a continuation fragment carries DATA and no
+//     address at all, so decoding the octets after ATYP as one would invent
+//     a source out of payload bytes;
+//   * a domain that is empty, or longer than the 16 octets this struct can
+//     carry -- truncating a name would misattribute the datagram, and the
+//     capsule resolves names before it associates, so a name this wide is
+//     not something the relay path can act on.
+// The two RSV octets are NOT checked: they are reserved and ignored, and
+// dropping traffic over them would be a policy this decoder has no business
+// making.  Nor is anything beyond the header touched.
+inline std::optional<socks5_udp_datagram>
+socks5_parse_udp_header(const void *data, size_t size) {
+  const auto *bytes = (const uint8_t *)data;
+  if (bytes == nullptr || size < 4) {
+    return std::nullopt;
+  }
+
+  if (bytes[2] != SOCKS_FRAG_NOT) {
+    return std::nullopt;  // a fragment piece: no address follows ATYP
+  }
+
+  const uint8_t atyp = bytes[3];
+  size_t addr_at = 4;     // where the address octets start
+  size_t addr_size = 0;   // and how many there are
+
+  if (atyp == SOCKS_IPV4) {
+    addr_size = 4;
+  } else if (atyp == SOCKS_IPV6) {
+    addr_size = 16;
+  } else if (atyp == SOCKS_DOMAINNAME) {
+    if (size < 5) {
+      return std::nullopt;
+    }
+    const size_t name_len = bytes[4];  // the LEN octet in front of the name
+    if (name_len == 0 || name_len > 16 || size < 5 + name_len + 2) {
+      return std::nullopt;
+    }
+    addr_at = 5;
+    addr_size = name_len;
+  } else {
+    return std::nullopt;
+  }
+
+  const size_t port_at = addr_at + addr_size;
+  if (size < port_at + 2) {
+    return std::nullopt;
+  }
+
+  socks5_udp_datagram out;
+  out.atyp = atyp;
+  out.addr = {};
+  std::memcpy(out.addr.data(), bytes + addr_at, addr_size);
+  out.port_host_order = (uint16_t)(((uint16_t)bytes[port_at] << 8) |
+                                   (uint16_t)bytes[port_at + 1]);
+  out.header_size = port_at + 2;
+
+  return out;
 }
 
 // ------------------------------------------------------------ socket layer

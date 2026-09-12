@@ -138,6 +138,30 @@ const bytes kRequestV6{0x05, 0x01, 0x00, 0x04,        // VER CMD RSV ATYP=4
 const bytes kRequestDomain{0x05, 0x01, 0x00, 0x03, 0x0b, 'e', 'x', 'a', 'm',
                            'p', 'l', 'e',  '.',  'c',  'o', 'm', 0x00, 0x50};
 
+// ---------------------------------------------------------------- P7 / UDP
+//
+// The two shapes RFC 1928 adds for datagrams: an ASSOCIATE request (section 4
+// CMD=3) asking the relay for a port, and the section 5/7 header in front of
+// every datagram that port then carries.  Same addresses as above, so a reader
+// can see the two encodings side by side.
+
+// VER CMD=3 RSV ATYP=1 then a 0.0.0.0:0 bind address: "any address, any port"
+// -- the client does not know its relay endpoint yet and asks the server to
+// assign one, which is what the reply then reports back.
+const bytes kUdpAssociateAny{0x05, 0x03, 0x00, 0x01, 0x00, 0x00,
+                             0x00, 0x00, 0x00, 0x00};
+// RSV(2) FRAG ATYP, then the address at the SAME offset it has in a request.
+const bytes kUdpHeaderV4{0x00, 0x00, 0x00, 0x01, 0xCB, 0x00, 0x71,
+                         0x07, 0x1F, 0x90};  // from 203.0.113.7:8080
+const bytes kUdpHeaderV6{0x00, 0x00, 0x00, 0x04,        // RSV RSV FRAG ATYP=4
+                         0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+                         0x11, 0x51};                    // [2001:db8::1]:4433
+// 18 bytes: 4 fixed + LEN(1) + 11 name octets + PORT.
+const bytes kUdpHeaderDomain{0x00, 0x00, 0x00, 0x03, 0x0b, 'e', 'x', 'a',
+                             'm', 'p', 'l',  'e',  '.',  'c', 'o', 'm',
+                             0x00, 0x50};
+
 }  // namespace
 
 // ------------------------------------------------------------------ greeting
@@ -354,6 +378,264 @@ void overloads_agree_byte_for_byte_ipv6() {
   CHECK(std::memcmp(via_sockaddr, via_ip_addr, a) == 0);
 }
 
+// --------------------------------------------------------------------- UDP
+//
+// The pure half of RFC 1928 sections 4 (CMD=3), 5 and 7: what an ASSOCIATE
+// request looks like, what heads a relayed datagram, and what comes back when
+// a server hands one to us.  Still no sockets -- and the parser is written for
+// bytes nobody can trust, because a datagram header arrives from the network.
+
+void udp_constants_match_the_contract() {
+  CHECK_EQ((int)SOCKS_UDP_ASSOCIATE, 3);  // the section 4 command id
+  CHECK_EQ((int)SOCKS_FRAG_NOT, 0);       // an unfragmented datagram
+  // RSV(2) + FRAG + ATYP + LEN + name + PORT, i.e. as wide as a request.
+  CHECK_EQ(SOCKS_UDP_HEADER_MAX, 262u);
+  CHECK_EQ(SOCKS_UDP_HEADER_MAX, SOCKS_REQUEST_MAX_SIZE);
+}
+
+// The generalization that let ASSOCIATE be built: socks5_build_request now
+// delegates, and the CONNECT bytes every hook puts on the wire must not have
+// moved by one bit.  These are the pre-existing pins, rebuilt through the
+// command-taking form.
+void build_request_cmd_keeps_the_connect_pins() {
+  char buf[SOCKS_REQUEST_MAX_SIZE] = {};
+  const uint8_t octets[] = {203, 0, 113, 7};
+  const char name[] = "example.com";
+
+  CHECK_EQ(socks5_build_request_cmd(SOCKS_CONNECT, SOCKS_IPV4, octets, 8080,
+                                    buf),
+           10u);
+  CHECK_BYTES(buf, 10, kRequestV4);
+
+  std::memset(buf, 0, sizeof(buf));
+  CHECK_EQ(socks5_build_request_cmd(SOCKS_CONNECT, SOCKS_IPV6,
+                                    k2001db8_1_wire.data(), 4433, buf),
+           22u);
+  CHECK_BYTES(buf, 22, kRequestV6);
+
+  std::memset(buf, 0, sizeof(buf));
+  CHECK_EQ(socks5_build_request_cmd(SOCKS_CONNECT, SOCKS_DOMAINNAME, name, 80,
+                                    buf),
+           18u);
+  CHECK_BYTES(buf, 18, kRequestDomain);
+
+  // ... and the delegating form still agrees with it.
+  char via_cmd[SOCKS_REQUEST_MAX_SIZE] = {};
+  char via_connect[SOCKS_REQUEST_MAX_SIZE] = {};
+  const size_t a = socks5_build_request_cmd(SOCKS_CONNECT, SOCKS_IPV4, octets,
+                                           8080, via_cmd);
+  const size_t b =
+      socks5_build_request(SOCKS_IPV4, octets, 8080, via_connect);
+  CHECK_EQ(a, b);
+  CHECK(std::memcmp(via_cmd, via_connect, a) == 0);
+}
+
+void udp_associate_asks_for_a_relay_assigned_endpoint() {
+  // 0.0.0.0:0 in the BND.ADDR / BND.PORT fields: the client has no preference
+  // and lets the relay pick, which is how a hooked process that never called
+  // bind() still gets a port.  The only difference from a CONNECT request is
+  // the CMD octet -- everything from ATYP on is the same encoding.
+  char buf[SOCKS_REQUEST_MAX_SIZE] = {};
+  const uint8_t any[4] = {0, 0, 0, 0};
+
+  const size_t n =
+      socks5_build_request_cmd(SOCKS_UDP_ASSOCIATE, SOCKS_IPV4, any, 0, buf);
+  CHECK_EQ(n, 10u);
+  CHECK_BYTES(buf, n, kUdpAssociateAny);
+  CHECK_EQ((int)buf[1], (int)SOCKS_UDP_ASSOCIATE);
+
+  char connect_buf[SOCKS_REQUEST_MAX_SIZE] = {};
+  const size_t c = socks5_build_request(SOCKS_IPV4, any, 0, connect_buf);
+  CHECK_EQ(c, n);
+  // RSV + ATYP + ADDR + PORT are the same encoding in both; only CMD
+  // differs, which is the next two checks.
+  CHECK_EQ(std::memcmp(buf + 2, connect_buf + 2, n - 2), 0);
+  CHECK_EQ((int)connect_buf[1], (int)SOCKS_CONNECT);
+  CHECK_EQ((int)buf[2], 0);  // RSV, in both
+}
+
+void build_udp_header_ipv4_is_network_order() {
+  char buf[SOCKS_UDP_HEADER_MAX] = {};
+  const uint8_t octets[] = {203, 0, 113, 7};
+
+  const size_t n =
+      socks5_build_udp_header(SOCKS_IPV4, octets, 8080, SOCKS_FRAG_NOT, buf);
+  CHECK_EQ(n, 10u);
+  CHECK_BYTES(buf, n, kUdpHeaderV4);
+  CHECK_EQ((int)buf[0], 0);  // RSV
+  CHECK_EQ((int)buf[1], 0);  // RSV
+  CHECK_EQ((int)buf[2], (int)SOCKS_FRAG_NOT);
+}
+
+void build_udp_header_ipv6_and_domain() {
+  char buf[SOCKS_UDP_HEADER_MAX] = {};
+
+  const size_t v6 = socks5_build_udp_header(SOCKS_IPV6, k2001db8_1_wire.data(),
+                                            4433, SOCKS_FRAG_NOT, buf);
+  CHECK_EQ(v6, 22u);
+  CHECK_BYTES(buf, v6, kUdpHeaderV6);
+
+  std::memset(buf, 0, sizeof(buf));
+  const char name[] = "example.com";
+  const size_t dn =
+      socks5_build_udp_header(SOCKS_DOMAINNAME, name, 80, SOCKS_FRAG_NOT, buf);
+  CHECK_EQ(dn, 18u);
+  CHECK_EQ(kUdpHeaderDomain.size(), 18u);
+  CHECK_BYTES(buf, dn, kUdpHeaderDomain);
+
+  // 5 + LEN + 2 for a domain: the LEN octet is counted once, not twice.
+  CHECK_EQ(dn, 5u + std::strlen(name) + 2u);
+}
+
+void build_udp_header_passes_the_fragment_octet_through() {
+  // FRAG is the caller's business: an unfragmented datagram is 0, and any
+  // other value is a continuation number this builder only copies.  The
+  // parser underneath refuses those, so the pair is deliberate.
+  char buf[SOCKS_UDP_HEADER_MAX] = {};
+  const uint8_t octets[] = {203, 0, 113, 7};
+  const uint8_t frags[] = {0x01, 0x02, 0x0f, 0x7f, 0xff};
+
+  for (const uint8_t frag : frags) {
+    std::memset(buf, 0, sizeof(buf));
+    const size_t n = socks5_build_udp_header(SOCKS_IPV4, octets, 8080,
+                                                 frag, buf);
+    CHECK_EQ(n, 10u);
+    CHECK_EQ((int)(std::uint8_t)buf[2], (int)frag);
+    // everything else is the unfragmented pin
+    CHECK_EQ(std::memcmp(buf, kUdpHeaderV4.data(), 2), 0);
+    CHECK_EQ(std::memcmp(buf + 3, kUdpHeaderV4.data() + 3, 7), 0);
+  }
+}
+
+void build_udp_header_rejects_bad_input() {
+  char buf[SOCKS_UDP_HEADER_MAX] = {};
+  const uint8_t octets[] = {203, 0, 113, 7};
+  char name[257];
+  std::memset(name, 'a', 256);
+  name[256] = '\0';
+
+  CHECK_EQ(socks5_build_udp_header(0x02, octets, 80, 0, buf), 0u);
+  CHECK_EQ(socks5_build_udp_header(0x09, octets, 80, 0, buf), 0u);
+  CHECK_EQ(socks5_build_udp_header(SOCKS_IPV4, nullptr, 80, 0, buf), 0u);
+  CHECK_EQ(socks5_build_udp_header(SOCKS_DOMAINNAME, "", 80, 0, buf), 0u);
+  CHECK_EQ(socks5_build_udp_header(SOCKS_DOMAINNAME, name, 80, 0, buf), 0u);
+  CHECK_EQ(socks5_build_udp_header(SOCKS_IPV4, octets, 80, 0, nullptr), 0u);
+
+  // 255 octets is the limit, and it lands exactly in SOCKS_UDP_HEADER_MAX.
+  char longest[SOCKS_DOMAIN_MAX_LENGTH + 1];
+  std::memset(longest, 'b', SOCKS_DOMAIN_MAX_LENGTH);
+  longest[SOCKS_DOMAIN_MAX_LENGTH] = '\0';
+  CHECK_EQ(socks5_build_udp_header(SOCKS_DOMAINNAME, longest, 1, 0, buf),
+           SOCKS_UDP_HEADER_MAX);
+}
+
+void parse_udp_header_round_trips_every_form() {
+  struct case_v {
+    uint8_t atyp;
+    const void *addr;
+    size_t addr_size;
+    uint16_t port;
+  };
+  const uint8_t v4_octets[] = {203, 0, 113, 7};
+  const char name[] = "example.com";
+  const case_v cases[] = {
+      {SOCKS_IPV4, v4_octets, 4, 8080},
+      {SOCKS_IPV6, k2001db8_1_wire.data(), 16, 4433},
+      {SOCKS_DOMAINNAME, name, 11, 80},
+  };
+
+  for (const auto &c : cases) {
+    char datagram[SOCKS_UDP_HEADER_MAX + 6] = {};
+    const size_t n = socks5_build_udp_header(c.atyp, c.addr, c.port,
+                                             SOCKS_FRAG_NOT, datagram);
+    CHECK(n > 0);
+    std::memcpy(datagram + n, "hello", 5);  // the payload the header fronts
+
+    const auto parsed =
+        socks5_parse_udp_header(datagram, n + 5 /* header + payload */);
+    CHECK(parsed.has_value());
+    if (!parsed) {
+      continue;
+    }
+    CHECK_EQ((int)parsed->atyp, (int)c.atyp);
+    CHECK_EQ(parsed->port_host_order, c.port);
+    CHECK_EQ(parsed->header_size, n);
+    CHECK(std::memcmp(parsed->addr.data(), c.addr, c.addr_size) == 0);
+    // an IPv4 address fills the low 4 octets, the rest stays zeroed
+    for (size_t i = c.atyp == SOCKS_IPV4 ? 4 : c.addr_size; i < 16; ++i) {
+      CHECK_EQ((int)parsed->addr[i], 0);
+    }
+    // DATA starts at header_size, not before
+    CHECK_EQ(std::memcmp(datagram + parsed->header_size, "hello", 5), 0);
+  }
+}
+
+void parse_udp_header_rejects_hostile_bytes() {
+  char buf[SOCKS_UDP_HEADER_MAX] = {};
+  const uint8_t octets[] = {203, 0, 113, 7};
+  const char name[] = "example.com";
+  const size_t v4 =
+      socks5_build_udp_header(SOCKS_IPV4, octets, 8080, SOCKS_FRAG_NOT, buf);
+  CHECK_EQ(v4, 10u);
+
+  CHECK(!socks5_parse_udp_header(nullptr, 0).has_value());
+  CHECK(!socks5_parse_udp_header(buf, 0).has_value());
+  // every truncation of a whole header, down to nothing
+  for (size_t n = 1; n < v4; ++n) {
+    CHECK(!socks5_parse_udp_header(buf, n).has_value());
+  }
+  // the whole header plus its payload still parses (no size == header rule)
+  std::memcpy(buf + v4, "hello", 5);
+  CHECK(socks5_parse_udp_header(buf, v4 + 5).has_value());
+
+  // an ATYP that is not one of the three, including one with no reply
+  char bogus[SOCKS_UDP_HEADER_MAX] = {};
+  std::memcpy(bogus, buf, v4);
+  for (const uint8_t atyp : {(uint8_t)0x00, (uint8_t)0x02, (uint8_t)0x05,
+                             (uint8_t)0xFF}) {
+    bogus[3] = (char)atyp;
+    CHECK(!socks5_parse_udp_header(bogus, v4).has_value());
+  }
+
+  // a fragment continuation: DATA follows FRAG, so the address is not there to
+  // be read -- decoding those octets anyway would invent a source
+  char frag[SOCKS_UDP_HEADER_MAX] = {};
+  std::memcpy(frag, buf, v4);
+  frag[2] = 1;
+  CHECK(!socks5_parse_udp_header(frag, v4).has_value());
+
+  // a domain header whose LEN claims more than the buffer holds
+  char dn[SOCKS_UDP_HEADER_MAX] = {};
+  const size_t d = socks5_build_udp_header(SOCKS_DOMAINNAME, name, 80, 0, dn);
+  CHECK_EQ(d, 18u);
+  for (size_t n = 1; n < d; ++n) {
+    CHECK(!socks5_parse_udp_header(dn, n).has_value());
+  }
+  CHECK(socks5_parse_udp_header(dn, d).has_value());
+
+  char oversized[SOCKS_UDP_HEADER_MAX] = {};
+  std::memcpy(oversized, dn, d);
+  oversized[4] = (char)0xFF;  // 255 octets of name in an 18 octet datagram
+  CHECK(!socks5_parse_udp_header(oversized, d).has_value());
+
+  // ... and a name too wide for the struct that would have to carry it: a
+  // truncated source address is worse than no source address
+  char wide[SOCKS_UDP_HEADER_MAX] = {};
+  char long_name[32];
+  std::memset(long_name, 'c', 31);
+  long_name[31] = '\0';
+  const size_t w =
+      socks5_build_udp_header(SOCKS_DOMAINNAME, long_name, 80, 0, wide);
+  CHECK_EQ(w, 38u);
+  CHECK(!socks5_parse_udp_header(wide, w).has_value());
+
+  // a LEN of 0 is not an address either
+  char empty_name[SOCKS_UDP_HEADER_MAX] = {};
+  std::memcpy(empty_name, dn, d);
+  empty_name[4] = 0;
+  CHECK(!socks5_parse_udp_header(empty_name, d).has_value());
+}
+
 // ---------------------------------------------------------------- RFC 1929
 //
 // socks5_build_auth lays out the subnegotiation request; socks5_handshake is
@@ -500,6 +782,10 @@ void print_pinned_vectors() {
   std::printf("  v4   203.0.113.7:8080   %s\n", hex(kRequestV4).c_str());
   std::printf("  v6   [2001:db8::1]:4433 %s\n", hex(kRequestV6).c_str());
   std::printf("  domain example.com:80   %s\n", hex(kRequestDomain).c_str());
+  std::printf("  udp associate 0.0.0.0:0 %s\n", hex(kUdpAssociateAny).c_str());
+  std::printf("  udp hdr v4 203.0.113.7   %s\n", hex(kUdpHeaderV4).c_str());
+  std::printf("  udp hdr v6 [2001:db8::1] %s\n", hex(kUdpHeaderV6).c_str());
+  std::printf("  udp hdr example.com:80   %s\n", hex(kUdpHeaderDomain).c_str());
 }
 
 int main() {
@@ -535,6 +821,15 @@ int main() {
   RUN(credentials_are_views_with_enablement_semantics);
   RUN(credentials_borrowed_from_the_injector_config);
   RUN(handshake_offer_tracks_the_credential_state);
+  RUN(udp_constants_match_the_contract);
+  RUN(build_request_cmd_keeps_the_connect_pins);
+  RUN(udp_associate_asks_for_a_relay_assigned_endpoint);
+  RUN(build_udp_header_ipv4_is_network_order);
+  RUN(build_udp_header_ipv6_and_domain);
+  RUN(build_udp_header_passes_the_fragment_octet_through);
+  RUN(build_udp_header_rejects_bad_input);
+  RUN(parse_udp_header_round_trips_every_form);
+  RUN(parse_udp_header_rejects_hostile_bytes);
 
   print_pinned_vectors();
 
