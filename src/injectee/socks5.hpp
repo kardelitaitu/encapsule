@@ -264,8 +264,8 @@ inline size_t socks5_build_request_from_sockaddr_cmd(uint8_t cmd,
 // IPv6/real-port forms).
 inline size_t socks5_build_associate_from_sockaddr(const sockaddr *bind_hint,
                                                    char *out) {
-  return socks5_build_request_from_sockaddr_cmd(SOCKS_UDP_ASSOCIATE,
-                                               bind_hint, out);
+  return socks5_build_request_from_sockaddr_cmd(SOCKS_UDP_ASSOCIATE, bind_hint,
+                                                out);
 }
 
 // Request bytes for an `IpAddr` IPC message.  By schema contract `v4_addr` and
