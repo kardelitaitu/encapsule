@@ -163,7 +163,8 @@ UI data-race fixes (`view.post`).
 - [x] Unit tests: handshake byte-level tests covering auth success and auth failure
       (a76f052 builders/offer 25 cases + 18ef7c4 live-socket relay walk: accept, bad
       pass refused, demanded-without-creds -> {5,FF}, not-required -> {5,00} as
-      today; tunnel proven post-negotiation; creds never logged).
+      today; + malformed 1929 refusals, relay stays live (7235543); tunnel proven
+      post-negotiation; creds never logged).
 - [ ] E2E: verify against a socks5 server that requires authentication.
 
 ### P6 — Feature: DNS resolution hooking
