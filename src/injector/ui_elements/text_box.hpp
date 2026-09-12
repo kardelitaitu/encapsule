@@ -19,8 +19,8 @@
    Distributed under the MIT License [ https://opensource.org/licenses/MIT ]
 =============================================================================*/
 
-#ifndef PROXINJECT_INJECTOR_TEXT_BOX
-#define PROXINJECT_INJECTOR_TEXT_BOX
+#ifndef ENCAPSULE_INJECTOR_TEXT_BOX
+#define ENCAPSULE_INJECTOR_TEXT_BOX
 
 #include <elements.hpp>
 

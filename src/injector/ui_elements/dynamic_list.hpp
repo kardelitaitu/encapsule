@@ -19,8 +19,8 @@
    Distributed under the MIT License [ https://opensource.org/licenses/MIT ]
 =============================================================================*/
 
-#ifndef PROXINJECT_INJECTOR_DYNAMIC_LIST
-#define PROXINJECT_INJECTOR_DYNAMIC_LIST
+#ifndef ENCAPSULE_INJECTOR_DYNAMIC_LIST
+#define ENCAPSULE_INJECTOR_DYNAMIC_LIST
 
 #include <elements/element/dynamic_list.hpp>
 #include <elements/view.hpp>

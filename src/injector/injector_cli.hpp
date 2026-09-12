@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef PROXINJECT_INJECTOR_INJECTOR_CLI
-#define PROXINJECT_INJECTOR_INJECTOR_CLI
+#ifndef ENCAPSULE_INJECTOR_INJECTOR_CLI
+#define ENCAPSULE_INJECTOR_INJECTOR_CLI
 
 #include "server.hpp"
 #include <spdlog/fmt/ostr.h>

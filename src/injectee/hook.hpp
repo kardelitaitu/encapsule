@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef PROXINJECT_INJECTEE_HOOK
-#define PROXINJECT_INJECTEE_HOOK
+#ifndef ENCAPSULE_INJECTEE_HOOK
+#define ENCAPSULE_INJECTEE_HOOK
 
 #include "client.hpp"
 #include "minhook.hpp"

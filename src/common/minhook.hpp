@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef PROXINJECT_COMMON_MINHOOK
-#define PROXINJECT_COMMON_MINHOOK
+#ifndef ENCAPSULE_COMMON_MINHOOK
+#define ENCAPSULE_COMMON_MINHOOK
 
 #include <minhook.h>
 

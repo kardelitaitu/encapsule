@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef PROXINJECT_INJECTOR_SERVER
-#define PROXINJECT_INJECTOR_SERVER
+#ifndef ENCAPSULE_INJECTOR_SERVER
+#define ENCAPSULE_INJECTOR_SERVER
 
 #include "async_io.hpp"
 #include "injector.hpp"

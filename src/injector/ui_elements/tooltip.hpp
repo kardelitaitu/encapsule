@@ -19,8 +19,8 @@
    Distributed under the MIT License [ https://opensource.org/licenses/MIT ]
 =============================================================================*/
 
-#ifndef PROXINJECT_INJECTOR_TOOLTIP
-#define PROXINJECT_INJECTOR_TOOLTIP
+#ifndef ENCAPSULE_INJECTOR_TOOLTIP
+#define ENCAPSULE_INJECTOR_TOOLTIP
 
 #include <elements/element/popup.hpp>
 #include <elements/element/proxy.hpp>

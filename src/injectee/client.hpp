@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef PROXINJECT_INJECTEE_CLIENT
-#define PROXINJECT_INJECTEE_CLIENT
+#ifndef ENCAPSULE_INJECTEE_CLIENT
+#define ENCAPSULE_INJECTEE_CLIENT
 
 #include "async_io.hpp"
 #include "queue.hpp"

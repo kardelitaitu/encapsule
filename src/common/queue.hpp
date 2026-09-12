@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef PROXINJECT_COMMON_QUEUE
-#define PROXINJECT_COMMON_QUEUE
+#ifndef ENCAPSULE_COMMON_QUEUE
+#define ENCAPSULE_COMMON_QUEUE
 
 #include <asio/experimental/channel.hpp>
 #include <queue>

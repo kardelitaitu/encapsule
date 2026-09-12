@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef PROXINJECT_COMMON_ASYNC_IO
-#define PROXINJECT_COMMON_ASYNC_IO
+#ifndef ENCAPSULE_COMMON_ASYNC_IO
+#define ENCAPSULE_COMMON_ASYNC_IO
 
 #include <asio.hpp>
 #include <protopuf/message.h>

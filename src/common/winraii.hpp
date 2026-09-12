@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef PROXINJECT_COMMON_WINRAII
-#define PROXINJECT_COMMON_WINRAII
+#ifndef ENCAPSULE_COMMON_WINRAII
+#define ENCAPSULE_COMMON_WINRAII
 
 #include "tlhelp32.h"
 #include "utils.hpp"

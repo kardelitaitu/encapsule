@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef PROXINJECT_COMMON_SCHEMA
-#define PROXINJECT_COMMON_SCHEMA
+#ifndef ENCAPSULE_COMMON_SCHEMA
+#define ENCAPSULE_COMMON_SCHEMA
 
 #include <protopuf/message.h>
 

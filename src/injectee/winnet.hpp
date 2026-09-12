@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef PROXINJECT_INJECTEE_WINNET
-#define PROXINJECT_INJECTEE_WINNET
+#ifndef ENCAPSULE_INJECTEE_WINNET
+#define ENCAPSULE_INJECTEE_WINNET
 
 #include "winraii.hpp"
 #include <WinSock2.h>
