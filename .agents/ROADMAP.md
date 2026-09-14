@@ -199,9 +199,26 @@ UI data-race fixes (`view.post`).
       ('the server is not listening yet' / 'that process is already in the list' / 'the capsule
       did not attach'), and 38 lines of duplicated IsWow64Process+module-walk were DELETED from
       injector_gui.hpp once server.inject returned the verdict. CLI has no refusal text yet. STILL OPEN: M1-c (client re-read of the mapping
-      per attempt) and the adopt-vs-already-resident channel — a RESIDENT capsule has no way to
-      receive a new port+token, because the server only pushes InjectorConfig down an
-      already-authenticated socket; -i on a resident pid still publishes a token nobody reads.
+      per attempt) and the adopt-vs-already-resident channel — a capsule ALREADY ATTACHED TO THE SAME DLL
+      PATH has no way to receive a new port+token (the server pushes InjectorConfig only down an
+      already-authenticated socket; -i on a resident pid publishes a token that instance never re-reads).
+      ✅ CLAIM CORRECTED (0aa41f2 measurement + d1a9f004 research): the old absolute 'a resident capsule
+      cannot receive new port+token' was FALSE AS WRITTEN. re-publish() overwrites the live section IN
+      PLACE (create_mapping is a bare CreateFileMappingW with no ERROR_ALREADY_EXISTS test), and a second
+      inject() whose find_injectee() resolves a DIFFERENT PATH attaches a SECOND module instance whose fresh
+      DllMain reads exactly that new payload and authenticates — that is what the e2e witness saw (the CLI's
+      build/x64/Release copy vs the harness's test_bin copy). M1-c is NOT partially done: the missing piece is
+      precisely a mapping re-read inside attempt()/open_session() (client.hpp constructor-fixes endpoint_+token_
+      and re-dials that same pair; the 3 s is the SOCKS handshake budget, not a poll).
+      🐛 THREE DEFECTS UNLOCKED BY THAT ANSWER: (D-REPUBLIC) re-publish() silently overwrites ANOTHER
+      injector's still-open bootstrap — nothing assumes one front end per mapping name; (D-BASENAME)
+      module_resident() compares BASE NAMES, so 'already encapsulated' is a claim about a NAME, not about the
+      image about to be loaded (the bool was true and still missed the event), and my late-load fix inherits
+      that weakness — acceptable there because SOME capsule loaded will read the mapping and the token is
+      bound to the pid, not the path, but it must stay stated; (D-TWO-INSTANCES) two do_client() threads in one
+      victim each run minhook init/enable and the second scope_ptr_bind triple overwrites the globals the first
+      bound, so hook traffic migrates while the first client thread stays alive — UNMEASURED, belongs to the
+      C-chain, not to P6a.
       🐛 FIXED BY THE WAY (f34f7ee, BEHAVIOR CHANGE OWNED): injector_server::inject()'s
       'not started' guard was DEAD CODE — 'port_ == -1' on a std::uint16_t compares 65535 to
       -1, so an un-started server fell through into a real injector::inject() carrying port
