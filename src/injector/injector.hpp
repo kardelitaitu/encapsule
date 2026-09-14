@@ -221,9 +221,14 @@ struct injector {
   // the allocation, the write, the choice of LoadLibraryW for the target's
   // bitness, the 5-second cap that keeps a wedged target from hanging the
   // injector, and the exit-code read that tells a refused DLL from a loaded
-  // one.  Every failure un-does the publish, token AND mapping.
+  // one.  Every failure un-does the publish, token AND mapping -- except the
+  // one case below where the load is only late, because rolling that back
+  // would orphan a capsule that had just arrived.  `already_encapsulated` is
+  // optional and additive, exactly as on inject() itself: pass nothing and
+  // this is the old call with the old behaviour.
   static bool load_into(DWORD pid, HANDLE proc, const injection_token &token,
-                        BOOL isWoW64, std::wstring_view filename) {
+                        BOOL isWoW64, std::wstring_view filename,
+                        bool *already_encapsulated = nullptr) {
     virtual_memory mem(proc, (filename.size() + 1) * sizeof(wchar_t));
     if (!mem) {
       forget_bootstrap(pid, token);
@@ -254,9 +259,50 @@ struct injector {
       return false;
     }
 
-    // A remote thread that never finishes means LoadLibraryW is wedged in
-    // the target: never hang the injector, and give back the allocation.
+    // A remote thread that has not finished in 5 s does NOT mean the load
+    // failed.  That cap is a promise about the injector -- never hang on
+    // somebody else's loader -- and not a measurement of the target.  The
+    // e2e harness measured the difference on this host: a cold first load
+    // taking 5000-5013 ms, three victims in a row, the cap expiring, ok=0,
+    // and the module resident moments later.  What used to follow the
+    // timeout destroyed the evidence and the
+    // bootstrap together: give back the allocation, then forget_bootstrap(),
+    // which took away the token AND the mapping from a capsule that was about
+    // to be resident -- and a capsule reads that mapping exactly once, at
+    // attach, so it was left holding a port and token nobody would accept
+    // again: every hello refused forever, no session in any front end, and
+    // nothing said anywhere.  Reviewer f26115ef's C2, the same silent-loss
+    // class.  So ask first, destroy second: module_resident() never blocks,
+    // never writes to the target and gates nothing -- it only says whether
+    // the thing we came here to do has in fact happened.
     if (WaitForSingleObject(thread.get(), 5000) != WAIT_OBJECT_0) {
+      if (module_resident(pid, isWoW64 != FALSE)) {
+        // Late, but LOADED.  The publish stays exactly as it is: that
+        // mapping is this capsule's only source of a port and a token, and
+        // reclaiming it now is the orphaning this branch exists to prevent.
+        // Success is what the return has always promised -- the module is in
+        // the target -- and the verdict is reported as already-encapsulated,
+        // because after a timeout this call genuinely cannot tell "it landed
+        // just now" from "it was mapped before we were asked", and the word
+        // that never claims to have watched an attach it did not see is the
+        // honest one.
+        //
+        // Wait out one more budget before returning, because `mem` is freed
+        // on the way out of scope and the buffer still holds the path the
+        // remote loader may be reading: VirtualFreeEx under a running
+        // LoadLibraryW is a fault in the victim.  That is the whole cost of
+        // this branch -- up to 5 s more, only for a target whose module is
+        // already mapped -- and if the second cap expires too the loader is
+        // wedged for real, which is the same exposure the timeout branch has
+        // always had, only further delayed.
+        WaitForSingleObject(thread.get(), 5000);
+        if (already_encapsulated) {
+          *already_encapsulated = true;
+        }
+        return true;
+      }
+
+      // Not there, not late: the whole publish goes back, as before.
       mem.free();
       forget_bootstrap(pid, token);
       return false;
@@ -279,16 +325,19 @@ struct injector {
   // Both halves, in order: publish, then load, and a load that fails takes
   // the publish with it.  The success path is what it always was -- mapping
   // created, payload written, token recorded before the thread, the remote
-  // LoadLibraryW waited for and its exit code read -- with one addition: the
+  // LoadLibraryW waited for (up to the 5 s cap, and see what load_into does
+  // when that cap expires) and its exit code read -- with one addition: the
   // mapping handle now stays open in `mappings` after this returns true.
   static bool inject(DWORD pid, HANDLE proc, std::uint16_t port, BOOL isWoW64,
-                     std::wstring_view filename) {
+                     std::wstring_view filename,
+                     bool *already_encapsulated = nullptr) {
     auto token = publish(pid, port);
     if (!token) {
       return false;
     }
 
-    return load_into(pid, proc, *token, isWoW64, filename);
+    return load_into(pid, proc, *token, isWoW64, filename,
+                     already_encapsulated);
   }
 
   static inline const char injectee_filename[] = "encapsule-injectee.dll";
@@ -438,6 +487,13 @@ struct injector {
   // resident, so this is the last moment at which the answer says whether THIS
   // call is the one that attached.  Nothing on this path is refused, skipped
   // or reordered because of it: module_resident() reports, it does not gate.
+  //
+  // One path overwrites it later, and deliberately: a remote load that outlives
+  // the 5 s cap but is found resident anyway reports true (see load_into),
+  // because the one thing that call cannot know is whether it watched the
+  // attach or merely arrived after it.  So read the value as "the capsule is
+  // mapped and this call does not claim to have attached it", not as a
+  // timestamped answer about which call mapped it.
   static bool inject(DWORD pid, std::uint16_t port,
                      bool *already_encapsulated = nullptr) {
     if (already_encapsulated) {
@@ -460,7 +516,8 @@ struct injector {
     }
 
     if (auto path = find_injectee(get_current_filename(), isWoW64)) {
-      return inject(pid, proc.get(), port, isWoW64, path.value());
+      return inject(pid, proc.get(), port, isWoW64, path.value(),
+                    already_encapsulated);
     }
 
     return false;
