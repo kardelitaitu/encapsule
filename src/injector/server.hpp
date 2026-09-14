@@ -216,13 +216,93 @@ private:
   std::map<DWORD, std::list<DWORD>::iterator> where;
 };
 
+// What one injector_server::inject() call actually did.
+//
+// The bool this replaced answered "no" to three different questions -- no
+// control port yet, a session already registered for this pid, and a real
+// failure inside injector:: -- and "yes" to two cases that want different
+// words on screen: a capsule this call mapped, and a capsule that was
+// already resident, where LoadLibraryW only bumped a refcount and attached
+// nothing. A front end cannot say anything true about an answer that is one
+// bit, which is why the GUI grew a second residency probe beside the call
+// that already knows the answer, duplicating the IsWow64Process walk that
+// decides which module list to read.
+//
+// One value per reason, deliberately not a code plus a flag: a struct of
+// {verdict, already_encapsulated} can hold a self-contradicting pair, and
+// the point of the whole exercise is that the reason reported is the reason
+// the injection itself acted on. So "already_encapsulated" is not a bool
+// beside the verdict, it IS the verdict, filled from injector::inject's own
+// out-param on the same call -- read before the remote load, by the one
+// function that has already worked out the target's bitness, which is the
+// last moment at which the answer can say whether THIS call attached.
+//
+// Not a hierarchy: the first two are what the old bool called true, the
+// rest are the ways a call says no, named so a caller can answer a refusal
+// with something better than silence. Read verdict to switch on the reason;
+// the helpers below are the questions a front end actually asks.
+enum class inject_verdict {
+  attached,             // publish + remote load ran; this call mapped the
+                        // capsule
+  already_encapsulated, // injector::inject() succeeded, but the capsule was
+                        // already mapped, so nothing new attached
+  already_registered,   // a live session for this pid is already in the
+                        // table
+  not_started,          // no control port yet: the server never started
+  failed                // injector::inject() said no
+};
+
+// The verdict, and the bool it replaced. The conversion is explicit: every
+// "if (server.inject(pid))" in the front ends keeps compiling, because a
+// condition is a contextual conversion, while an argument position -- the
+// bool parameter of process_subpid below -- has to say what it wants out
+// loud, which is the only place a quiet, lossy bool could still sneak in.
+struct inject_result {
+  inject_verdict verdict = inject_verdict::failed;
+
+  explicit operator bool() const { return ok(); }
+
+  // Exactly the old return value: the capsule is running, or already was,
+  // so a session is expected. Named as well as operator bool, because a
+  // contextual conversion does not reach into a bool parameter.
+  bool ok() const {
+    return verdict == inject_verdict::attached ||
+           verdict == inject_verdict::already_encapsulated;
+  }
+
+  // The word to print: "already encapsulated", not "injected".
+  bool already_encapsulated() const {
+    return verdict == inject_verdict::already_encapsulated;
+  }
+
+  // The two refusals a click has to explain. A double-click is
+  // already_registered; not_started is the tool answering before it has a
+  // port to hand the injectee.
+  bool already_registered() const {
+    return verdict == inject_verdict::already_registered;
+  }
+
+  bool not_started() const { return verdict == inject_verdict::not_started; }
+};
+
 struct injector_server {
   injector_clients clients;
   kept_bootstraps kept;
   InjectorConfig config_;
   std::mutex config_mutex;
 
-  std::uint16_t port_ = -1;
+  // The "no control port yet" sentinel, and it has to be a named constant:
+  // the test below used to be "port_ == -1", which is never true. A
+  // std::uint16_t promotes to int, so that compared 65535 against -1 and the
+  // guard was dead -- an un-started server fell straight through into a real
+  // injector::inject() carrying port 65535 in the mapping payload, i.e. a
+  // capsule wired to a control port that does not exist. Both front ends set
+  // the port before they inject, so it stayed latent, but the GUI sets it on
+  // the detached do_server thread while the app thread answers a click: the
+  // first click after startup can win that race.
+  static constexpr std::uint16_t no_port = 0xffff;
+
+  std::uint16_t port_ = no_port;
 
   void set_port(std::uint16_t port) { port_ = port; }
 
@@ -233,21 +313,35 @@ struct injector_server {
   // window would mean holding this lock across VirtualAllocEx/
   // CreateRemoteThread, i.e. into the kernel, which is exactly what the lock
   // discipline above forbids.
-  bool inject(DWORD pid) {
-    if (port_ == -1) {
-      return false;
+  // The order of the three tests is the order that has always been there, and
+  // it is why the answers cannot overlap: no port means nothing was tried,
+  // a registered pid means nothing is about to be tried, and only a call that
+  // got past both of them can report what the injector itself found out.
+  inject_result inject(DWORD pid) {
+    if (port_ == no_port) {
+      return {inject_verdict::not_started};
     }
     if (clients.contains(pid)) {
-      return false;
+      return {inject_verdict::already_registered};
     }
-    if (!injector::inject(pid, port_)) {
-      return false;
+
+    // The residency is asked of the same call that does the work, not of a
+    // second walk over the same module list: injector::inject fills this
+    // before it loads, then succeeds anyway, because LoadLibraryW on a
+    // resident DLL is a refcount bump and not a new DllMain. So a true here
+    // riding along with a successful load below is the phantom re-injection,
+    // and the verdict names it with the caller's own word. It gates nothing:
+    // a resident capsule is still published to and still counted, as before.
+    bool resident = false;
+    if (!injector::inject(pid, port_, &resident)) {
+      return {inject_verdict::failed};
     }
     // publish() just minted a new token for this pid, so anything remembered
     // about the old one has to go: an eviction must never retire the
     // bootstrap that was created a moment ago.
     kept.drop(pid);
-    return true;
+    return {resident ? inject_verdict::already_encapsulated
+                     : inject_verdict::attached};
   }
 
   bool open(DWORD pid, injectee_client_ptr ptr) {
@@ -466,7 +560,12 @@ struct injectee_session : injectee_client,
     } else if (auto v = compare_message<"connect">(msg)) {
       co_await process_connect(*v);
     } else if (auto v = compare_message<"subpid">(msg)) {
-      co_await process_subpid(*v, server_.inject(*v));
+      // .ok(), not the result itself: process_subpid's bool is a parameter,
+      // and a contextual conversion does not reach one -- which is exactly
+      // what operator bool being explicit is for.  The subprocess reply keeps
+      // the bool it has always carried; the reason, if there is one, stays on
+      // the io thread that has no sink for it.
+      co_await process_subpid(*v, server_.inject(*v).ok());
     }
   }
 
