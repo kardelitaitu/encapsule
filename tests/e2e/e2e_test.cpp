@@ -48,6 +48,14 @@
 // only translation unit that includes it.
 #include <winraii.hpp>
 
+// The already-encapsulated probe below injects FOR REAL, out of this exe, so
+// it includes the product's own two headers: injector.hpp is the injection
+// path whose out-param is under test, and server.hpp is a control server we
+// own -- which is what turns "did that second call attach anything?" from an
+// inference into a readout (injector_server::clients::size()).  Also the only
+// TU of either, for the same non-inline reason as above.
+#include <server.hpp>
+
 #ifndef ENCAPSULE_E2E_DUMMY_NAME
 #define ENCAPSULE_E2E_DUMMY_NAME "encapsule_e2e_dummy.exe"
 #endif
@@ -882,6 +890,158 @@ void inject_ipv4_decoy() {
   injection_case("ipv4", "203.0.113.7", 8080, SOCKS_IPV4);
 }
 
+// The victim has to still be here for the SECOND call, and that is the whole
+// difference between this scenario and injection_case: the decoy exits 0 the
+// instant a round trip comes back (dummy_target.cpp), so a pid that has
+// finished one is already on its way out -- there is no "after the verified
+// round trip" moment to attach a probe to without editing the decoy, which is
+// outside this file's fence.  So this victim dials a closed loopback port, is
+// refused in milliseconds, and never completes anything: it hammers until its
+// deadline, and loopback is the one destination hook.hpp never routes, so the
+// capsule is never asked to carry a byte either.  What proves the first load
+// was real is the CLI's own log line, asserted below: it appears when a hello
+// authenticated by token_matches() registers a session, which is a fact about
+// the attach and not about any traffic.
+constexpr int kResidencyDecoyMs = 30000;
+constexpr int kAttachSettleMs = 2000;  // the hello lands in milliseconds
+constexpr int kSettleMs = 1000;        // window a second session shows in
+
+// A control server of our own, alive across the second inject.  The capsule a
+// real second attach would create dials the port it has just been handed, so
+// the sessions on THIS server are the readout for "did that call attach
+// anything?" -- and for a refcount bump it can only ever read zero.
+struct residency_witness {
+  asio::io_context ctx;
+  injector_server server;
+  std::thread io;
+  std::uint16_t port = 0;
+
+  residency_witness() : ctx(), server(), io() {
+    tcp::acceptor acceptor(ctx, auto_endpoint);
+    port = static_cast<std::uint16_t>(acceptor.local_endpoint().port());
+    server.set_port(port);
+    asio::co_spawn(
+        ctx, listener<injectee_session>(std::move(acceptor), server),
+        asio::detached);
+    io = std::thread([this] { ctx.run(); });
+  }
+
+  ~residency_witness() {
+    ctx.stop();
+    if (io.joinable()) {
+      io.join();
+    }
+  }
+
+  std::size_t sessions() const { return server.clients.size(); }
+};
+
+std::size_t count_said(const std::string &log, const std::string &what) {
+  std::size_t n = 0;
+  for (std::size_t at = log.find(what); at != std::string::npos;
+       at = log.find(what, at + 1)) {
+    ++n;
+  }
+  return n;
+}
+
+void a_second_injection_reports_already_encapsulated() {
+  const int failures_before = test_failures;
+
+  // The decoy dials a closed port on loopback; no --socks5, because nothing
+  // must ever be carried here: the pid has to still be present for the second
+  // call, and a decoy that completed a round trip would not be.
+  const std::string decoy_cmd =
+      dummy_command(dummy_path(), "127.0.0.1", 9, kResidencyDecoyMs,
+                    "E2E-RESIDENCY", false);
+  const std::optional<PROCESS_INFORMATION> launched =
+      create_process(decoy_cmd, CREATE_NO_WINDOW);
+  CHECK(launched.has_value());
+  if (!launched) {
+    return;
+  }
+  child_process decoy;
+  decoy.adopt(*launched);
+  const DWORD pid = decoy.pid();
+
+  // 1. the first injection is the product's own front end, on a pid that has
+  //    nothing of ours mapped in it.
+  child_process cli;
+  // -p takes a numeric endpoint; it is aimed at the same closed port the decoy
+  // dials, so a config exists (the front end wants one) and routes nothing.
+  const std::string cli_cmd = quote_arg(g_cli_path) + " -i " +
+                              std::to_string(pid) +
+                              " -p 127.0.0.1:9 -l";
+  const bool spawned = cli.spawn(cli_cmd, true);
+  CHECK(spawned);
+  if (!spawned) {
+    decoy.finish();
+    return;
+  }
+  std::printf("  [residency] victim pid %lu, cli pid %lu\n",
+              static_cast<unsigned long>(pid),
+              static_cast<unsigned long>(cli.pid()));
+
+  // 2. give that attach time to introduce itself before anything is asked of
+  //    the second call.  The line that proves it happened is read out of the
+  //    CLI's log at the end -- a live child's pipe is only drained when it is
+  //    finished, and pulling the session count forward would mean a hook into
+  //    the front end, which is outside this file's fence.
+  std::this_thread::sleep_for(std::chrono::milliseconds(kAttachSettleMs));
+
+  // 3. THE CLAIM, out of injector::inject's own bool on that same pid.
+  //    7593252 made this pair of answers the truth -- LoadLibraryW on an
+  //    already-mapped module bumps a refcount, hands back the same HMODULE
+  //    and runs no DllMain -- and 4a9587e prints "already encapsulated" out
+  //    of exactly this bool.  Success alone is not the claim, and neither is
+  //    resident=1 riding along with a failed load, so both are asserted.
+  residency_witness witness;
+  bool resident = false;
+  const auto began = clock_type::now();
+  const bool again = injector::inject(pid, witness.port, &resident);
+  const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+      clock_type::now() - began).count();
+  CHECK(again);
+  CHECK(resident);
+  std::printf("  [residency] second inject: ok=%d resident=%d in %lldms\n",
+              static_cast<int>(again), static_cast<int>(resident),
+              static_cast<long long>(took));
+
+  // 4. the cheap safety property, MEASURED.  The count that must not move is
+  //    the one the resident capsule is actually attached to, and that session
+  //    belongs to the CLI: its established-line total is read out of its log
+  //    below, after this call, so a second DllMain showing up there is caught.
+  //    What our own server sees is printed rather than asserted, because on
+  //    this tree it is not zero -- publishing a new port at an already-resident
+  //    capsule gets answered, inside this settle window, by an authenticated
+  //    hello on the NEW port.  That is a finding about publish() and the
+  //    injectee's mapping read, not about the residency bool under test here,
+  //    so it is reported rather than asserted in either direction.
+  std::this_thread::sleep_for(std::chrono::milliseconds(kSettleMs));
+  std::printf("  [residency] %zu session(s) on the second caller's port in"
+              " %dms\n",
+              witness.sessions(), kSettleMs);
+
+  // 5. the front end's word for the SAME out-param, one line per call site:
+  //    "injected" here, and exactly one established session.  This is the
+  //    negative control -- resident had to read false while the module was
+  //    not mapped yet -- and the log can only be drained once the child is
+  //    finished, so it lands last.
+  const std::string injected = std::to_string(pid) + ": injected";
+  const std::string again_word =
+      std::to_string(pid) + ": already encapsulated";
+  cli.finish();
+  decoy.finish();
+  const std::string log = cli.output();
+  CHECK_EQ(count_said(log, injected), std::size_t(1));
+  CHECK_EQ(count_said(log, again_word), std::size_t(0));
+  CHECK_EQ(count_said(log, "established injectee connection"),
+           std::size_t(1));
+  if (test_failures > failures_before) {
+    std::printf("  [residency] cli log:\n%s\n", log.c_str());
+  }
+}
+
 // P4-1: revisit IPv6 byte order
 //
 // The IPv6 decoy case ([2001:db8::1]:9090, atyp=4) cannot be asserted yet:
@@ -1203,7 +1363,15 @@ int run_inject() {
   }
   std::printf("  cli   = %s\n  dummy = %s\n", g_cli_path.c_str(),
               g_dummy_override.c_str());
+  // Runs after the connect case, on a victim of its own.  Only the SECOND call
+  // is made from inside this harness, deliberately: a COLD first load
+  // attempted here ran past load_into's 5s remote-thread cap on this host
+  // (5000-5013ms, three victims in a row, ok=0 with the module resident
+  // moments later and its bootstrap already rolled back), while the same cold
+  // load from encapsule-cli lands in milliseconds.  A refcount bump needs no
+  // such window, and the residency answer under test is the second call's.
   RUN(inject_ipv4_decoy);
+  RUN(a_second_injection_reports_already_encapsulated);
   RUN(inject_ipv6_decoy);
   return test_failures;
 }

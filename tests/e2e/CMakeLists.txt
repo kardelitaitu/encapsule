@@ -33,12 +33,23 @@ target_link_libraries(${ENCAPSULE_E2E_TEST_TARGET} PRIVATE
 target_include_directories(${ENCAPSULE_E2E_TEST_TARGET} PRIVATE
 	${CMAKE_SOURCE_DIR}/tests
 	${CMAKE_SOURCE_DIR}/src/injectee
+	${CMAKE_SOURCE_DIR}/src/injector
 	${asio_SOURCE_DIR}/asio/include)
 target_compile_definitions(${ENCAPSULE_E2E_TEST_TARGET} PRIVATE
 	ENCAPSULE_E2E_DUMMY_NAME="${ENCAPSULE_E2E_DUMMY_NAME}")
 add_dependencies(${ENCAPSULE_E2E_TEST_TARGET}
 	${ENCAPSULE_E2E_INJECTOR_TARGET} ${ENCAPSULE_E2E_DUMMY_TARGET}
 	${ENCAPSULE_E2E_INJECTEE_TARGET})
+
+# The already-encapsulated probe injects out of THIS exe, and injector.hpp
+# resolves the capsule with find_injectee(get_current_filename()) -- next to
+# the module that calls it.  Without this copy the probe would fail for the
+# boring reason: no encapsule-injectee.dll beside the harness.
+add_custom_command(TARGET ${ENCAPSULE_E2E_TEST_TARGET} POST_BUILD
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different
+	$<TARGET_FILE:${ENCAPSULE_E2E_INJECTEE_TARGET}>
+	$<TARGET_FILE_DIR:${ENCAPSULE_E2E_TEST_TARGET}>/$<TARGET_FILE_NAME:${ENCAPSULE_E2E_INJECTEE_TARGET}>
+	VERBATIM)
 
 # Always registered: loopback only, nothing is injected, so it runs anywhere.
 add_test(NAME e2e.loopback_selfcheck
