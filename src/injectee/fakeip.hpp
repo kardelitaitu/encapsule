@@ -294,18 +294,65 @@ public:
   // must never hand out the address of the thing it tunnels to, because a fake
   // that IS the proxy turns every connect into a loop.  An address outside the
   // range excludes nothing, and the default -- 0.0.0.0, which is not a fake --
-  // excludes nothing either.
+  // excludes nothing either.  This is only the early form of exclude() below:
+  // one path, one set of rules, whether the caller knows the address at
+  // construction or learns it from parse_proxy_url halfway through a run.
   explicit fake_ip_table(
       octets excluded = octets{},
       std::size_t quarantine = FAKEIP_DEFAULT_QUARANTINE)
       : quarantine_(quarantine) {
-    if (const auto slot = fake_ip_slot_of(excluded)) {
-      excluded_slot_ = *slot;
-    }
+    exclude(excluded);
   }
 
   fake_ip_table(const fake_ip_table &) = delete;
   fake_ip_table &operator=(const fake_ip_table &) = delete;
+
+  // Take an address out of circulation for the rest of this table's life.
+  //
+  // Constructor-only exclusion was the gap: the proxy literal is not known
+  // until the user supplies one, and parse_proxy_url accepts ANY dotted IPv4,
+  // so "198.51.100.7:1080" is a legal endpoint that sits inside the range this
+  // table hands out.  Without a runtime hook the table could answer some other
+  // name with the proxy's own address, and every connect to that fake walks
+  // straight back into the proxy -- a loop with nothing in a log to explain it.
+  //
+  // Additive and idempotent: call it as often as you like, for as many
+  // addresses as you like (a proxy can move, and a long-lived injectee learns
+  // more than one endpoint), and each in-range address costs exactly one slot
+  // however many times it is named.  An address outside the range, or the .0
+  // and .255 bytes inside it, is not a slot at all and excludes nothing.
+  //
+  // RETIRING, NOT KEEPING, IS THE DECISION.  If the address is already mapped
+  // to a name when it is excluded, that mapping is retired here, immediately,
+  // and drops any pin with it.  The alternative -- leave a live row alone --
+  // would preserve exactly the state that causes the loop: a name whose fake
+  // IS the proxy, warm in a pin, being connected to right now.  A pin normally
+  // means "somebody is using this", which is why eviction honours it; here the
+  // somebody is using the wrong address, so honouring it honours the bug.
+  // Retiring is also the fail-closed direction for the caller: lookup() of the
+  // excluded address answers "not one of mine" rather than a stale name, the
+  // row cannot be claimed again, and the excluded byte can never be issued
+  // again by any path -- free, LRU or otherwise.  The name that lost the row
+  // is not lost: asking for it again allocates a DIFFERENT fake for it.
+  void exclude(const octets &addr) {
+    const auto slot = fake_ip_slot_of(addr);
+    if (!slot || excluded_[*slot]) {
+      return;  // not issuable anyway, or already out of circulation
+    }
+    excluded_[*slot] = true;
+    ++exclusions_;
+    if (!slots_[*slot].name.empty()) {
+      retire(*slot);  // clears the name and the pin; see the note above
+    }
+  }
+
+  // True when the table has taken this address out of circulation.  Answers
+  // for any octets value, in range or not, so a caller can ask about the
+  // endpoint it was handed without knowing whether it is a fake.
+  bool excluded(const octets &addr) const {
+    const auto slot = fake_ip_slot_of(addr);
+    return slot && excluded_[*slot];
+  }
 
   // The fake for a name, creating the mapping when the name is new.  Stable:
   // asking twice for a name that is still held returns the SAME address, never
@@ -420,10 +467,16 @@ public:
 
   std::size_t quarantine() const { return quarantine_; }
 
-  // Addresses this table can ever hold: the range, minus an in-range exclusion.
+  // Addresses this table can ever hold: the range, minus every in-range
+  // exclusion it has been told about, at construction or afterwards.
   std::size_t capacity() const {
-    return FAKEIP_CAPACITY - (excluded_slot_ ? 1u : 0u);
+    return FAKEIP_CAPACITY - exclusions_;
   }
+
+  // How many addresses are out of circulation.  It is a count rather than the
+  // set because the only question a caller has is "how much did that cost", and
+  // capacity() is that answer already.
+  std::size_t exclusions() const { return exclusions_; }
 
 private:
   std::optional<std::size_t> owned_slot(const octets &fake) const {
@@ -446,10 +499,14 @@ private:
     return std::nullopt;
   }
 
-  // Issuable when nothing is in it, it is not the excluded address, and either
-  // it has never been used or its quarantine has run out.
+  // Issuable when nothing is in it, it is not an excluded address, and either
+  // it has never been used or its quarantine has run out.  This predicate is
+  // where the exclusion bites: find_free() is the only way a row is ever
+  // claimed, it goes through here, and every exclusion -- constructor or
+  // runtime, one row or several -- is therefore honoured on the alloc path
+  // without alloc() having to know anything about it.
   bool claimable(std::size_t i) const {
-    if (excluded_slot_ && *excluded_slot_ == i) {
+    if (excluded_[i]) {
       return false;
     }
     const fake_ip_slot &row = slots_[i];
@@ -502,7 +559,15 @@ private:
 
   std::array<fake_ip_slot, FAKEIP_CAPACITY> slots_{};
   std::size_t quarantine_ = FAKEIP_DEFAULT_QUARANTINE;
-  std::optional<std::size_t> excluded_slot_;
+  // Out-of-circulation marks, one byte per row: a fixed array, no container and
+  // no allocation, and O(1) to consult from claimable().  A row is marked for
+  // the table's whole life, so there is nothing to clear and nothing to leak
+  // when one proxy address is replaced by another.
+  std::array<bool, FAKEIP_CAPACITY> excluded_{};
+  std::size_t exclusions_ = 0;  // rows marked, so capacity() need not count
+  // Both clocks are TICKS, not wall clock: nothing here reads a clock, and
+  // every test drives LRU aging and quarantine expiry by the number of alloc()
+  // calls it makes, which is why there is no injectable time source to add.
   std::uint64_t touch_ = 0;         // LRU clock: every call is a use
   std::uint64_t allocations_ = 0;   // ring clock: every new-name attempt
 };

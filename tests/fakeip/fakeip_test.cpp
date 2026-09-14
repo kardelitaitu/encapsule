@@ -16,9 +16,9 @@
 // Tests for the fake-IP name table (ROADMAP P6a T1 + T2).
 //
 // This is what keeping src/injectee/fakeip.hpp free of winsock buys: the range,
-// the round trip, the eviction order, the quarantine ring and the name rules
-// are all pinned here, on the host, with no process to inject into, no proxy to
-// talk to and no socket ever opened.
+// the round trip, the eviction order, the quarantine ring, the name rules and
+// both forms of the exclusion rule are all pinned here, on the host, with no
+// process to inject into, no proxy to talk to and no socket ever opened.
 
 #include <array>
 #include <cstddef>
@@ -315,6 +315,162 @@ void the_proxys_own_address_is_never_issued() {
   CHECK_EQ(plain.alloc("a.example.com").value_or(octets{}), fake_ip_at(0));
 }
 
+// The gap the P6a review found: an exclusion could only be declared when the
+// table was built, but the proxy literal is only known once parse_proxy_url has
+// answered -- and it accepts ANY dotted IPv4, including one inside this range.
+// So these cases drive exclude() at run time, on an address the table has
+// ALREADY handed out, which is the one that leaves a stale mapping behind.
+void excluding_an_in_use_address_retires_its_mapping() {
+  fake_ip_table table;  // nothing excluded at construction: all of this is late
+  CHECK_EQ(table.capacity(), FAKEIP_CAPACITY);
+  for (std::size_t i = 0; i < 7; ++i) {  // .1 through .7
+    CHECK(table.alloc(host_name(i)).has_value());
+  }
+  const octets proxy{198, 51, 100, 7};
+  CHECK_EQ(table.lookup(proxy).value_or(""), host_name(6));
+  CHECK(table.pin(proxy));  // something is in flight on it, as if connected
+  CHECK(table.pin(proxy));
+  CHECK_EQ(table.pins(proxy), std::size_t(2));
+  CHECK_EQ(table.live_names(), std::size_t(7));
+
+  table.exclude(proxy);
+
+  // Fail-closed: the stale mapping must not survive the exclusion.  A lookup
+  // that kept answering host6 here is the proxy loop, with extra steps.
+  CHECK(!table.lookup(proxy));
+  CHECK(table.excluded(proxy));
+  CHECK_EQ(table.live_names(), std::size_t(6));
+  // Retirement drops the row AND its pins: a pin is not a reason to keep
+  // handing out the proxy's own address, and unpin() then reports "not mine"
+  // instead of underflowing a counter that no longer exists.
+  CHECK_EQ(table.pins(proxy), std::size_t(0));
+  CHECK(!table.pin(proxy));
+  CHECK(!table.unpin(proxy));
+  CHECK_EQ(table.capacity(), FAKEIP_CAPACITY - 1);
+  CHECK_EQ(table.exclusions(), std::size_t(1));
+
+  // Idempotent, in both senses: naming it again costs nothing and retires
+  // nothing a second time.
+  table.exclude(proxy);
+  table.exclude(proxy);
+  CHECK_EQ(table.exclusions(), std::size_t(1));
+  CHECK_EQ(table.capacity(), FAKEIP_CAPACITY - 1);
+  CHECK_EQ(table.live_names(), std::size_t(6));
+
+  // Values that are not rows exclude nothing, in range or out of it -- and the
+  // 0.0.0.0 default is one of them, which is why a plain table is plain.
+  const octets network{198, 51, 100, 0};
+  const octets broadcast{198, 51, 100, 255};
+  const octets test_net3{203, 0, 113, 7};
+  const octets loopback{127, 0, 0, 1};
+  const octets default_addr{};
+  for (const octets &a :
+       {network, broadcast, test_net3, loopback, default_addr}) {
+    table.exclude(a);
+    CHECK(!table.excluded(a));
+  }
+  CHECK_EQ(table.exclusions(), std::size_t(1));
+  CHECK_EQ(table.capacity(), FAKEIP_CAPACITY - 1);
+
+  // The NAME survives; only its fake is gone.  Asking again must land
+  // somewhere else, and .7 must stay dead underneath it.
+  const auto again = table.alloc(host_name(6));
+  CHECK(again.has_value());
+  CHECK(*again != proxy);
+  CHECK_EQ(table.lookup(*again).value_or(""), host_name(6));
+  CHECK(!table.lookup(proxy));
+  CHECK_EQ(table.live_names(), std::size_t(7));
+}
+
+// Never handed out again by any later alloc(): the sweep runs the whole range
+// twice over with an empty ring, so eviction keeps walking the table and the
+// excluded rows are the lowest free slots it would love to land on.
+void a_runtime_exclusion_is_never_issued_again_under_churn() {
+  const octets proxy{198, 51, 100, 7};
+  const octets moved_to{198, 51, 100, 20};  // a second endpoint, later still
+  fake_ip_table table{octets{}, 0};
+  for (std::size_t i = 0; i < 30; ++i) {
+    CHECK(table.alloc(host_name(i)).has_value());
+  }
+  table.exclude(proxy);
+  table.exclude(moved_to);  // additive: two rows, not one replacing the other
+  CHECK_EQ(table.exclusions(), std::size_t(2));
+  CHECK_EQ(table.capacity(), FAKEIP_CAPACITY - 2);
+  CHECK(!table.lookup(proxy));
+  CHECK(!table.lookup(moved_to));
+
+  for (std::size_t i = 0; i < FAKEIP_CAPACITY * 2; ++i) {
+    const auto f = table.alloc(host_name(100 + i));
+    CHECK(f.has_value());
+    if (f) {
+      CHECK(*f != proxy);
+      CHECK(*f != moved_to);
+      CHECK(!table.excluded(*f));  // the table never issues a withheld row
+      CHECK_EQ(table.lookup(*f).value_or(""), host_name(100 + i));
+    }
+  }
+  CHECK_EQ(table.live_names(), table.capacity());
+  CHECK(!table.lookup(proxy));
+  CHECK(!table.lookup(moved_to));
+}
+
+// An exclusion declared late has to behave exactly like one declared up front,
+// and it has to outrank the quarantine ring rather than join it: a row whose
+// wait is over is still not issuable if somebody excluded it.
+void exclusion_at_run_time_matches_the_constructor_and_the_ring() {
+  const octets proxy{198, 51, 100, 7};
+  fake_ip_table built_in{octets{}, 0};
+  built_in.exclude(proxy);  // the same fact, learned after construction
+  fake_ip_table known_up_front{proxy, 0};
+  CHECK_EQ(built_in.capacity(), known_up_front.capacity());
+  for (std::size_t i = 0; i < FAKEIP_CAPACITY; ++i) {  // one more than fits
+    const auto late = built_in.alloc(host_name(i));
+    const auto early = known_up_front.alloc(host_name(i));
+    CHECK_EQ(late.has_value(), early.has_value());
+    if (late && early) {
+      CHECK_EQ(*late, *early);  // the same seam, in the same place
+      CHECK(*late != proxy);
+    }
+  }
+  CHECK(!built_in.lookup(proxy));
+
+  // Now the ring: 4 allocations of quarantine, a row excluded while live, and
+  // a table that fills to its capacity.  The excluded row ages out of the ring
+  // it was retired into -- and must STILL not be issuable.
+  fake_ip_table ring{octets{}, 4};
+  for (std::size_t i = 0; i < FAKEIP_CAPACITY - 1; ++i) {  // .1 .. .254 minus 1
+    CHECK(ring.alloc(host_name(i)).has_value());
+  }
+  const octets third{198, 51, 100, 3};
+  ring.exclude(third);  // live as host2, and the lowest row in the scan order
+  CHECK(!ring.lookup(third));
+  CHECK_EQ(ring.capacity(), FAKEIP_CAPACITY - 1);
+  CHECK_EQ(ring.live_names(), FAKEIP_CAPACITY - 2);
+  const auto spare = ring.alloc("spare.example.com");  // the last untouched row
+  CHECK_EQ(spare.value_or(octets{}), fake_ip_at(FAKEIP_CAPACITY - 1));
+  CHECK_EQ(ring.live_names(), ring.capacity());
+
+  for (std::size_t i = 0; i < 4; ++i) {  // four evictions, four refusals
+    CHECK(!ring.alloc(host_name(900 + i)));
+  }
+  // 254 rows, 5 of them empty now: the 4 the ring just took plus the excluded
+  // one, which is empty forever.
+  CHECK_EQ(ring.live_names(), FAKEIP_CAPACITY - 5);
+  // Four rows in the ring plus the excluded one: quarantined() answers "free
+  // and not issuable", and an excluded row is that forever.
+  CHECK_EQ(ring.quarantined(), std::size_t(5));
+
+  // The fifth attempt wins -- on .1, the first row whose wait ran out, NOT on
+  // .3, whose wait ran out too.  That is the exclusion outranking the ring.
+  const auto aged = ring.alloc("late.example.com");
+  CHECK_EQ(aged.value_or(octets{}), fake_ip_at(0));
+  CHECK(*aged != third);
+  CHECK_EQ(ring.lookup(fake_ip_at(0)).value_or(""),
+           std::string("late.example.com"));
+  CHECK(!ring.lookup(third));
+  CHECK(!ring.pin(third));
+}
+
 void pin_and_unpin_bookkeeping() {
   fake_ip_table table;
   const auto f = table.alloc("www.example.com");
@@ -393,6 +549,9 @@ int main() {
   RUN(quarantined_slot_is_not_reissued_early);
   RUN(churn_never_collides_a_live_name);
   RUN(the_proxys_own_address_is_never_issued);
+  RUN(excluding_an_in_use_address_retires_its_mapping);
+  RUN(a_runtime_exclusion_is_never_issued_again_under_churn);
+  RUN(exclusion_at_run_time_matches_the_constructor_and_the_ring);
   RUN(pin_and_unpin_bookkeeping);
   RUN(names_that_must_stay_local);
   RUN(the_ad_suffix_rule_needs_the_callers_domain);
