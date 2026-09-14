@@ -254,15 +254,21 @@ int main(int argc, char *argv[]) {
   }
 
   bool has_process = false;
-  auto report_injected = [&has_process](DWORD pid) {
-    info("{}: injected", pid);
+  // The resident half is what the line used to promise: the capsule is never
+  // unloaded, so a second inject of an already encapsulated pid 'succeeds' at
+  // the Win32 level and attaches nothing, and "injected" said otherwise.  The
+  // server now answers that from the same call that did the work -- see
+  // inject_result in <server.hpp> -- so the tool reports what happened, with
+  // the same two words the GUI prints for the same verdict.
+  auto report_injected = [&has_process](DWORD pid, bool resident) {
+    info("{}: {}", pid, resident ? "already encapsulated" : "injected");
     has_process = true;
   };
 
   for (auto pid : pids) {
     if (pid > 0) {
-      if (server.inject(pid)) {
-        report_injected(pid);
+      if (const auto outcome = server.inject(pid)) {
+        report_injected(pid, outcome.already_encapsulated());
       }
     }
   }
@@ -270,8 +276,9 @@ int main(int argc, char *argv[]) {
   for (const auto &name : proc_names) {
     injector::pid_by_name_wildcard(name,
                                    [&server, &report_injected](DWORD pid) {
-                                     if (server.inject(pid)) {
-                                       report_injected(pid);
+                                     if (const auto res = server.inject(pid)) {
+                                       report_injected(
+                                           pid, res.already_encapsulated());
                                      }
                                    });
   }
@@ -279,24 +286,25 @@ int main(int argc, char *argv[]) {
   for (const auto &path : proc_paths) {
     injector::pid_by_path_wildcard(path,
                                    [&server, &report_injected](DWORD pid) {
-                                     if (server.inject(pid)) {
-                                       report_injected(pid);
+                                     if (const auto res = server.inject(pid)) {
+                                       report_injected(
+                                           pid, res.already_encapsulated());
                                      }
                                    });
   }
 
   for (const auto &name : proc_re_names) {
     injector::pid_by_name_regex(name, [&server, &report_injected](DWORD pid) {
-      if (server.inject(pid)) {
-        report_injected(pid);
+      if (const auto outcome = server.inject(pid)) {
+        report_injected(pid, outcome.already_encapsulated());
       }
     });
   }
 
   for (const auto &path : proc_re_paths) {
     injector::pid_by_path_regex(path, [&server, &report_injected](DWORD pid) {
-      if (server.inject(pid)) {
-        report_injected(pid);
+      if (const auto outcome = server.inject(pid)) {
+        report_injected(pid, outcome.already_encapsulated());
       }
     });
   }
@@ -304,8 +312,8 @@ int main(int argc, char *argv[]) {
   for (const auto &file : create_paths) {
     DWORD creation_flags = parser.get<bool>("-w") ? CREATE_NEW_CONSOLE : 0;
     if (auto res = create_process(file, creation_flags)) {
-      if (server.inject(res->dwProcessId)) {
-        report_injected(res->dwProcessId);
+      if (const auto outcome = server.inject(res->dwProcessId)) {
+        report_injected(res->dwProcessId, outcome.already_encapsulated());
       }
     }
   }

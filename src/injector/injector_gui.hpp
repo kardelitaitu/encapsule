@@ -256,44 +256,6 @@ inline const char *parse_process_id(const std::string &text, DWORD &out) {
   return nullptr;
 }
 
-// Was the capsule already sitting in this process before the click that is
-// asking?  The DLL is never unloaded, so a second inject of the same pid
-// 'succeeds' at the Win32 level while nothing new attached, and a success
-// line printed for that click would promise an attach that never happened.
-// The injector answers this through the out-param of
-// `injector::inject`, but the GUI injects through `injector_server::inject`,
-// whose pass-through has no such parameter to hand it over; so the probe is
-// taken here instead, the same way the injection path takes it:
-// `IsWow64Process` decides which module list `module_resident` reads, since
-// without TH32CS_SNAPMODULE32 a 64-bit tool cannot see a WoW64 target's
-// 32-bit list at all.  A non-x64 build leaves the flag false, exactly as
-// `inject` does, so the two paths agree about one bitness per platform.
-//
-// UI truth only, which is what makes it cheap: `module_resident` is a
-// report, never a gate.  The same-user target owns its own module list and
-// can refuse the snapshot, come back short, or carry a name that only looks
-// like ours, so nothing here authorizes, permits or refuses anything --
-// authentication stays in token_matches() and the mapping DACL.  When even
-// the bitness is unknowable the answer is `unknown`, not a guessed false,
-// and the caller then says only what it has always said.
-enum class capsule_residency { fresh, resident, unknown };
-
-inline capsule_residency query_capsule_residency(DWORD pid) {
-  BOOL is_wow64 = FALSE;
-#if defined(_WIN64)
-  // PROCESS_QUERY_LIMITED_INFORMATION is all IsWow64Process asks for, so a
-  // target this tool cannot open for injection is still answerable about.
-  handle queried(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
-  if (!queried || !IsWow64Process(queried.get(), &is_wow64)) {
-    return capsule_residency::unknown;
-  }
-#endif
-
-  return injector::module_resident(pid, is_wow64 != FALSE)
-             ? capsule_residency::resident
-             : capsule_residency::fresh;
-}
-
 auto make_controls(injector_server &server, ce::view &view,
                    process_vector &process_vec) {
   using namespace ce;
@@ -450,22 +412,35 @@ auto make_controls(injector_server &server, ce::view &view,
     guarded(
         [&] {
           inject_click([&server, report](DWORD pid) {
-            // Asked before the call, never after it: once the load has run the
-            // module is resident of course, so only the answer taken here says
-            // whether this click is the one that attached.  It cannot change
-            // what the call does -- `resident` gates nothing, and an injection
-            // is never skipped or refused because of it.
-            const auto resident = query_capsule_residency(pid);
+            // One call, one answer.  The verdict is the reason the injection
+            // itself acted on -- the residency was read before the remote
+            // load, by the server that owns the control port and the bitness
+            // question -- so there is nothing left for this click to probe.
+            const auto outcome = server.inject(pid);
 
-            if (!server.inject(pid)) {
+            // One fixed line per refusal, and the two earlier "no" answers
+            // that used to be silent are now said out loud: a click that came
+            // in before do_server had a port, and a second click on a process
+            // already in the list.  Neither is the user's mistake to decode
+            // from a row that did not appear.  Every line here is a literal --
+            // no pid, nothing from the box, and the panel tag is the same one
+            // the backstop below uses.
+            if (outcome.not_started()) {
+              report("[process]", "the server is not listening yet");
+              return false;
+            }
+            if (outcome.already_registered()) {
+              report("[process]", "that process is already in the list");
+              return false;
+            }
+            if (!outcome) {
+              report("[process]", "the capsule did not attach");
               return false;
             }
 
-            // Two fixed sentences, both written here.  `fresh` and `unknown`
-            // share the word this tool printed before it knew anything, so a
-            // question it cannot answer costs only the new half of the
-            // distinction.  No pid and nothing from the box is in either.
-            report("[process]", resident == capsule_residency::resident
+            // The two words the tool has always printed, now chosen by the
+            // answer rather than by a guess taken next to the call.
+            report("[process]", outcome.already_encapsulated()
                                     ? "already encapsulated"
                                     : "injected");
             return true;
