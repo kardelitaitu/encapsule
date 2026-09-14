@@ -58,11 +58,23 @@ CMake >= 3.20, driven by `build.ps1`. Third-party deps are FetchContent-pinned a
   `socks5_handshake` runs the greeting → method-choice → RFC 1929 state machine. Only the socket layer
   defines non-`inline` functions, so the header belongs in exactly one TU per binary ·
   `winnet.hpp` (address helpers).
-  Two **pure, socket-free, host-testable** modules sit beside those and are **not** wired into the
-  hooks yet: `fakeip.hpp` (guard `ENCAPSULE_INJECTEE_FAKEIP`) — the ROADMAP P6 fake-IP name table
+  `fake_map.hpp` (guard `ENCAPSULE_INJECTEE_FAKE_MAP`) sits with them: the P6a S1/S2 layer —
+  `read_fake_addr()` recognizing a TEST-NET-2 fake from a raw `sockaddr` for **both** AF_INET and
+  the v4-mapped AF_INET6 spelling *without* going through `to_ip_addr` (whose v6 storage is
+  REVERSED, see `winnet.hpp`/P4-1), the tri-state `fake_verdict {route_by_name, refuse,
+  passthrough}`, and a single lock-scoped owner for the table. It includes `<winsock2.h>`,
+  `<ws2ipdef.h>` (for `sockaddr_in6`) and `<ws2tcpip.h>` (for `socklen_t`) for LAYOUTS ONLY and
+  calls no winsock function, so it links nothing and, unlike `socks5.hpp`, carries no single-TU
+  trap (proved by linking it into two TUs of one test exe). `in_range` drives refusal, not
+  `issuable`; recovered names come back OWNED because a view would not survive the lock. The S3
+  connect-site wiring is still open, so no fake address is produced or consumed in the product yet.
+  Two **more** host-testable modules sit beside those (three with `fake_map.hpp` above —
+  which, since S2, holds one function-static and a `std::mutex`, so it is testable on the host
+  but is no longer the 'pure data only' kind), and none of them is wired into the hooks yet:
+  `fakeip.hpp` (guard `ENCAPSULE_INJECTEE_FAKEIP`) — the ROADMAP P6 fake-IP name table
   (T1+T2) over TEST-NET-2 / RFC 5737, nothing but `inline`/`constexpr`, no winsock and no
-  `schema.hpp`, so unlike `socks5.hpp` it carries no single-TU trap; the socket-facing layer that
-  feeds it real `sockaddr`/`IpAddr` values is still open. `udp_state.hpp` (guard
+  `schema.hpp`, so unlike `socks5.hpp` it carries no single-TU trap; its socket-facing half is
+  `fake_map.hpp`, and the connect-site wiring (S3) is what is still open. `udp_state.hpp` (guard
   `ENCAPSULE_INJECTEE_UDP_STATE`) — the ROADMAP P7a UDP association / per-socket state (caps, drop
   counters, recycled-`SOCKET` quarantine), sockets travel as `std::uintptr_t`, deliberately **not**
   thread-safe (one pump thread). The client-side `UDP ASSOCIATE` call DOES exist now
@@ -84,9 +96,12 @@ CMake >= 3.20, driven by `build.ps1`. Third-party deps are FetchContent-pinned a
 - `src/wow64/address_dumper.cpp` — Win32-only helper exe; returns the 32-bit `LoadLibraryW` address as
   its **process exit code** (`:22-26`); `#error`s if compiled as x64 (`:18-20`). Name unchanged by P3.
 - `tests/` — host-side CTest suite: `schema/`, `utils/`, `winnet/`, `socks5/`, `queue/`, `fakeip/`,
-  `udp/`, `e2e/` (+ `test_support.hpp`); the **seven** unit dirs each hold one
+  `udp/`, `server/`, `fake_map/`, `e2e/` (+ `test_support.hpp`); the **nine** unit dirs each hold one
   `add_executable(encapsule_test_<mod>)` + one `add_test` (`tests/<mod>/CMakeLists.txt:4`), and
-  `fakeip/` / `udp/` link nothing but the include path — that is the point of those two headers.
+  `fakeip/` / `udp/` / `fake_map/` link nothing but the include path — that is the point of those
+  three headers. `fake_map/` additionally sets `_WIN32_WINNT` in its own CMakeLists rather than
+  inheriting it from `encapsule_common`. `server/` is the one unit dir that includes an injector
+  header (`server.hpp`, hence asio) and it drives `injector_server::open/remove/close` directly.
   `e2e/` additionally builds a decoy exe (`encapsule_e2e_dummy`, :19-27) and a header-only relay
   (`socks5_test_server.hpp`, `require_auth`); `tests/` is not added in the injectee-only pass.
 
@@ -126,14 +141,15 @@ cmake --build build/x64 --config Release -j $env:NUMBER_OF_PROCESSORS   # or: cm
 ctest --test-dir build/x64 -C Release --output-on-failure -E '^e2e\.'   # CI blocking step, build.yml:31
 ```
 
-- Registered tests — **10 on an x64 build, 8 on a Win32 one**. Seven unit: `common.schema`,
-  `common.utils`, `common.queue`, `injectee.winnet`, `injectee.socks5`, `injectee.fakeip`,
-  `injectee.udp` (one `add_test` each at `tests/<mod>/CMakeLists.txt:4`, targets `encapsule_test_<mod>`).
+- Registered tests — **12 on an x64 build, 10 on a Win32 one**. Nine unit: `common.schema`,
+  `common.utils`, `common.queue`, `common.server`, `injectee.winnet`, `injectee.socks5`,
+  `injectee.fakeip`, `injectee.udp`, `injectee.fake_map` (one `add_test` each at
+  `tests/<mod>/CMakeLists.txt:4`, targets `encapsule_test_<mod>`).
   Three e2e, all labelled `e2e` with `RUN_SERIAL`, `TIMEOUT 120`, `SKIP_RETURN_CODE 77`
   (`tests/e2e/CMakeLists.txt:52-53`): `e2e.loopback_selfcheck` (always registered), plus
   `e2e.inject_connect` and `e2e.inject_auth`, both behind `ENCAPSULE_E2E_INJECT` (:58) **and** 64-bit
   (:60-81). Test exes go to `build/<arch>/test_bin/`.
-- CI runs the same split: the blocking step is `ctest -E '^e2e\.'` (the seven unit tests, all four
+- CI runs the same split: the blocking step is `ctest -E '^e2e\.'` (the nine unit tests, all four
   matrix legs), and the x64/Release-only step is `ctest -R '^e2e\.' --repeat until-pass:3`, which now
   covers **all three** e2e tests including the RFC 1929 one (`build.yml:30-35`).
 - Auth coverage, by layer: `injectee.socks5` pins the RFC 1929 **bytes** only (greeting shape +
@@ -186,7 +202,8 @@ reports **732 nodes / 2214 edges**, 47 File nodes, 0 skipped, and packages `inje
 
 ⚠️ **P6/P7-era code may be missing — re-index (`mode=moderate`) before graph queries.** The tree is in
 (it has `tests/socks5/` now), but `src/injectee/fakeip.hpp`, `src/injectee/udp_state.hpp`,
-`tests/fakeip/`, `tests/udp/` and `tests/e2e/` have **no File nodes**, and `docs/` is excluded by design.
+`src/injectee/fake_map.hpp`, `tests/fakeip/`, `tests/udp/`, `tests/fake_map/`, `tests/server/` and
+`tests/e2e/` have **no File nodes**, and `docs/` is excluded by design.
 Live `parse_partial` (5 files, ranges approximate and drifting while `hook.hpp` is edited): `build.ps1`,
 `src/injectee/client.hpp` (:91), `src/injectee/hook.hpp` (:159, :271-273, :358, :473),
 `src/injectee/services.inc` (whole file, :1-292), `src/injector/injector.hpp` (:149). Use `grep`/`read`
@@ -197,6 +214,12 @@ Re-index: `mcp cbm index_repository(repo_path="C:\dev\encapsule", mode="moderate
 
 ## 5. Environment notes
 
+- **Scratch stays inside the project:** any throwaway file — a mutated copy of a header, a probe
+  `.bat`, a captured log, a syntax-probe `.cpp` — goes under `build/` (gitignored via `.gitignore`
+  `/build*`), by convention `build/manager-scratch/`. Never `%TEMP%`, never `C:\temp_*`, never a
+  sibling directory. Two reasons that matter here: a stray copy outside the repo is invisible to the
+  next worker and can silently disagree with the real file, and a *mutation control* only proves
+  something if the reader can re-run it.
 - Windows host, PowerShell for the build wrapper; needs MSVC + Windows SDK discoverable by CMake
   (`build.ps1` shells out to `cmake` only; the VS generator locates MSBuild). `cmake` must be on PATH.
 - C++20 (`CMakeLists.txt:26`), static CRT `MultiThreaded`/`MultiThreadedDebug` (`:28`),
@@ -260,13 +283,16 @@ Re-index: `mcp cbm index_repository(repo_path="C:\dev\encapsule", mode="moderate
 - 2-space indent, no tabs in `src/`; ~80-column style, held by hand — there is
   **no** `.clang-format` at the repo root (the only ones live inside vendored
   deps under the build trees), so nothing enforces the column.
-  Re-measured on the current tree, exactly **1** line of `src/` runs past 80
-  columns (`injector.hpp:191`, 82 chars); the longest line in `injector_gui.hpp`
-  and `fakeip.hpp` is 80. `CMakeLists.txt`/`build.ps1` use tabs.
+  Re-measured on the current tree, **9** lines of `src/` run past 80 columns:
+  **7** in `injector_gui.hpp` (pre-existing `make_tip_below` tooltip strings) and
+  **2** in `fakeip.hpp`. `injector.hpp` is now ≤80 throughout — its one 82-char
+  line was wrapped in the P6/P7 wave — so the old 'exactly 1 over-80 line, in
+  injector.hpp' claim is retired. `CMakeLists.txt`/`build.ps1` use tabs.
 - Includes: `"quoted"` for same-package headers, `<angle>` for stdlib, third-party and `src/common`
   (on the include path, so `<utils.hpp>` and `"utils.hpp"` both appear).
-- Header guards `ENCAPSULE_<PKG>_<NAME>` — all **19** `.hpp` headers under `src/` (now including
-  `fakeip.hpp` → `ENCAPSULE_INJECTEE_FAKEIP`, `udp_state.hpp` → `ENCAPSULE_INJECTEE_UDP_STATE`) plus
+- Header guards `ENCAPSULE_<PKG>_<NAME>` — all **20** `.hpp` headers under `src/` (now including
+  `fakeip.hpp` → `ENCAPSULE_INJECTEE_FAKEIP`, `udp_state.hpp` → `ENCAPSULE_INJECTEE_UDP_STATE`,
+  `fake_map.hpp` → `ENCAPSULE_INJECTEE_FAKE_MAP`) plus
   `version.hpp.in` use it; no stragglers. `services.inc` has no guard by design (X-macro table
   included inside `hook.hpp`). No `#pragma once` anywhere.
 - Every source file starts with the Apache-2.0 `// Copyright 2022 PragmaTwice` block (**28/28** files
