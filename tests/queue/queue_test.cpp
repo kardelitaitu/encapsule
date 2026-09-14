@@ -23,69 +23,112 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstdio>
 #include <exception>
+#include <memory>
 #include <thread>
 #include <vector>
 
 // blocking_queue<T> is a std::queue guarded by a channel<void(error_code)>.
-// Every scenario below runs on its own io_context, started with asio::co_spawn
-// and bounded by a steady_timer watchdog, so a stuck channel fails the test
-// instead of hanging CI.  The per-scenario budget keeps the common case (a
-// channel that wakes again) well inside the 60s TIMEOUT set on common.queue.
-// Caveat for the bounded-push scenarios below: a push() that really wedges
-// takes the single io thread with it, so no watchdog can fire and that failure
-// lands as the CTest timeout instead of a scenario FAIL -- still a red build.
+// Every scenario below runs on its own io_context ON ITS OWN THREAD and is
+// bounded by an alarm armed on the test's main thread, so both a stuck channel
+// and a producer call that blocks synchronously fail as a NAMED scenario
+// instead of turning into a ctest-level TIMEOUT (see run_scenario).
+//
+// kScenarioCount x kWatchdogMs + margin is the arithmetic tests/queue/
+// CMakeLists.txt uses for common.queue's TIMEOUT, and main() checks
+// kScenarioCount against the scenarios it actually ran -- the two numbers are
+// coupled by a failing test, not by a comment.
 namespace {
 
 constexpr int kWatchdogMs = 8000;
+constexpr int kScenarioCount = 12;
 constexpr int kItems = 64;
 constexpr int kSentinel = -7;
 
-struct scenario {
+// One scenario: its own io_context, its own io thread, and an alarm that does
+// NOT live on that io thread.
+//
+// That separation is the whole point.  The regression this suite exists to
+// catch is a push() that blocks synchronously (a hooked winsock call in a
+// foreign process must never wait for a report nobody is reading), and a timer
+// armed on the SAME io_context as the blocked call can never fire -- the
+// blocked thread is the only thing that would run it.  The previous shape
+// therefore turned a wedging producer into the CTest TIMEOUT on common.queue,
+// a failure with no scenario name attached.  Here the deadline is a
+// condition_variable wait on the test's main thread, which keeps running while
+// the io thread is wedged, so the scenario fails BY NAME.
+struct scenario_state {
   asio::io_context ctx;
-  asio::steady_timer watchdog;
-  bool timed_out;
-  std::exception_ptr error;
-
-  scenario() : ctx(), watchdog(ctx), timed_out(false), error() {}
-
-  scenario(const scenario &) = delete;
-  scenario &operator=(const scenario &) = delete;
+  std::mutex m;
+  std::condition_variable cv;
+  bool done;                    // guarded by m
+  std::exception_ptr error;     // guarded by m
+  bool finished;                // written by the main thread only
 };
 
-// Runs `body` (an awaitable taking the io_context) until it finishes or the
-// watchdog expires; whichever happens first stops the context.
+// Scenarios actually started, so main() can prove the TIMEOUT arithmetic in
+// tests/queue/CMakeLists.txt still matches the file it is sized for.  Plus the
+// scenarios whose io thread had to be abandoned: main() ends the run with
+// _Exit() when that count is non-zero (see the note there).
+int scenarios_run = 0;
+int scenarios_abandoned = 0;
+
+// Runs `body` (an awaitable taking the io_context) on its own io thread until
+// it finishes or kWatchdogMs expires, whichever happens first.
 template <typename Body>
 void run_scenario(const char *name, Body body) {
-  scenario s;
+  // shared_ptr rather than a stack object, because a timed-out io thread is
+  // DETACHED and keeps this alive: joining it would reintroduce the very hang
+  // the alarm exists to escape.  The leak is deliberate and only ever happens
+  // on a scenario that has already failed.
+  auto s = std::make_shared<scenario_state>();
+  ++scenarios_run;
 
-  s.watchdog.expires_after(std::chrono::milliseconds(kWatchdogMs));
-  s.watchdog.async_wait([&s](asio::error_code ec) {
-    if (!ec) {
-      s.timed_out = true;
-      s.ctx.stop();
+  asio::co_spawn(s->ctx, body(s->ctx), [s](std::exception_ptr e) {
+    {
+      std::lock_guard<std::mutex> lock(s->m);
+      s->error = e;
+      s->done = true;
     }
+    s->ctx.stop();
+    s->cv.notify_all();
   });
 
-  asio::co_spawn(s.ctx, body(s.ctx), [&s](std::exception_ptr e) {
-    s.error = e;
-    s.ctx.stop();
-  });
+  std::thread io([s] { s->ctx.run(); });
 
-  s.ctx.run();
-  s.watchdog.cancel();
+  {
+    std::unique_lock<std::mutex> lock(s->m);
+    s->finished = s->cv.wait_for(lock, std::chrono::milliseconds(kWatchdogMs),
+                                 [s] { return s->done; });
+  }
 
-  CHECK(!s.timed_out);
-  if (s.timed_out) {
-    std::printf("  [%s] watchdog expired after %dms: channel stuck\n", name,
+  if (s->finished) {
+    io.join();
+  } else {
+    s->ctx.stop(); // releases a parked loop; useless against a wedged call
+    io.detach();   // never join the thread we are about to report as hung
+    ++scenarios_abandoned;
+  }
+
+  CHECK(s->finished); // the failure is counted here...
+  if (!s->finished) { // ...this only names the scenario that produced it
+    std::printf("FAIL [%s] still running after %dms -- a producer/consumer is"
+                " stuck; named here instead of by the ctest TIMEOUT\n", name,
                 kWatchdogMs);
   }
 
-  CHECK(!s.error);
-  if (s.error) {
+  std::exception_ptr error;
+  {
+    std::lock_guard<std::mutex> lock(s->m);
+    error = s->error;
+  }
+  CHECK(!error);
+  if (error) {
     try {
-      std::rethrow_exception(s.error);
+      std::rethrow_exception(error);
     } catch (const asio::system_error &e) {
       std::printf("  [%s] unexpected asio::system_error %s:%d (%s)\n", name,
                   e.code().category().name(), e.code().value(), e.what());
@@ -727,5 +770,29 @@ int main() {
   RUN(test_capacity_is_a_sliding_window);
   RUN(test_push_after_cancel_wakes_a_later_waiter);
   RUN(test_default_capacity_stays_unbounded);
+
+  // Keep the ctest TIMEOUT honest: it is sized as kScenarioCount x
+  // kWatchdogMs + margin.  A 13th RUN() line that leaves both numbers alone is
+  // how a named scenario FAIL silently goes back to being an anonymous
+  // timeout, so the coupling is checked here rather than trusted to a comment.
+  if (scenarios_run != kScenarioCount) {
+    ++test_failures;
+    std::printf("FAIL ran %d scenarios but kScenarioCount is %d; the TIMEOUT"
+                " in tests/queue/CMakeLists.txt must move with it"
+                "  (%d x %dms + margin)\n",
+                scenarios_run, kScenarioCount, kScenarioCount, kWatchdogMs);
+  }
+  // An abandoned io thread is parked inside a call the test has already
+  // reported as hung, and it is still holding whatever that call had locked --
+  // a mutex, an asio channel, a std::thread it is joining.  The scenario
+  // verdicts above are complete and printed, but an orderly return from main
+  // can then wait on those locks forever, which would put us straight back
+  // where we started: a ctest TIMEOUT with the names buried in the log.  So
+  // flush and leave by the door that cannot block, and let the exit code be
+  // the failure count.
+  if (scenarios_abandoned) {
+    std::fflush(stdout);
+    std::_Exit(static_cast<unsigned>(test_failures));
+  }
   return test_failures;
 }
