@@ -13,21 +13,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The sockaddr half of the fake-IP design (ROADMAP P6a S1): recognise a
-// fabricated address on its way out of a victim process, and turn it, together
-// with the table's answer, into the three-way decision a connect site makes.
+// The sockaddr half of the fake-IP design (ROADMAP P6a S1 + S2): recognise a
+// fabricated address on its way out of a victim process, turn it, together with
+// the table's answer, into the three-way decision a connect site makes, and own
+// the one table those decisions are taken against.
 //
 // PURE AND HOST-TESTABLE.  No winsock function is called anywhere in here:
 // <winsock2.h> is included for the address LAYOUTS only (sockaddr,
 // sockaddr_in, sockaddr_in6, sockaddr_storage, socklen_t), which is what lets a
 // test hand this layer a byte buffer on the stack and never open a socket --
-// the same deal tests/fakeip and tests/udp have with their headers.  No global,
-// no lock, no allocation, no thread assumption, no config: the table's answer
-// and the "is a proxy configured" flag arrive as PARAMETERS, because
-// load_scope(), the stream-classification gate and the table's owner belong to
-// the caller (S3 wires it).  Everything is inline or constexpr, so unlike
-// socks5.hpp there is no single-TU trap -- any number of translation units in
-// one binary may include this header.
+// the same deal tests/fakeip and tests/udp have with their headers.  The
+// recognizer (read_fake_addr) and the policy (fake_connect_verdict) are pure
+// functions of their arguments: no global, no lock, no allocation, no thread
+// assumption, no config -- the table's answer and the "is a proxy configured"
+// flag arrive as PARAMETERS, because load_scope(), the stream-classification
+// gate and the do-not-fake name rules belong to the caller (S3 wires them).
+// fake_ip_owner (S2) is the one class here that holds a mutex, and it is the
+// only thing that touches a table.  Every function in this header is inline or
+// constexpr, so unlike socks5.hpp there is no single-TU trap: any number of
+// translation units in one binary may include it, and they all share the one
+// owner.
 //
 // WHY IT READS THE OCTETS ITSELF (the V6 TRAP, ROADMAP P6).  winnet.hpp's
 // to_ip_addr STORES a v6 address REVERSED while to_asio and
@@ -70,6 +75,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -298,6 +304,18 @@ struct fake_connect_decision {
   fake_addr_read addr;    // what the sockaddr said, whatever the verdict
 };
 
+// The same decision for a caller that is about to CROSS A LOCK RELEASE -- i.e.
+// the owner's decide().  The name is a std::string, because an answer taken
+// under the table's mutex has to outlive that mutex: the next alloc() can
+// retire, clear, re-claim or destroy the row a view pointed at, and by then the
+// lock is gone and nothing can stop it.  So this is the shape S3 hands to
+// socks5_request: an owned name, a port and an address that is not used.
+struct fake_owned_decision {
+  fake_verdict verdict = fake_verdict::passthrough;
+  std::string name;  // OWNED; non-empty ONLY for route_by_name
+  fake_addr_read addr;
+};
+
 // The policy, as a pure function of the two facts the caller brings.  Four
 // rules, in this order, and the order is the design:
 //
@@ -361,5 +379,267 @@ inline fake_addr_read fake_addr_read_of(const std::array<std::uint8_t, 4> &v4,
   fake_map_detail::fake_map_classify(out);
   return out;
 }
+
+// --------------------------------------------------------------- the owner
+
+// One fake_ip_table, one mutex, one accessor.  This is the whole of P6a S2:
+// the piece that decides WHERE the table lives and WHO may hold it, so that S3
+// can wire the connect sites without inventing a fourth global.
+//
+// WHY A FUNCTION STATIC AND NOT A GLOBAL (the C4 lesson, stated in full).  The
+// three scope-bound globals hook.hpp reads -- queue, config, nbio_map -- are
+// POINTERS that do_client() publishes and retires through scope_ptr_bind, so
+// one thread swaps them while another is inside a detour.  That is what forced
+// every read through load_scope(), and it is what made the startup window a
+// real state a detour can observe: null, or the previous run's object.  A
+// fake_ip_table cannot be spelled that way.  It is 254 rows plus two clocks,
+// non-copyable, non-rebindable, so the only thing to publish is its ADDRESS,
+// and an address that never changes is not a hazard -- it is a fact.  So the
+// object is a function-local static behind an inline accessor:
+//
+//   * residency by construction -- the first call to instance() builds it, and
+//     nothing can un-build it.  There is no window in which the table is
+//     missing, therefore no null check, no acquire, no "not yet configured".
+//   * the injectee is resident by design (it is never unloaded, no FreeLibrary
+//     path exists), so the object is never retired while a victim thread could
+//     still be inside a detour.  The C4 problem was a live object being taken
+//     away; this one cannot be taken away.
+//   * the accessor is defined inside the class body, hence implicitly inline,
+//     and a local static in an inline function is ONE object for the whole
+//     binary ([basic.stc.static]) -- not one per translation unit.  That is
+//     the difference from a static file-scope object, and it is why no TU
+//     gets a private table that quietly disagrees with the shared one.
+//   * std::mutex has no copy, no rebind and no "swap in a new proxy", so the
+//     lock a row is claimed under is the same lock it is retired under for
+//     the life of the process.
+//
+// WHAT THE LOCK IS AND IS NOT ALLOWED TO COVER.  Every method here takes
+// mutex_ once, with a lock_guard, and calls straight into fake_ip_table.  The
+// one rule that keeps that true is that NO CALL IS EVER MADE INTO THIS CLASS
+// WHILE ITS MUTEX IS HELD: where an overload delegates (the sockaddr forms, the
+// uint32 exclusion), the delegation happens BEFORE the lock is taken -- the
+// recognizer and the policy are pure, so the buffer can be decoded outside the
+// critical section and handed in.  std::mutex is not recursive, so a
+// re-entrant call would be a deadlock rather than an error message, and a
+// deadlock inside a victim's connect detour is the worst failure this DLL can
+// produce; that is why the rule is stated here, why every delegating overload
+// is annotated, and which invariant the S2 mutation test exists to prove.
+//
+// Nothing in a critical section touches a socket, an event, a file, a
+// registry key or the injector: the whole of it is 254-row scans, byte
+// copies and the two address predicates.  It is NOT allocation
+// free and the comment in fakeip.hpp is the reason -- a row name is a
+// std::string, so alloc() assigns one and lookup() copies one, and either can
+// throw std::bad_alloc.  That is the honest shape: the only thing that can
+// block a holder of this mutex is a malloc that has to grow the heap, on a
+// row that is a dozen bytes.  A detour must not let bad_alloc escape into the
+// victim, so S3 catches it around these calls and fails the connect closed;
+// the lock_guard means the mutex is released on that unwinding either way.
+//
+// WHAT COMES BACK IS OWNED, NEVER BORROWED.  lookup() hands back a
+// std::optional<std::string> and decide() a std::string, both copies.  A
+// string_view into a row is a view into memory that the NEXT alloc() can
+// retire, clear, re-claim for another name, or destroy -- and the caller has
+// already dropped the lock by then, so the table cannot stop it.  That is the
+// same class of bug the quarantine ring exists to prevent, moved from the
+// network to the address space.  S1's fake_connect_decision still carries a
+// view, because it is built from a caller-supplied row inside one expression;
+// the owner's decide() is the one that crosses a lock release, so it copies.
+//
+// WHAT IS DELIBERATELY NOT HERE.  No config, no load_scope(), no proxy
+// endpoint, no socket type, no no_fake_name() gate: whether a proxy is
+// configured and whether a name may be faked at all are the caller's
+// decisions, made before it reaches this class, and proxy_configured arrives
+// as a parameter.  Keeping them out is what lets the owner be built before
+// any configuration exists -- which is exactly the startup window the dossier
+// refuses to black-hole.
+class fake_ip_owner {
+public:
+  // The same type as fake_addr_read::v4 and fake_ip_table::octets: four octets
+  // in wire order.  Named here so the signatures below fit the column.
+  using octets = fake_ip_table::octets;
+
+  // A test builds its own owner with its own ring length; production uses
+  // instance().  The default quarantine is fakeip.hpp's, not a second number
+  // to keep in sync.
+  explicit fake_ip_owner(
+      std::size_t quarantine = FAKEIP_DEFAULT_QUARANTINE)
+      : table_(octets{}, quarantine) {}
+
+  fake_ip_owner(const fake_ip_owner &) = delete;
+  fake_ip_owner &operator=(const fake_ip_owner &) = delete;
+
+  // THE accessor.  One object per binary, alive from the first call to
+  // process exit.  Nothing else in the DLL needs to know it exists.
+  static fake_ip_owner &instance() {
+    static fake_ip_owner owner;
+    return owner;
+  }
+
+  // The fake for a name, or nullopt when the table has nothing to give (every
+  // slot pinned, or the ring draining).  The answer is a fake_addr_read, i.e.
+  // the same shape read_fake_addr produces for a buffer, so the resolve side
+  // and the connect side hand each other one type and cannot disagree about
+  // whether it is in range.  The port stays 0: a fake carries no port, the
+  // caller keeps the one it was given.
+  //
+  // Not gated by no_fake_name() -- see WHAT IS DELIBERATELY NOT HERE.
+  std::optional<fake_addr_read> alloc_for(std::string_view name) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto issued = table_.alloc(name);
+    if (!issued) {
+      return std::nullopt;
+    }
+    return fake_addr_read_of(*issued, 0);
+  }
+
+  // The name a fake was issued for, as a COPY, or nullopt for "never issued",
+  // "already retired" and "not one of ours" alike.  This is the call the
+  // connect sites make; the returned optional owns its bytes, so the caller
+  // can drop the lock, build a socks5 request, and still have the name.
+  std::optional<std::string> lookup(const octets &fake) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return table_.lookup(fake);
+  }
+
+  // The same question from the buffer a connect site was handed.  The
+  // recognizer decides what to ask the table for, so a native v6 or a short
+  // buffer is answered without a lookup at all.
+  std::optional<std::string> lookup(const sockaddr *name, socklen_t len) {
+    const auto addr = read_fake_addr(name, len);  // pure: no lock needed
+    if (!addr.in_range) {
+      return std::nullopt;
+    }
+    return lookup(addr.v4);
+  }
+
+  // In flight bookkeeping.  Both are false for an address the table does not
+  // currently hold, and unpin never underflows (fakeip.hpp owns that rule).
+  bool pin(const octets &fake) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return table_.pin(fake);
+  }
+
+  bool unpin(const octets &fake) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return table_.unpin(fake);
+  }
+
+  std::size_t pins(const octets &fake) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return table_.pins(fake);
+  }
+
+  // Keep a name at the top of the LRU because a connection using it is still
+  // alive.  False when there is no row to warm.
+  bool note_touched(const octets &fake) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return table_.note_touched(fake);
+  }
+
+  bool note_touched(const sockaddr *name, socklen_t len) {
+    const auto addr = read_fake_addr(name, len);  // pure: no lock needed
+    if (!addr.in_range) {
+      return false;
+    }
+    return note_touched(addr.v4);
+  }
+
+  // The tick the pump and the connect path advance.  Not a std::function, not
+  // a clock read, not a thread: the caller says "time passed" and how much, and
+  // the ring moves by that many allocations.  Returns the new clock value.
+  std::uint64_t forward_progress(std::size_t ticks = 1) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return table_.note_progress(ticks);
+  }
+
+  // The runtime exclusion, so the front-end path that sets an endpoint calls
+  // one thing.  Both spellings are the same address: the octets form, and the
+  // uint32 an IpAddr carries (fakeip.hpp's fake_ip_from_u32 decodes it, so a
+  // caller holding parse_proxy_url's answer needs no bit_cast and no ntohl).
+  // Additive and idempotent; if the address was mapped, the row is RETIRED
+  // here -- the fail-closed direction fakeip.hpp argues for, and the reason a
+  // proxy moving into the range cannot leave a live loop behind.
+  void exclude_proxy(const octets &fake) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    table_.exclude(fake);
+  }
+
+  void exclude_proxy(std::uint32_t v4_value) {
+    exclude_proxy(fake_ip_from_u32(v4_value));  // pure, and never re-locks
+  }
+
+  bool excludes(const octets &fake) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return table_.excluded(fake);
+  }
+
+  // The counters a report line wants, all under the same lock as the rows.
+  std::size_t live_names() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return table_.live_names();
+  }
+
+  std::size_t quarantined() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return table_.quarantined();
+  }
+
+  std::size_t exclusions() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return table_.exclusions();
+  }
+
+  std::size_t capacity() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return table_.capacity();
+  }
+
+  std::size_t quarantine() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return table_.quarantine();
+  }
+
+  // THE CONNECT SITES' ONE CALL: recognise the buffer, ask the table, apply
+  // the S1 policy, and hand back an OWNED name.  proxy_configured is the
+  // caller's -- it is read from load_scope() outside this lock, which is what
+  // keeps the two locks (this mutex and the config's own) from ever nesting.
+  fake_owned_decision decide(const fake_addr_read &addr,
+                             bool proxy_configured) {
+    fake_owned_decision out;
+    out.addr = addr;
+
+    // Cheap and lock-free first: most connects are to addresses that are not
+    // ours, and taking a mutex for one of those would serialise the whole
+    // process behind traffic this table has no opinion about.
+    if (!addr.in_range) {
+      out.verdict = fake_verdict::passthrough;
+      return out;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto row = table_.lookup(addr.v4);
+    const auto pure = fake_connect_verdict(
+        addr, fake_table_answer::from_lookup(row), proxy_configured);
+    out.verdict = pure.verdict;
+    if (pure.verdict == fake_verdict::route_by_name && row) {
+      out.name = *row;  // the copy that makes this safe to return
+    }
+    return out;
+  }
+
+  fake_owned_decision decide(const sockaddr *name, socklen_t len,
+                             bool proxy_configured) {
+    // The recognizer is pure, so read it before the lock and pass the result
+    // in; this keeps the critical section to one lookup and one copy.
+    return decide(read_fake_addr(name, len), proxy_configured);
+  }
+
+private:
+  fake_ip_table table_;
+  // Guards table_ and nothing else.  Declared after it so the destruction
+  // order (mutex first, table second) is the one a static teardown wants.
+  std::mutex mutex_;
+};
 
 #endif  // ENCAPSULE_INJECTEE_FAKE_MAP

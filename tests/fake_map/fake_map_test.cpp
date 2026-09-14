@@ -22,17 +22,24 @@
 // "proxy configured" flag arrive as arguments.  So the cases that only ever
 // happen inside a victim process -- a sockaddr shorter than the struct it
 // claims to be, a v6 answer that is not a mapped v4, a fake whose row was
-// evicted -- are ordinary unit tests here.
+// evicted -- are ordinary unit tests here.  The second half of the file
+// (P6a S2) covers the single owner: one table, one mutex, one accessor, OWNED
+// answers, and the two clock entry points a resident process needs.  It is
+// still nothing but a byte buffer and a std::thread -- the mutex is the only
+// new machine, and no socket is opened anywhere in either half.
 
 #include <winsock2.h>  // the address layouts, exactly as fake_map.hpp sees them
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include <fake_map.hpp>
@@ -750,6 +757,382 @@ void a_domain_shaped_verdict_is_all_the_fake_path_leaves_behind() {
   CHECK_EQ(passed, std::size_t(0));
 }
 
+// ------------------------------------------------------------- the owner (S2)
+
+void the_owner_is_one_object_for_the_whole_binary() {
+  // The residency claim, checked: one accessor, one object, no window where it
+  // is missing.  A second call through a function pointer keeps the compiler
+  // from folding the two reads into one.
+  fake_ip_owner &a = fake_ip_owner::instance();
+  auto *through = +[] { return &fake_ip_owner::instance(); };
+  fake_ip_owner *b = through();
+  CHECK_EQ(&a, b);
+  CHECK_EQ(a.capacity(), FAKEIP_CAPACITY);
+  CHECK_EQ(a.quarantine(), FAKEIP_DEFAULT_QUARANTINE);
+  CHECK_EQ(a.exclusions(), std::size_t(0));
+  // The singleton is not the only usable owner: a test (or a second table,
+  // if a design ever wanted one) builds its own.  Everything stateful below
+  // runs against a local owner so no scenario depends on the order of another.
+  fake_ip_owner local;
+  CHECK_EQ(local.capacity(), FAKEIP_CAPACITY);
+  CHECK(&local != b);
+}
+
+void alloc_for_answers_in_the_shape_the_recognizer_reads() {
+  fake_ip_owner owner;
+  const auto first = owner.alloc_for("one.example.com");
+  CHECK(first.has_value());
+  if (!first) {
+    return;
+  }
+  CHECK(first->readable);
+  CHECK(first->in_range);
+  CHECK(first->issuable);
+  CHECK_EQ(first->slot, std::size_t(0));  // the fresh rows fill from slot 0
+  CHECK_EQ(first->port, std::uint16_t(0));  // a fake carries no port
+
+  // A sockaddr built from that answer is recognised as the same fake: the
+  // resolve side and the connect side hand each other one type and cannot
+  // disagree about what is in range.
+  const auto m = make_v4(first->v4, 443);
+  const auto r = read_fake_addr(m.addr(), m.len);
+  CHECK_EQ(r.slot, first->slot);
+  CHECK_EQ(r.in_range, first->in_range);
+  CHECK_EQ(r.issuable, first->issuable);
+  CHECK_EQ(r.v4, first->v4);
+
+  // Stable: asking twice for a live name gets the SAME address, not a second
+  // one, because an application that resolves twice must not find its host in
+  // two places.
+  const auto again = owner.alloc_for("one.example.com");
+  CHECK(again.has_value());
+  CHECK_EQ(again->v4, first->v4);
+
+  // An empty name is nothing to issue an address for.
+  CHECK(!owner.alloc_for("").has_value());
+}
+
+void a_name_comes_back_owned_after_its_row_is_gone() {
+  // THE OWNERSHIP RULE, as a test rather than a comment: whatever the owner
+  // hands back has to survive the table destroying the row it came from.
+  fake_ip_owner owner;
+  const std::string name = "keep-me.example.com";
+  const auto fake = owner.alloc_for(name);
+  CHECK(fake.has_value());
+  if (!fake) {
+    return;
+  }
+
+  const auto row = owner.lookup(fake->v4);
+  CHECK(row.has_value());
+  CHECK_EQ(*row, name);
+
+  // Retire the row out from under the answer: exclude() clears the row string
+  // IN PLACE, so a borrowed view would now read as empty -- or worse, point at
+  // a different name after a re-claim.  The copy cannot be moved by any of it.
+  owner.exclude_proxy(fake->v4);
+  CHECK(!owner.lookup(fake->v4).has_value());
+  CHECK_EQ(*row, name);
+  CHECK_EQ(row->size(), name.size());
+
+  // And the sockaddr-shaped lookup sees the same thing, from both spellings.
+  const auto m4 = make_v4(fake->v4, 443);
+  const auto m6 = make_mapped(fake->v4, 443);
+  CHECK(!owner.lookup(m4.addr(), m4.len).has_value());
+  CHECK(!owner.lookup(m6.addr(), m6.len).has_value());
+  CHECK(owner.excludes(fake->v4));
+}
+
+void pins_travel_through_the_lock_and_never_underflow() {
+  fake_ip_owner owner;
+  const auto fake = owner.alloc_for("pinned.example.com");
+  CHECK(fake.has_value());
+  if (!fake) {
+    return;
+  }
+  CHECK_EQ(owner.pins(fake->v4), std::size_t(0));
+  CHECK(owner.pin(fake->v4));
+  CHECK_EQ(owner.pins(fake->v4), std::size_t(1));
+  CHECK(owner.pin(fake->v4));  // a second connect to the same host
+  CHECK_EQ(owner.pins(fake->v4), std::size_t(2));
+  CHECK(owner.unpin(fake->v4));
+  CHECK(owner.unpin(fake->v4));
+  CHECK_EQ(owner.pins(fake->v4), std::size_t(0));
+  // An unbalanced release is refused, not wrapped.
+  CHECK(!owner.unpin(fake->v4));
+  CHECK_EQ(owner.pins(fake->v4), std::size_t(0));
+  // And an address the owner holds nothing for is not pinnable at all.
+  CHECK(!owner.pin(REAL));
+  CHECK(!owner.unpin(REAL));
+  CHECK_EQ(owner.pins(REAL), std::size_t(0));
+}
+
+void note_touched_keeps_the_name_still_in_use() {
+  // quarantine = 0 so the ring cannot hide the LRU effect being measured:
+  // the only ordering left is the touch clock, which is what this is about.
+  fake_ip_owner owner(0);
+  std::vector<fake_addr_read> held;
+  for (std::size_t i = 0; i < FAKEIP_CAPACITY; ++i) {
+    const auto issued = owner.alloc_for(host(i));
+    if (!issued) {
+      ++test_failures;
+      return;
+    }
+    held.push_back(*issued);
+  }
+  CHECK_EQ(owner.live_names(), FAKEIP_CAPACITY);
+
+  // The first name is the oldest.  Touch it -- as a live connection would on
+  // every connect it makes with that fake -- and the next eviction must take
+  // the SECOND row instead.
+  CHECK(owner.note_touched(held[0].v4));
+  const auto warmed = make_v4(held[0].v4, 443);
+  CHECK(owner.note_touched(warmed.addr(), warmed.len));  // the buffer form
+  const auto stranger = owner.alloc_for("stranger.example.com");
+  CHECK(stranger.has_value());
+  if (!stranger) {
+    return;
+  }
+  // Freed and, with a zero-length ring, re-issued in the same breath: the
+  // newcomer lands on the row that was just evicted -- held[1], because
+  // held[0] was touched and is no longer the least recently used.
+  CHECK_EQ(stranger->v4, held[1].v4);
+  // Named optionals throughout: an "auto &&" bound to *owner.lookup(...) would
+  // name a string inside an optional that dies at the end of the statement.
+  const auto kept = owner.lookup(held[0].v4);
+  CHECK(kept.has_value());
+  CHECK_EQ(*kept, host(0));  // still the name it was issued for
+  const auto taken = owner.lookup(stranger->v4);
+  CHECK(taken.has_value());
+  CHECK_EQ(*taken, std::string("stranger.example.com"));  // not host(1)
+
+  // Warming something that is not a row says so.
+  CHECK(!owner.note_touched(REAL));
+  const auto real = make_v4(REAL, 443);
+  CHECK(!owner.note_touched(real.addr(), real.len));
+}
+
+void forward_progress_is_the_only_thing_that_drains_the_ring() {
+  fake_ip_owner owner;  // the shipped ring length, 127 allocations
+  CHECK_EQ(owner.quarantine(), FAKEIP_DEFAULT_QUARANTINE);
+  for (std::size_t i = 0; i < FAKEIP_CAPACITY; ++i) {
+    if (!owner.alloc_for(host(i))) {
+      ++test_failures;
+      return;
+    }
+  }
+
+  // Full, and nothing pinned: the first attempt retires the LRU row and is
+  // itself refused, because the slot it freed is in quarantine.
+  CHECK(!owner.alloc_for("newcomer.example.com").has_value());
+  CHECK_EQ(owner.quarantined(), std::size_t(1));
+  // Idleness does not drain it.  Five more attempts advance the clock by five
+  // ticks of their own -- nowhere near the ring -- and retire five more rows.
+  for (int i = 0; i < 5; ++i) {
+    CHECK(!owner.alloc_for("newcomer.example.com").has_value());
+  }
+  CHECK_EQ(owner.quarantined(), std::size_t(6));
+
+  // The caller says time passed, and the oldest quarantine expires.  This is
+  // the seam a process that stops resolving still needs: without it the ring
+  // freezes at whatever the last allocation was and half the range is gone.
+  owner.forward_progress(FAKEIP_DEFAULT_QUARANTINE);
+  const auto after = owner.alloc_for("newcomer.example.com");
+  CHECK(after.has_value());
+  if (after) {
+    // It lands on the row retired FIRST -- host(0) was the oldest, and the
+    // scan for a claimable slot runs from index 0.
+    CHECK_EQ(after->v4, fake_ip_at(0));
+    const auto row = owner.lookup(after->v4);
+    CHECK(row.has_value());
+    CHECK_EQ(*row, std::string("newcomer.example.com"));
+    // host(0) is gone: the address it used is somebody else's now, and
+    // the buffer form of the lookup agrees with the octet form.
+    const auto buffer = make_v4(fake_ip_at(0), 443);
+    const auto by_buffer = owner.lookup(buffer.addr(), buffer.len);
+    const auto by_octets = owner.lookup(fake_ip_at(0));
+    CHECK(by_buffer.has_value());
+    CHECK(by_octets.has_value());
+    CHECK_EQ(*by_buffer, *by_octets);
+    CHECK(*by_octets != host(0));
+  }
+  // A zero-length advance moves nothing, and the counter is the caller's to
+  // read back.
+  const auto before = owner.forward_progress(0);
+  CHECK_EQ(owner.forward_progress(0), before);
+}
+
+void excluding_the_proxy_in_the_range_costs_exactly_one_slot() {
+  fake_ip_owner owner;
+  const auto fake = owner.alloc_for("loop.example.com");
+  CHECK(fake.has_value());
+  if (!fake) {
+    return;
+  }
+  CHECK_EQ(owner.capacity(), FAKEIP_CAPACITY);
+
+  // The front-end path knows the endpoint as the uint32 an IpAddr carries.
+  owner.exclude_proxy(fake_ip_to_u32(fake->v4));
+  CHECK(owner.excludes(fake->v4));
+  CHECK_EQ(owner.exclusions(), std::size_t(1));
+  CHECK_EQ(owner.capacity(), FAKEIP_CAPACITY - 1);
+  // Retiring, not keeping: the row that named the proxy is gone at once.
+  CHECK(!owner.lookup(fake->v4).has_value());
+
+  // Idempotent, both spellings, however many times the endpoint is re-set.
+  owner.exclude_proxy(fake->v4);
+  owner.exclude_proxy(fake_ip_to_u32(fake->v4));
+  CHECK_EQ(owner.exclusions(), std::size_t(1));
+
+  // An address outside the range excludes nothing and costs nothing.
+  owner.exclude_proxy(REAL);
+  CHECK(!owner.excludes(REAL));
+  CHECK_EQ(owner.exclusions(), std::size_t(1));
+}
+
+void decide_is_the_connect_sites_one_call() {
+  fake_ip_owner owner;
+  const std::string name = "site.example.com";
+  const auto fake = owner.alloc_for(name);
+  CHECK(fake.has_value());
+  if (!fake) {
+    return;
+  }
+  owner.pin(fake->v4);
+
+  // A hit, in both spellings, with a proxy: route by the recovered name.
+  for (const auto &m : {make_v4(fake->v4, 443), make_mapped(fake->v4, 443)}) {
+    const auto d = owner.decide(m.addr(), m.len, true);
+    CHECK(d.verdict == fake_verdict::route_by_name);
+    CHECK_EQ(d.name, name);
+    CHECK_EQ(d.addr.slot, fake->slot);
+    CHECK(d.addr.in_range);
+    // Owned: the string in the answer is not the row.
+    CHECK(d.name.data() != owner.lookup(fake->v4)->data());
+  }
+
+  // A miss inside the range, with and without a proxy.
+  const auto never = make_v4(octets{198, 51, 100, 99}, 443);
+  CHECK(owner.decide(never.addr(), never.len, true).verdict ==
+        fake_verdict::refuse);
+  CHECK(owner.decide(never.addr(), never.len, false).verdict ==
+        fake_verdict::passthrough);
+  CHECK(owner.decide(never.addr(), never.len, true).name.empty());
+
+  // A real destination: passthrough whatever the config, and no lock taken.
+  const auto real = make_v4(REAL, 443);
+  const auto rd = owner.decide(real.addr(), real.len, true);
+  CHECK(rd.verdict == fake_verdict::passthrough);
+  CHECK(rd.name.empty());
+
+  // A buffer too short to read: not ours, so the original call runs.  This is
+  // the case where a careless owner would both claim a fake and read past the
+  // end of the victim's allocation.
+  const auto truncated = make_truncated_v4(fake->v4, 443, 8);
+  const auto td = owner.decide(truncated.addr(), truncated.len, true);
+  CHECK(td.verdict == fake_verdict::passthrough);
+  CHECK(!td.addr.readable);
+
+  // The answer outlives the row: exclude the fake after deciding, and the
+  // connect still has the name it was going to put on the wire.
+  const auto d = owner.decide(*fake, true);  // the fake_addr_read overload
+  CHECK(d.verdict == fake_verdict::route_by_name);
+  owner.exclude_proxy(fake->v4);
+  CHECK(!owner.lookup(fake->v4).has_value());
+  CHECK_EQ(d.name, name);
+  owner.unpin(fake->v4);
+}
+
+void counters_are_what_a_report_line_would_print() {
+  fake_ip_owner owner;
+  CHECK_EQ(owner.live_names(), std::size_t(0));
+  CHECK_EQ(owner.quarantined(), std::size_t(0));
+  CHECK_EQ(owner.exclusions(), std::size_t(0));
+  CHECK_EQ(owner.capacity(), FAKEIP_CAPACITY);
+  for (std::size_t i = 0; i < 3; ++i) {
+    CHECK(owner.alloc_for(host(i)).has_value());
+  }
+  CHECK_EQ(owner.live_names(), std::size_t(3));
+  CHECK_EQ(owner.capacity(), FAKEIP_CAPACITY);  // capacity counts exclusions
+  owner.exclude_proxy(octets{198, 51, 100, 200});
+  CHECK_EQ(owner.exclusions(), std::size_t(1));
+  CHECK_EQ(owner.capacity(), FAKEIP_CAPACITY - 1);
+  // Excluding a byte that is not a slot costs nothing.
+  owner.exclude_proxy(NETWORK);
+  CHECK_EQ(owner.exclusions(), std::size_t(1));
+}
+
+void one_owner_stays_consistent_under_concurrent_connects() {
+  // The reason the mutex exists: a detour can be entered from several threads
+  // at once, and two of them resolving the same name must not get two fakes,
+  // while every answer must still name the host it was issued for.  It is also
+  // the deadlock probe -- if any method re-enters the owner under its own
+  // lock, this scenario hangs and the registered TIMEOUT 60 is what catches
+  // it (see the S2 mutation proof).
+  fake_ip_owner owner;
+  constexpr int threads = 4;
+  constexpr int per_thread = 25;
+  std::vector<std::thread> workers;
+  // Written only by the worker that owns the slot, read after every join().
+  std::atomic<int> broken{0};
+
+  for (int t = 0; t < threads; ++t) {
+    workers.emplace_back([&owner, &broken, t] {
+      for (int i = 0; i < per_thread; ++i) {
+        const std::string name = host(std::size_t(t) * per_thread + i);
+        const auto fake = owner.alloc_for(name);
+        if (!fake) {
+          ++broken;
+          continue;
+        }
+        if (!owner.pin(fake->v4)) {
+          ++broken;
+        }
+        const auto row = owner.lookup(fake->v4);
+        if (!row || *row != name) {
+          ++broken;  // a name that came back wrong is a misroute
+        }
+        const auto m = make_mapped(fake->v4, 443);
+        const auto d = owner.decide(m.addr(), m.len, true);
+        if (d.verdict != fake_verdict::route_by_name || d.name != name) {
+          ++broken;
+        }
+        owner.note_touched(fake->v4);
+      }
+    });
+  }
+  for (auto &w : workers) {
+    w.join();
+  }
+
+  CHECK_EQ(broken.load(), 0);
+  CHECK_EQ(owner.live_names(), std::size_t(threads * per_thread));
+  // 100 names out of 254 slots, every one pinned: nothing could be
+  // evicted, and each name is still behind the one address it was issued for
+  // -- which is the property that matters, because slots are handed out in
+  // whatever order the threads raced through the lock.  A torn critical
+  // section shows up as a name pointing at another name's address.
+  for (std::size_t i = 0; i < std::size_t(threads * per_thread); ++i) {
+    const auto issued = owner.alloc_for(host(i));  // stable for a live row
+    if (!issued) {
+      ++test_failures;
+      std::printf("FAIL %s lost its address\n", host(i).c_str());
+      break;
+    }
+    const auto row = owner.lookup(issued->v4);
+    if (!row || *row != host(i)) {
+      ++test_failures;
+      std::printf("FAIL %s resolves to the wrong name\n", host(i).c_str());
+      break;
+    }
+    if (owner.pins(issued->v4) != 1) {
+      ++test_failures;
+      std::printf("FAIL %s has the wrong pin count\n", host(i).c_str());
+      break;
+    }
+  }
+}
+
 int main() {
   RUN(the_reader_only_trusts_asserted_layouts);
   RUN(a_v4_fake_is_recognised_with_its_octets_and_port);
@@ -772,6 +1155,16 @@ int main() {
   RUN(an_excluded_or_evicted_fake_falls_into_the_miss_path);
   RUN(eviction_turns_a_live_row_back_into_a_refusal);
   RUN(a_domain_shaped_verdict_is_all_the_fake_path_leaves_behind);
+  RUN(the_owner_is_one_object_for_the_whole_binary);
+  RUN(alloc_for_answers_in_the_shape_the_recognizer_reads);
+  RUN(a_name_comes_back_owned_after_its_row_is_gone);
+  RUN(pins_travel_through_the_lock_and_never_underflow);
+  RUN(note_touched_keeps_the_name_still_in_use);
+  RUN(forward_progress_is_the_only_thing_that_drains_the_ring);
+  RUN(excluding_the_proxy_in_the_range_costs_exactly_one_slot);
+  RUN(decide_is_the_connect_sites_one_call);
+  RUN(counters_are_what_a_report_line_would_print);
+  RUN(one_owner_stays_consistent_under_concurrent_connects);
 
   return test_failures;
 }

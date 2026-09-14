@@ -478,6 +478,43 @@ public:
   // capacity() is that answer already.
   std::size_t exclusions() const { return exclusions_; }
 
+  // --------------------------------------------- the two clocks, from outside
+  //
+  // Added for the P6a S2 owner and ADDITIVE on purpose: nothing above this line
+  // changes, so every existing caller and every tests/fakeip pin behaves
+  // exactly as before.  Both clocks used to advance only inside alloc(), which
+  // is right for a table with one caller and wrong for one behind a mutex with
+  // two different kinds of event feeding it:
+  //
+  //   a live connection keeping its name warm   -> note_touched(addr)
+  //   time passing at all, draining quarantine  -> note_progress()
+  //
+  // Without the first, an application that resolves once and then connects a
+  // hundred times lets its row sink to the bottom of the LRU while it is being
+  // used; a pin keeps a row from being EVICTED, it does not keep the ordering
+  // honest, and those are two different promises.
+  //
+  // Without the second the failure is worse and quieter: the quarantine ring is
+  // counted in ALLOCATIONS, so a process that stops resolving has a frozen
+  // clock and its retired slots never age out.  Half the range, parked
+  // forever -- the exhaustion this design was argued for avoiding, arriving not
+  // through load but through idleness.
+  bool note_touched(const octets &fake) {
+    const auto slot = owned_slot(fake);
+    if (!slot) {
+      return false;  // not a row: nothing to warm, and no pretending
+    }
+    slots_[*slot].last_use = ++touch_;
+    return true;
+  }
+
+  // Advance the ring clock by 'ticks' allocations and report the new value, so
+  // a caller or a test can see the drain it just paid for.
+  std::uint64_t note_progress(std::size_t ticks = 1) {
+    allocations_ += ticks;
+    return allocations_;
+  }
+
 private:
   std::optional<std::size_t> owned_slot(const octets &fake) const {
     const auto slot = fake_ip_slot_of(fake);
