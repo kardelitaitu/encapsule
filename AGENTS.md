@@ -142,10 +142,39 @@ ctest --test-dir build/x64 -C Release --output-on-failure -E '^e2e\.'   # CI blo
   **`e2e.inject_auth` is registered** — real injection plus a proxy that demands credentials, one
   accepted case and one refused case that must fail closed (`tests/e2e/CMakeLists.txt:69-80`).
 - Measured on a clean tree at `a6c23c4`, not inherited: the x64 suite ran **10/10 green** locally
-  (~99 s total, `e2e.inject_auth` ~62 s of it). The only compile errors anywhere in the project are
-  inside the `string_view.hpp` vendored by cycfi/elements (`nonstd/string_view.hpp:120`, C2143/C2447
-  under MSVC 17.14) — that is why the **GUI target is CI-built only**; the injectee, the CLI, the
-  dumper and every test build and run locally.
+  (~99 s total, `e2e.inject_auth` ~62 s of it). Every error line a full x64 build emits comes from
+  **one** place — the vendored dependency header in the next two bullets — which is why the
+  injectee, the CLI, the dumper and every test build and run locally while the GUI target does not.
+- **How to check the GUI locally, and the probe that does NOT check it.** A syntax-only
+  `cl /Zs src/injector/injector_gui.cpp` genuinely passes: 0 diagnostics, and even
+  `cl /c /std:c++20 /MT /O2` on that same file exits 0 (measured in an isolated checkout, MSVC
+  14.44.35207 / SDK 10.0.26100, VS17 generator). It is worthless as a GUI check, because the
+  failing compilation units are **elements' own library sources** — `lib/src/element/text.cpp`,
+  `lib/support/font.cpp`, `glyphs.cpp`, `receiver.cpp`, `resource_paths.cpp`: **5 of 45** TUs
+  attempted, all 5 failed, **0** objects produced — and they are reached **before** our GUI TU is
+  ever compiled. So a clean `/Zs` on `injector_gui.cpp` proves our code is well-formed and proves
+  NOTHING about the GUI target; the GUI target's failure is upstream, in the vendored
+  dependency's own build. The only probe that measures the target is a real
+  `cmake --build <dir> --config Release --target encapsule`, and today all it yields is where
+  inside that dependency the build stops.
+- **Root cause, measured — not an ABI wall, not a compiler-version mystery.** In the vendored
+  `nonstd/string_view.hpp` (string-view-lite v1.4.0, reached through the elements fork's **nested
+  `lib/infra` submodule**) the `nssv_USES_STD_STRING_VIEW` branch includes `<string_view>` (~:109)
+  but **not** `<string>`: that arrives only at ~:354, inside the *nonstd* branch. So every
+  `std::basic_string` use in the std branch (~:118) is undeclared, and the cascade is C2039
+  `'basic_string' is not a member of 'std'` -> C7568 -> C2062, then the C2143/C2447 pair
+  previously cited at :120, then ~64 downstream C2027s in `color.hpp` — **281 error lines from
+  those 5 TUs, zero `LNK*`**. This is a ONE-LINE-avoidable dependency defect: the header needs
+  `#include <string>` in its std branch. It is not a linker wall.
+- **What stays unknown, said as unknown.** The `/MT`-vs-`/MD` `RuntimeLibrary` question against
+  the fork's in-tree prebuilt externals was **never tested**, because the build aborts long before
+  any link — so there is no linker evidence either way. What exists is indirect only: those x64
+  "libs" are DLL **import stubs** (sections `.idata$2/3/4/5/6` + `.debug$S`, nothing else), they
+  carry no `/DEFAULTLIB` CRT directive, and the staged DLLs import no
+  `MSVCRT`/`VCRUNTIME140`/`MSVCP140` — so an `LNK2038` mismatch from those prebuilts looks
+  unlikely, and "unlikely" is the honest word. The GUI has still never been built or linked on
+  this host, and GitHub Actions has never run on this fork, so GUI correctness is unverified by
+  CI too.
 - `BUILD_TESTING OFF CACHE BOOL "" FORCE` (`CMakeLists.txt:38`) silences only the *deps'* tests, not ours.
 
 ## 4. Codebase-memory index (use this for accurate tool calls)
