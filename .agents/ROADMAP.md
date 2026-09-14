@@ -68,6 +68,54 @@ UI data-race fixes (`view.post`).
       `PROXINJECTEE_ONLY=ON` pass that yields `proxinjectee32.dll`).
 - [ ] Scheduled chore: bump pinned FetchContent deps (asio 1.22.2, spdlog 1.10.0,
       argparse v2.9, protopuf v2.2.1) and refresh the elements fork pin.
+      SPLIT by risk dossier (bc8f57cb, offline tag sets from build/x64/_deps/*/.git/packed-refs,
+      so 'newest' = current-as-of-last-configure, not live):
+      (a) spdlog 1.10.0 -> 1.17.0 — SAFE-ISH, CLI-only (2 includes + 10 calls), but the real
+          content is bundled fmt 8.1.1 -> 12.1.0 (fmt 9/10/11/12 breaking changes under our
+          {} format strings). Gate: full unit ctest + read injector_cli's output by eye.
+      (b) argparse 2.9 -> 3.2 — CLI-only, +1103/-167 in one header. MEASURED: the literal our
+          redaction depends on, '"Unknown argument: " + current_argument', is UNCHANGED at
+          v3.2:2451/2455; v3 ADDS an 'Invalid argument <x>' form we do not yet scrub, and NO
+          TEST asserts CLI error text at all -> pin the redactor FIRST (see (f)), then bump.
+      (c) asio 1.22.2 -> cap at 1.30.0/1.36.0, NEVER >= 1.38.0: at 1.38 the headers moved from
+          asio/include/... to include/asio/... and our layout is HARDCODED IN 9 PLACES
+          (CMakeLists.txt:70,108,130,139 + tests/{schema,queue,socks5,e2e,winnet}/CMakeLists.txt),
+          including ELEMENTS_ASIO_INCLUDE_DIR — i.e. asio and elements are coupled through the
+          same copy, so the two bumps cannot be evaluated independently. queue.hpp is NOT on a
+          private surface: it names only documented experimental channel members (ctor with
+          (executor,max), async_send/async_receive, cancel, close); the one API delta we could
+          feel is get_executor() returning const-ref since 1.24/1.3x. Oracle already exists:
+          ctest -R '^common\.queue$' (7 scenarios incl. the pushed==delivered+dropped+queued
+          identity). Prereq refactor: hoist one asio_INCLUDE_DIR variable over those 9 sites.
+      (d) minhook 49d03ad (v1.3.3+22) -> v1.3.4 — the pin-to-tag delta touches ONLY thread
+          freeze hardening (SuspendThread != 0xFFFFFFFF, unsuspendable -> never resumed,
+          Mitigates #132); the Create/Remove/EnableState machine our REVERSE-ORDER UNROLL
+          depends on is textually unchanged, and that is load-bearing because every remove()
+          runs on a created-but-never-enabled hook. To origin/master instead = hde32/hde64 +
+          trampoline rewrites (+257/+341) = instruction relocation on LIVE winsock prologues,
+          which only the e2e legs can catch and they crash the VICTIM, not the test. Tag only.
+      (e) protopuf v2.2.1 -> v3.1.0 — DELIBERATELY DEFERRED, do not do it in this chore: v2.2.1
+          is the last release before the major that crosses the FROZEN P5 WIRE CONTRACT
+          (fields 4/5, credential-free config byte-identical to pre-P5) and common.schema is the
+          ONLY guard; silent encode drift compiles green on both sides and misbehaves in the
+          victim. Zero product benefit.
+      (f) elements 8e4dfff — NOTHING TO BUMP TO: our pin IS PragmaTwice/elements origin/master
+          tip (0 ahead/0 behind; develop is 25 behind), the string-view-lite copy lives in the
+          NESTED lib/infra submodule @f3e33fe -> external/string-view-lite v1.4.0, there is no
+          PATCH_COMMAND anywhere in our build, so a bump cannot move it. Making this real means
+          re-forking onto cycfi/elements or carrying a patch.
+      CORRECTION TO OUR OWN DOCS (measured this session, MSVC 14.44.35207, exact vcxproj flags):
+      cl /Zs passes for injector_gui.cpp + all three ui_elements/*.cpp + elements' own
+      lib/host/windows/*.cpp, and a real 'cl /c /std:c++20 /MT /O2 injector_gui.cpp' -> exit 0
+      (20 warnings), with /showIncludes PROOFING nonstd/string_view.hpp:117-122 is in the graph.
+      So the documented 'string_view.hpp(120): C2143/C2447 is the only compile error in the
+      project' DOES NOT REPRODUCE — the true GUI gap is that elements.lib has never been built
+      or LINKED here (0 .obj in encapsule.dir/Release, 0 .lib in _deps/elements-build), which
+      points at the fork's in-tree prebuilt /MT externals (cairo/fontconfig/freetype/pixman/
+      expat/png16) and RuntimeLibrary ABI agreement, not at a parse error. Decisive probe:
+      build --target encapsule ONCE in the isolated worktree and read whether the first failure
+      is a parse error (dep) or LNK1104/LNK2038 (ABI). AGENTS.md §3's claim to be updated once
+      that probe lands.
 - [x] Add contributor docs: build prerequisites (MSVC, Windows SDK, CMake) and
       debugging tips for injected processes (`docs/` currently holds only image assets
       and the logo attribution, `docs/logo/attribute.md`).
@@ -143,6 +191,27 @@ UI data-race fixes (`view.post`).
       unmanageable. Remediation ladder M1-a..f accepted (A now: stop forgetting;
       C-lite: durable mapping re-read per attempt = the real fix; B rejected —
       re-inject cannot re-enter DllMain). BUILDING.md's re-inject promise fixed too.
+      M1-a LANDED (54cdae4/fccdc60, pushed): session_end {lost, retired} with NO default arg,
+      kept_bootstraps LRU cap 4096 as a leaf lock; pinned by 9e180e2 (tests/server, mutation-
+      proven both ways). M1-b LANDED (57a748f, pushed): mapping held per-pid + publish/load
+      split. M1-d LANDED (c46bbe1 + f34f7ee + 4a9587e + b6855c6, all pushed): both front
+      ends now say 'already encapsulated' vs 'injected', the GUI names its three refusals
+      ('the server is not listening yet' / 'that process is already in the list' / 'the capsule
+      did not attach'), and 38 lines of duplicated IsWow64Process+module-walk were DELETED from
+      injector_gui.hpp once server.inject returned the verdict. CLI has no refusal text yet. STILL OPEN: M1-c (client re-read of the mapping
+      per attempt) and the adopt-vs-already-resident channel — a RESIDENT capsule has no way to
+      receive a new port+token, because the server only pushes InjectorConfig down an
+      already-authenticated socket; -i on a resident pid still publishes a token nobody reads.
+      🐛 FIXED BY THE WAY (f34f7ee, BEHAVIOR CHANGE OWNED): injector_server::inject()'s
+      'not started' guard was DEAD CODE — 'port_ == -1' on a std::uint16_t compares 65535 to
+      -1, so an un-started server fell through into a real injector::inject() carrying port
+      65535 in the mapping payload: a capsule wired to a control port that does not exist.
+      Latent for both front ends in the common case, but the GUI sets the port on the detached
+      do_server thread while the app thread answers clicks, so the FIRST CLICK after startup
+      could win that race. Now a named no_port = 0xffff sentinel makes the case real and
+      fail-closed. LESSON FOR THE ROADMAP'S FRAGILE-AREAS LIST: never compare a uint16_t port
+      against -1; and port_ is still a plain uint16_t written from the io thread and read from
+      the front-end thread (documented race, narrower now).
       ⚠ MEASURED (fd745e7, disabled probe e2e.inject_exec): a brand-new '-e' child's FIRST
       connect goes DIRECT ~0.4s before its config lands (relay 1 CONNECT vs sink 1 direct
       accept at 617ms; attempt #1 RST by the witness, attempt #2 round-trips once hooked).
@@ -234,13 +303,86 @@ UI data-race fixes (`view.post`).
       ATYP=3 remote-resolve; no-TTL LRU + quarantine ring because a reused fake IP
       misrouting live traffic is the worst failure; never fake NetBIOS/.local/.arpa/
       _msdcs/WPAD; the startup window resolves via the original rather than black-holing;
-      `freeaddrinfo` must be hooked too (static CRT => HeapAlloc-tagged) or the victim
-      crashes. Slices T1..T7; T1 landed 0f78d72, T3..T6 serialized behind R2/R3 in
-      hook.hpp/injectee.cpp.)
-- [ ] Hook `getaddrinfo` / `GetAddrInfoW` (+ `GetAddrInfoExW` if async resolution
-      needs it) via the CRTP MinHook wrapper — currently absent (grep-verified), so
-      DNS leaks outside the tunnel.
-- [ ] Implement the chosen strategy in the injectee.
+      CORRECTED PREMISE (dossier fd728755, accepted): DO NOT substitute the ADDRINFO
+      chain and DO NOT hook freeaddrinfo. Rewrite the REAL chain in place — overwrite only
+      the 4 address octets of ai_addr (AF_INET, or AF_INET6 as ::ffff:<fake>), guarded by
+      ai_addrlen >= sizeof(sockaddr_in), port untouched — so the block, ai_canonname, every
+      pointer and the free all stay the VICTIM's: no allocator, no side table, no magic
+      header, no ABA on a recycled pointer, and it cannot corrupt a victim's memory. The old
+      'static CRT therefore must hook freeaddrinfo' reasoning was doubly wrong: getaddrinfo/
+      freeaddrinfo are ws2_32 EXPORTS, not CRT, and the hook is only needed by substitution.
+      Consequence accepted: multi-family chains, per-entry canonname and v6-native names are
+      NOT faked (fall back to the real answer — the cheap direction).
+      Nameless-fake policy: in-range + table MISS => refuse via fail_proxied_connect when a
+      proxy is set, original call when not (same shape as the `unknown` verdict branch, and
+      strictly AFTER the stream-classification gate so it can never bypass it). Never a quiet
+      direct route: a direct path to a fake is a documented-range blackhole AND a doctrine
+      violation, and the refusal is free because that connect fails either way.
+      Pin only inside the detour frame (getaddrinfo has no SOCKET arg, so a resolve-time pin
+      can never be balanced -> leaks a pin per name). Do-not-fake gates before touching the
+      chain: no_fake_name (+AD suffix, cached via one GetComputerNameExW under the table
+      lock, because no_fake_name(name,"") is the PERMISSIVE overload), literal node,
+      AI_NUMERICHOST|AI_PASSIVE|AI_CANONNAME|AI_ALL|AI_PROXY, ai_socktype not STREAM/0,
+      AF_INET6 without AI_V4MAPPED, no route.proxy, alloc() -> nullopt.
+      Table owner: function-static fake_ip_table + mutex behind ONE inline getter (no fourth
+      scope-bound global, no load_scope window, residency by construction). Gap found and
+      being fixed (0bc96339): 'excluded' was ctor-only while the proxy literal is runtime —
+      198.51.100.7 as the user's proxy would be handed back as a fake => invisible proxy loop.
+      V6 TRAP RULE: the fake path may only ever produce a DOMAIN IpAddr, never a v6 one —
+      to_ip_addr stores v6_addr REVERSED while to_asio/socks5_build_request_from_ip_addr read
+      wire order (pinned at tests/winnet). Do not let P6 depend on P4-1 fixing that.
+      REPORTING: no schema change (confirmed) — syscall is free text rendered verbatim by both
+      front ends, so syscall="connect+fake" costs nothing, while a real field would break
+      tests/schema's InjecteeConnect::size==4 credential-safety pin for information already on
+      the wire; report the RECOVERED NAME in addr.domain, not the fake.
+      SLICES (S1 sockaddr->octets normalizer + tri-state verdict, new fake_map.hpp +
+      tests/fake_map, NO hook.hpp edit | S2 single owner/exclusion | S3 reverse-map at the 3
+      sockaddr sites (connect/WSAConnect, ByList, ConnectEx — ByName/ByNameW already carry a
+      DOMAIN IpAddr and need nothing) | S4 getaddrinfo/GetAddrInfoW emission | S5 syscall
+      "+fake" | S6 e2e decoy proving the relay saw ATYP DOMAINNAME + a 300-name churn count)
+      KILL LIST #1 ANSWERED (9b49f964, static PE import parse; own parser - no dumpbin on this
+      host; limits: GetProcAddress-resolved names invisible, nss3.dll imports WSA* BY ORDINAL,
+      SysWOW64 twins NOT checked (we inject 32-bit targets), no delay-load):
+        SEES ws2 getaddrinfo/GetAddrInfoW: curl.exe; git libcurl-4.dll + git.exe (also
+        gethostbyname); CPython _socket.pyd (python3xx.dll itself has NO addrinfo import ->
+        delegates); Code.exe/Electron; wezterm (Rust, +WINHTTP); winhttp.dll/wininet.dll
+        reference WS2_32 and NOT DNSAPI, so WinHTTP apps stay on the hookable path.
+        BYPASSES: chrome.dll 153 imports GetAddrInfoExW/GetAddrInfoExCancel + carries
+        DnsClient/dns_over_https (its async/DoH resolver owns the answer); Firefox
+        xul.dll+nss3.dll via PR_GetAddrInfoByName/PR_EnumerateAddrInfo (WSOCK32 by ordinal);
+        node v22 is SPLIT (GetAddrInfoW for dns.lookup AND ares_/cares strings for
+        dns.resolve*); System.Net.NameResolution.dll PREFERS GetAddrInfoExW (pwsh/dotnet
+        apphosts show zero net imports, delegating to hostpolicy).
+        DISQUALIFYING CASE: cloudflared (Go) imports NO ws2_32 and NO dnsapi at all (9
+        api-ms-crt imports) + go:buildid/runtime.goexit + LoadLibrary-style strings ->
+        pure-Go UDP resolver. Nothing in a winsock/ws2 detour set can see it.
+      CONSEQUENCES ADOPTED: (i) HOOK THE FAMILY BY EXPORT ADDRESS, not 'getaddrinfo' —
+      getaddrinfo, GetAddrInfoW, GetAddrInfoExW (+ ExCancel/FreeAddrInfoExW),
+      gethostbyname/gethostbyaddr; export-address detouring is what covers ordinal imports
+      (nss3), and a getaddrinfo-only hook silently misses .NET/PowerShell and part of Chrome.
+      (ii) CLAIMS SHRINK to: covers CRT/WS2 users (curl, libcurl/git, CPython, Electron, WinHTTP
+      apps, wezterm); Chromium's network service, Firefox/NSPR+DoH, c-ares and Go resolve for
+      themselves and need separate study — still the majority of realistic targets, so S4 is
+      worth building. (iii) FRAMING, the part that matters most: a private resolver gets a REAL
+      ip and connects to it, and ONLY the existing connect() hook captures that, so fake-IP is
+      ADDITIVE (it survives name caching and apps that refuse literal-IP proxies) and is NEVER
+      the coverage mechanism. Do not let README/ROADMAP imply otherwise. (iv) BEFORE S4 ships,
+      spend the ~0.5-day DYNAMIC probe: a log-only scratch injectee detouring those exports,
+      recording name + entry point + caller module!RVA (RtlCaptureStackBackTrace), injected
+      into chrome/firefox/Code/python/curl/git push. It answers what static analysis cannot:
+      which entry point is hit in practice, whether resolution happens in a SEPARATE PROCESS
+      (Chromium network service vs browser — a hook in the wrong process fakes nothing), and
+      the per-victim hit rate to rank remaining work.
+      #2 is capacity: half the /24 is quarantined by default so steady state is
+      ~127 names and a connect-time refusal is a HARD user-visible failure, so S6 must count
+      them; #4 hook.hpp contention — S3/S4/S5 all rewrite the same five hunks, rebase each on
+      the landed tree, never hand-merge route/creds/q lines.)
+- [ ] Hook the RESOLVER FAMILY by export address — `getaddrinfo`, `GetAddrInfoW`,
+      `GetAddrInfoExW` (+ `GetAddrInfoExCancel`/`FreeAddrInfoExW`), `gethostbyname`/
+      `gethostbyaddr` — via the CRTP MinHook wrapper. Export-address detouring is required
+      because some victims import these APIs BY ORDINAL (nss3.dll), and a getaddrinfo-only
+      hook silently misses .NET/PowerShell and part of Chromium (kill list #1, above).
+      Currently absent (grep-verified), so DNS leaks outside the tunnel.
 - [ ] Preserve async semantics for overlapped resolution paths (interplay with the
       existing `WSAAsyncSelect`/`WSAEventSelect` hooks).
 - [ ] Emit DNS events into the existing connection-log pipeline.
