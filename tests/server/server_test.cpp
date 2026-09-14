@@ -253,6 +253,85 @@ void a_kept_bootstrap_is_still_not_a_skeleton_key() {
   CHECK(!accepted(41999, mk(41999)));  // a pid nobody ever injected
 }
 
+// ------------------------------------------------------------ inject verdicts
+//
+// inject() answers five ways, and three of them are decisions the server
+// makes about a pid before anybody touches a process: no control port, a pid
+// already in the table, and -- through a pid no OpenProcess will hand out --
+// a real injector::inject failure.  That is what makes them pinnable here
+// with no transport and no injection: the front ends need the WHY, and the
+// WHY must not depend on a live target.  The two successes cannot be pinned
+// this way -- they are about a load that really ran -- and that is e2e's
+// job, which drives the attached path for real.
+//
+// pid 0 is the process every scenario below refuses to name: it is "no such
+// process", so OpenProcess fails before publish() could mint a token or
+// CreateRemoteThread could run.  Nothing here can inject into anything even
+// with the guard under test broken, which is the property the first scenario
+// depends on -- proving the shipped defect by performing it would mean
+// injecting a DLL into whatever pid happened to be standing there.
+
+// The shipped defect.  `port_ == -1` was never true of a std::uint16_t: it
+// promoted, compared 65535 against -1, and let an un-started server walk into
+// a REAL injector::inject() carrying port 65535 -- a bootstrap and a token
+// wired to a control port that does not exist.  So the pin is not only the
+// verdict but the ordering it proves: the refusal happened first, so nothing
+// was published, nothing answers to the pid, and no record grew.
+void an_un_started_server_refuses_before_it_touches_anything() {
+  injector_server server; // set_port() deliberately never called
+
+  const auto outcome = server.inject(0);
+
+  CHECK(!outcome); // the old bool still says no...
+  CHECK(outcome.not_started()); // ...and now says which no it meant
+  CHECK(outcome.verdict == inject_verdict::not_started);
+
+  // The half a bool could never carry, and the half the dead guard broke:
+  CHECK(injector::tokens.count(0) == 0); // publish() never ran
+  CHECK(!accepted(0, mk(0))); // so no hello for pid 0 is accepted
+  CHECK(server.kept.size() == 0); // and the refusal left no state behind
+  CHECK(server.clients.size() == 0);
+}
+
+// The second refusal is a different fact from a failure: the capsule is
+// attached and reporting, so the front end has to be able to say "already in
+// the list" rather than reuse the word it has for a call that did not work.
+void a_registered_pid_is_refused_as_already_registered() {
+  injector_server server;
+  server.set_port(1234);
+
+  constexpr DWORD pid = 41400;
+  auto session = connect(server, pid); // the same open() process() uses
+
+  const auto outcome = server.inject(pid);
+  CHECK(!outcome);
+  CHECK(outcome.already_registered());
+  CHECK(outcome.verdict == inject_verdict::already_registered);
+  CHECK(!outcome.not_started()); // the three no's are not one bucket
+
+  // Refusing costs the running session nothing.
+  CHECK(server.clients.size() == 1);
+  CHECK(session->stops == 0);
+
+  session->stop(session_end::retired); // cleanup: this pid is a real entry
+}
+
+// The third no is the injector's own, and it keeps its own name now that the
+// other two have theirs: a server that IS listening, pointed at a pid that
+// cannot be opened, is a failure -- not a not_started, not a double click.
+void a_pid_that_cannot_be_opened_reports_a_real_failure() {
+  injector_server server;
+  server.set_port(1234);
+
+  const auto outcome = server.inject(0); // OpenProcess refuses pid 0
+  CHECK(!outcome);
+  CHECK(outcome.verdict == inject_verdict::failed);
+  CHECK(!outcome.not_started());
+  CHECK(!outcome.already_registered());
+  CHECK(!outcome.already_encapsulated());
+  CHECK(injector::tokens.count(0) == 0);
+  CHECK(server.kept.size() == 0);
+}
 } // namespace
 
 int main() {
@@ -263,6 +342,8 @@ int main() {
   RUN(re_losing_a_pid_moves_it_to_the_new_end);
   RUN(a_live_pid_is_never_eviction_fodder);
   RUN(a_kept_bootstrap_is_still_not_a_skeleton_key);
-
+  RUN(an_un_started_server_refuses_before_it_touches_anything);
+  RUN(a_registered_pid_is_refused_as_already_registered);
+  RUN(a_pid_that_cannot_be_opened_reports_a_real_failure);
   return test_failures;
 }
